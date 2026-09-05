@@ -1,0 +1,20 @@
+# CNB 云原生构建 + 云原生开发环境声明（Everything as code）
+# main 事件流水线 = docker 环境 + 声明式缓存卷 + stages 步骤
+main:
+  push:
+    - docker:
+        image: node:20
+      volumes:
+        - /root/.npm:copy-on-write
+      stages:
+        - echo "秘书团流水线已启动"
+        - node -v
+
+# $ 节点声明云原生开发环境（branch-as-environment，vscode 在线开发）
+$:
+  vscode:
+    - docker:
+        image: node:20
+      services: [vscode]
+      stages:
+        - echo "云原生开发环境就绪"
