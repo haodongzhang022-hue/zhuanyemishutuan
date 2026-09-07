@@ -8,24 +8,28 @@ from typing import List, Optional
 
 
 class TaskState(str, Enum):
-    """任务状态机：todo → in_progress → done / blocked / failed"""
+    """任务状态机：todo → in_progress → done / blocked / stopped
+    - stopped = 归档/停止追踪（设计 schema 语义态，fold.md §4 归档态）
+    - failed / cancelled = 实现层额外状态，保留兼容"""
     TODO = "todo"
     IN_PROGRESS = "in_progress"
     DONE = "done"
     BLOCKED = "blocked"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    STOPPED = "stopped"      # 归档/停止追踪（对齐 schema 枚举）
+    FAILED = "failed"        # 实现层：执行失败
+    CANCELLED = "cancelled"  # 实现层：取消
 
     @classmethod
     def is_valid_transition(cls, from_state: str, to_state: str) -> bool:
         """校验合法状态迁移"""
         VALID = {
-            "todo": {"in_progress", "blocked", "cancelled", "done"},
-            "in_progress": {"done", "blocked", "failed"},
-            "blocked": {"in_progress", "done", "cancelled", "failed"},
-            "failed": {"in_progress", "todo", "cancelled"},
-            "done": set(),      # done 终态，不可再迁移
-            "cancelled": set(), # cancelled 终态
+            "todo": {"in_progress", "blocked", "cancelled", "done", "stopped"},
+            "in_progress": {"done", "blocked", "failed", "stopped"},
+            "blocked": {"in_progress", "done", "cancelled", "failed", "stopped"},
+            "failed": {"in_progress", "todo", "cancelled", "stopped"},
+            "done": {"stopped"},            # done 后可归档停止追踪
+            "cancelled": {"stopped"},       # cancelled 后可归档
+            "stopped": set(),               # stopped 归档终态，不可再迁移
         }
         return to_state in VALID.get(from_state, set())
 
@@ -214,6 +218,7 @@ class StateCard:
             "blocked_count": states.count(TaskState.BLOCKED.value),
             "failed_count": states.count(TaskState.FAILED.value),
             "cancelled_count": states.count(TaskState.CANCELLED.value),
+            "stopped_count": states.count(TaskState.STOPPED.value),
             "tasks": tasks_summary,
             "content_refs": [t.content_ref for t in self.tasks if t.content_ref],
             "upstream": self.upstream,

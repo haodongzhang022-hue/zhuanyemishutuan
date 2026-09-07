@@ -345,6 +345,7 @@ class SecretaryTree:
                 "done_count": states.count(TaskState.DONE.value),
                 "in_progress_count": states.count(TaskState.IN_PROGRESS.value),
                 "blocked_count": states.count(TaskState.BLOCKED.value),
+                "stopped_count": states.count(TaskState.STOPPED.value),
                 "content_refs": [t.content_ref for t in card.tasks if t.content_ref],
             })
         else:
@@ -353,6 +354,7 @@ class SecretaryTree:
                 "done_count": 0,
                 "in_progress_count": 0,
                 "blocked_count": 0,
+                "stopped_count": 0,
                 "content_refs": [],
             })
         return summary
@@ -530,6 +532,7 @@ class HierarchySubmitter:
                 "done_count": summary["done_count"],
                 "blocked_count": summary["blocked_count"],
                 "in_progress_count": summary["in_progress_count"],
+                "stopped_count": summary.get("stopped_count", 0),
                 "content_refs": summary["content_refs"],
             })
             # 记录上下游关系

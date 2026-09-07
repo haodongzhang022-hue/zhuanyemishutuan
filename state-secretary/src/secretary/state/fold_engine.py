@@ -135,6 +135,8 @@ class FoldEngine:
                 TaskState.DONE.value: "✅",
                 TaskState.BLOCKED.value: "⛔",
                 TaskState.FAILED.value: "❌",
+                TaskState.CANCELLED.value: "🚫",
+                TaskState.STOPPED.value: "📁",
             }.get(task.state, "⬜")
 
             fold_mark = "" if task.fold == FoldState.EXPANDED.value else " [折叠]"
@@ -165,9 +167,11 @@ class FoldEngine:
         done = states.count(TaskState.DONE.value)
         in_prog = states.count(TaskState.IN_PROGRESS.value)
         blocked = states.count(TaskState.BLOCKED.value)
+        stopped = states.count(TaskState.STOPPED.value)
         total = len(card.tasks)
         lines.append("")
-        lines.append(f"📊 进度: {done}/{total} 完成, {in_prog} 进行中, {blocked} 阻塞")
+        lines.append(f"📊 进度: {done}/{total} 完成, {in_prog} 进行中, "
+                     f"{blocked} 阻塞, {stopped} 已归档")
 
         return "\n".join(lines)
 
@@ -177,8 +181,11 @@ class FoldEngine:
         这是执行 agent 真正看到的 prompt 片段——不含全量原文。
         """
         parts = []
-        expanded = [t for t in card.tasks if t.fold == FoldState.EXPANDED.value]
-        collapsed = [t for t in card.tasks if t.fold == FoldState.COLLAPSED.value]
+        # stopped(归档)任务不进入活动 prompt，仅记录计数
+        active = [t for t in card.tasks if t.state != TaskState.STOPPED.value]
+        expanded = [t for t in active if t.fold == FoldState.EXPANDED.value]
+        collapsed = [t for t in active if t.fold == FoldState.COLLAPSED.value]
+        stopped_count = sum(1 for t in card.tasks if t.state == TaskState.STOPPED.value)
 
         if card.objective:
             parts.append(f"总体目标: {card.objective}")
@@ -206,6 +213,9 @@ class FoldEngine:
             )
             parts.append(f"— 已折叠任务(按需检索) —")
             parts.append(refs)
+
+        if stopped_count > 0:
+            parts.append(f"— 已归档任务: {stopped_count} 个 (stopped, 按索引检索) —")
 
         return "\n".join(parts)
 
