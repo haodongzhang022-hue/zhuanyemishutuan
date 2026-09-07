@@ -51,7 +51,7 @@ SKILL.state 由单一 agent 管理状态，随会话增长无隔离。本方案�
 下级 → 上级仅提交**汇总结构化状态**（见 schema.md §3 最小集），不含原始全文：
 
 ```
-progress     # 进度（完成/进行中/待办百分比或枚举）
+progress     # 进度（纯数值 [0,1]，见 schema.md §3.1；完成态由 status 裁决）
 decisions    # 本域关键决策（折叠后的要点，非全文）
 open_items   # 开放项 / 阻塞点
 context_ids  # 涉及的本层上下文索引（可回查）

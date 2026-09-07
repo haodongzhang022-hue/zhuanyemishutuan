@@ -23,8 +23,8 @@
 
   // ---- state：最小会话状态集 ----
   "task_id": "t-001",          // 当前任务/小目标标识（对齐 Q2 todolist）
-  "progress": 0.5,             // 进度 [0,1] 或完成枚举
-  "status": "in_progress",     // todo | in_progress | done | blocked
+  "progress": 0.5,             // 进度，纯数值 [0,1]（完成态由 status 裁决，见 §3.1）
+  "status": "in_progress",     // todo | in_progress | done | blocked | stopped（语义态，见 §3.1）
   "decisions": [               // 关键决策（折叠要点，非全文）
     { "id": "d-1", "summary": "采信 Q1 四层秘书定义", "ts": "..." }
   ],
@@ -43,6 +43,15 @@
 
 - 向上提交时只携带 `state` 中的**汇总字段**（progress/decisions/open_items）+ `context_ids` 索引，不携带原始全文。
 - 保证任一上级拿到即可做宏观判断与调度，无需感知下级细节。
+
+### 3.1 progress（数值进度）与 status（语义态）边界定义（收敛 US-3 读歧义）
+
+- **`progress`：纯数值进度**，取值域 `[0, 1]`（0=未开始，1=完成）。仅表达"做到哪一步"，不承载生命周期语义。
+- **`status`：语义态枚举**，唯一裁决生命周期与"完成态"：`todo | in_progress | done | blocked | stopped`。
+- **判定规则（单一事实源）**：
+  - 是否**完成**只看 `status == "done"`，不依赖 `progress` 数值。
+  - `progress` 是否需强制置 1：当 `status == "done"` 时约定 `progress` 归一为 `1`，供上级快速读取；但裁决权在 `status`。
+  - 语义态迁移由 fold.md §4 状态机驱动，`progress` 仅随任务推进更新，二者不互相推断。
 
 ## 4. 扩展机制（ext）
 

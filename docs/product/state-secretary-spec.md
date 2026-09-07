@@ -29,7 +29,7 @@
 ```
 状态记录:
   state_id / secretary_level / domain / conversation_id / parent_id
-  task_id / progress / status(todo|in_progress|done|blocked)
+  task_id / progress(纯数值[0,1]) / status(todo|in_progress|done|blocked|stopped)
   decisions[] / open_items[] / context_ids[]
   ext: { 行业命名空间 }
 ```
