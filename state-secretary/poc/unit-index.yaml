@@ -1,0 +1,21 @@
+# 跨行业单元注册索引 (本仓库 L1-M2/M8 本地视图)
+# 说明: 本文件是通用能力层的【路由索引】, 声明可路由行业单元的描述。
+#       各单元的真实仓库为被管对象(如 dongjiagoushi 在独立仓), 本层只索引其能力入口,
+#       不持有其内部实现 —— 符合「收编行业单元为原子」约束。
+units:
+  - unit_id: dongjiagoushi
+    repo_ref: "https://cnb.cool/dongdongxiaozu/dongjiagoushi"
+    industry: 软件研发
+    industry_alias: [研发, 架构师, 软件开发, dev, 架构]
+    capability_tags: [架构设计, 编码实现, 协作编排, 接力交接, 经验记忆]
+    roles: [architect, developer, reviewer, product, secretary]
+    register_version: "1.0"
+
+  # 第二行业单元样例(真实仓在独立位置, 此处仅作路由描述预埋, 不修改其源仓)
+  - unit_id: game-dev-example
+    repo_ref: "<second-unit-repo: 待接入>"
+    industry: 游戏研发
+    industry_alias: [游戏, 玩法, 数值策划, 关卡设计]
+    capability_tags: [玩法设计, 数值平衡, 关卡策划, UE引擎]
+    roles: [game_planner, level_designer]
+    register_version: "1.0"

@@ -1,42 +1,70 @@
-# 落库模块划分建议
+# 落库模块划分（已落地）
 
-> 目标：给出 ISSUE-001 的落库位置建议，对齐 Q5（新增模块，不塞进现有模块，确保纯净可用）。
+> 目标：ISSUE-001 的落库位置，对齐 Q5（新增模块，纯净可用）。
 
 ## 1. 结论（Q5）
 
-- **新增独立模块**承载状态管理秘书机制，功能较多、需纯净可用，不塞进现有模块。
-- 本仓库 `zhuanyemishutuan` 定位秘书/协作领域通用层抽象；dongjiagoushi 承载架构师既有协作规则，不互相替代。
+- **已新增独立模块** `state-secretary/` 承载状态管理秘书机制。
+- 代码源自 `hanghangchuzhuangyuan`（行行出状元）M9 状态管理层 + M10 上下文装配层的**拷贝移植**。
+- 本仓库 `zhuanyemishutuan` 定位秘书/协作领域通用层抽象；dongjiagoushi 承载架构师既有协作规则。
 
-## 2. 模块结构建议
+## 2. 模块结构（已落地）
 
 ```
 zhuanyemishutuan/            # 通用层
-└── state-secretary/         # 【新增】状态管理秘书模块
+├── docs/design/             # 设计文档（7 篇 + index）
+├── docs/product/            # 产品规格（1 篇）
+└── state-secretary/         # 【已落地】状态管理秘书模块
     ├── README.md            # 模块说明 + 入口
-    ├── schema/              # 状态最小 Schema 定义 + ext 扩展
-    │   ├── core.min.json     # 通用最小集（meta + state）
-    │   └── ext/              # 领域扩展区
-    ├── fold/                 # 折叠/编号/索引/检索
-    │   ├── context_id.md     # 编号规则
-    │   └── index.md          # 折叠索引格式
-    ├── cache/                # 稳定前缀 + 丢弃时机策略
-    ├── org/                  # L0-L3 层级组织模型定义
-    ├── docs/                 # 本设计文档（design + product）
-    └── poc/                  # token/命中对比 benchmark
+    ├── setup.py             # Python 包配置
+    ├── src/
+    │   └── secretary/       # Python 源码包
+    │       ├── state/       # 状态管理层（M9）
+    │       │   ├── models.py          # 状态 Schema 数据模型
+    │       │   ├── manager.py         # StateManager 卡生命周期
+    │       │   ├── fold_engine.py     # FoldEngine 折叠/编号/检索
+    │       │   ├── content_archive.py # ContentArchive 原文归档
+    │       │   ├── hierarchy.py       # SecretaryTree + HierarchySubmitter
+    │       │   ├── ownership.py       # OwnershipGuard 并发归属
+    │       │   ├── arbiter.py         # ConflictArbiter 字段级仲裁
+    │       │   └── persist.py         # FlushQueue 批量落盘
+    │       ├── context/     # 上下文装配层（M10）
+    │       │   ├── assembler.py       # 三层物理隔离装配器
+    │       │   ├── cache_guard.py     # 缓存守卫
+    │       │   ├── rules.py           # 规则引擎
+    │       │   └── slib_guard.py      # SLIB 装配守卫
+    │       └── handoff/     # 交接总线（M5）
+    │           ├── models.py          # HandoffCard
+    │           └── handoff.py         # HandoffBus
+    ├── tests/               # 74 项 pytest 测试（全部通过）
+    └── poc/                 # POC 脚本 + benchmark
+        ├── m1_router.sh             # 单单元路由
+        ├── m2_router_composite.sh   # 复合路由
+        ├── m3_multiunit_router.sh   # 多单元路由
+        ├── state_m9_benchmark.py    # token/命中量化验证
+        └── industry-register.yaml   # 路由注册表
 ```
 
-## 3. 分层职责（防止与 dongjiagoushi 混淆）
+## 3. 代码映射（设计文档 ↔ 实现）
 
-- **通用层（本模块）**：状态管理秘书抽象——层级模型、最小 Schema、折叠检索、缓存保障、丢弃时机。全行业通用。
-- **dongjiagoushi**：架构师协作机制（接力卡/双版本/入口强制）。本仓库不替代，仅参考其中适合进通用层的部分。
-- **行业领域**（金融/游戏/电商等）：通过 `schema.ext.<行业>` 扩展区接入，不改通用层。
+| 设计文档 | 实现代码 | 说明 |
+|---------|---------|------|
+| state-secretary-schema.md | `state/models.py` | StateCard/TaskRecord/状态机 |
+| state-secretary-fold.md | `state/fold_engine.py` + `content_archive.py` | 折叠 + 原文归档可回查 |
+| state-secretary-org.md | `state/hierarchy.py` | SecretaryTree + 向上提交 |
+| state-secretary-cache.md | `context/assembler.py` + `cache_guard.py` | 三层装配 + 稳定前缀 |
+| state-secretary-poc.md | `poc/state_m9_benchmark.py` | 已可运行的量化对比 |
 
-## 4. 落地演进顺序
+## 4. 落地状态
 
-1. 先落 schema/fold 最小可运行脚本 + org 角色定义（对应本模块骨架）。
-2. 接 cache 稳定前缀策略。
-3. 跑 poc/benchmark 出对比报告 → CP2 人确认放行后固化。
+1. ✅ schema/fold/org 最小可运行代码 + 测试（74 项通过）
+2. ✅ cache 稳定前缀策略（context/assembler.py 三层装配）
+3. ✅ poc/benchmark 可运行
+4. ✅ 独立可部署，不依赖现有模块内部实现
+5. ✅ 仅依赖 Python 标准库，无第三方包
 
-## 5. 校验
-- 新模块独立可部署、不依赖现有模块内部实现。
-- 各设计文档与代码位置一一对应，README 提供入口。
+## 5. 来源说明
+
+- 代码源自 `hanghangchuzhuangyuan`（dongdongxiaozu/hanghangchuzhuangyuan）M9 + M10。
+- 采用「复制而非迁移」原则，原仓不受影响，两端可并行演进。
+- 包名 `hanghang.*` → `secretary.*` 适配，去除对原仓路由引擎的耦合。

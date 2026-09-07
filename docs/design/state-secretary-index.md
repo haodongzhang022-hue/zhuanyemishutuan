@@ -43,3 +43,17 @@
 | Q3 原文不落地额外存储，只存 todolist 精简层 | fold.md §3.3 + cache.md §4 丢弃时机 |
 | Q4 状态最小 Schema + 行业扩展 | schema.md |
 | Q5 新增独立模块 | module.md |
+
+## 5. 实现状态（已落地代码）
+
+> **2026-09-08**：状态管理秘书模块已落地可运行代码（`state-secretary/`），
+> 代码源自 `hanghangchuzhuangyuan` M9/M10 状态管理层拷贝移植，包名适配为 `secretary.*`。
+> 74 项 pytest 测试全部通过，POC benchmark 可运行。
+
+| 设计文档 | 已落地代码 |
+|---------|-----------|
+| schema.md | `state-secretary/src/secretary/state/models.py` |
+| fold.md | `state-secretary/src/secretary/state/fold_engine.py` + `content_archive.py` |
+| org.md | `state-secretary/src/secretary/state/hierarchy.py` |
+| cache.md | `state-secretary/src/secretary/context/assembler.py` |
+| poc.md | `state-secretary/poc/state_m9_benchmark.py` |
