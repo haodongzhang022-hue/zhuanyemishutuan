@@ -18,8 +18,11 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import tempfile
+import time
 from typing import Dict, List, Optional, Any
 
 from ..state import (
@@ -124,12 +127,19 @@ class SecretarySession:
                 lambda u, r: static_prefix if static_prefix else None
             ) if static_prefix else None,
         )
-        self.handoff_bus = HandoffBus(data_dir=ho_dir)
-        # 记录本会话创建过的交接卡 ID，供 delete_session 一并清理
+        self.handoff_bus = HandoffBus(data_dir=ho_dir, state_root=self._session_root)
+        # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
+        # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
+        # 持久化记录为准，实例内存清单仅为会话内缓存镜像。
         self._owned_handoff_ids: List[str] = []
+        # 本会话经交接 auto_state_card 关联的 ho-* StateCard ID
+        # （delete_session 一并回收这些状态卡，消除跨根孤儿）
+        self._owned_state_card_ids: List[str] = []
 
         # 确保 StateCard 已创建（get_or_create）
         self._ensure_card()
+        # 恢复本会话归属台账（跨实例：上一实例创建的交接卡/ho-* 卡纳入清理）
+        self._load_ledger()
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -164,6 +174,77 @@ class SecretarySession:
                 max_seq = max(max_seq, int(m.group(1)))
         return max_seq
 
+    def _own_state_card(self, state_card_id: str) -> None:
+        """登记一张本会话负责回收的 StateCard（去重保留）。"""
+        if state_card_id and state_card_id not in self._owned_state_card_ids:
+            self._owned_state_card_ids.append(state_card_id)
+
+    def _ledger_path(self) -> str:
+        """本会话交接卡归属台账路径。
+
+        存放于本会话 handoffs/ 目录下（<root>/handoffs/.session-<id>.owned）。
+        持久化记录"哪些交接卡 + 关联 ho-* 状态卡属于本会话"，供跨实例
+        重开后 delete_session 仍能一次回收；不扫全部卡文件、不误认领
+        其他会话的交接卡（多会话同数据根时互不越权）。
+
+        注意：文件后缀刻意**不带 .json**——handoff 目录的 *.json 会被
+        list_pending() 当作交接卡解析，台账不应被误读为 HandoffCard。
+        """
+        return os.path.join(
+            self.handoff_bus.data_dir,
+            f".session-{self.session_id}.owned")
+
+    def _record_ownership(self, handoff_id: str,
+                          state_card_id: Optional[str]) -> None:
+        """登记一张交接卡（及其关联 ho-* 状态卡）属于本会话，落盘台账。"""
+        if handoff_id and handoff_id not in self._owned_handoff_ids:
+            self._owned_handoff_ids.append(handoff_id)
+        if state_card_id:
+            self._own_state_card(state_card_id)
+        self._flush_ledger()
+
+    def _flush_ledger(self) -> None:
+        """把本会话交接卡归属台账写入磁盘（幂等、无锁单写者）。"""
+        ledger = {
+            "session_id": self.session_id,
+            "handoff_ids": list(self._owned_handoff_ids),
+            "state_card_ids": list(self._owned_state_card_ids),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = self._ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(ledger, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _load_ledger(self) -> None:
+        """会话实例启动时读取本会话归属台账，恢复跨实例所有权。"""
+        path = self._ledger_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        for hid in data.get("handoff_ids", []) or []:
+            if hid not in self._owned_handoff_ids:
+                self._owned_handoff_ids.append(hid)
+        for sid in data.get("state_card_ids", []) or []:
+            self._own_state_card(sid)
+
+    def _owned_handoffs(self) -> List[str]:
+        """汇总本会话需要清理的交接卡 ID（内存清单 ∪ 台账权威清单）。"""
+        self._load_ledger()
+        return list(self._owned_handoff_ids)
+
     # ------------------------------------------------------------------
     # 会话生命周期
     # ------------------------------------------------------------------
@@ -173,24 +254,47 @@ class SecretarySession:
         return self._card()
 
     def delete_session(self) -> bool:
-        """清理本会话的全部数据（状态卡 + 原文归档 + 本会话创建的交接卡）。
+        """清理本会话的全部数据（状态卡 + 原文归档 + 交接卡 + 关联 ho-* 状态卡）。
 
         生命周期语义完整：一次 delete 即回收该会话秘书占用的全部存储，
-        不残留归档/交接文件于磁盘。
+        不残留 .lock / 空目录 / 跨实例交接卡 / 交接自动关联的孤儿状态卡。
+        返回"本会话状态卡是否存在"（卡已不存在时返回 False，
+        即使归档/交接等伴生数据已全部清理）。
         """
-        ok = self.state_manager.delete_card(self.session_id)
-        # 清理本会话的原文归档
-        try:
-            self.archive.delete_session(self.session_id)
-        except Exception:
-            pass
-        # 清理本会话创建的交接卡
-        for hid in list(self._owned_handoff_ids):
+        # 1) 清理本会话"创建/认领过"的交接卡——含上一实例创建、本实例据台账
+        #    恢复认领的卡（跨实例不留残余）
+        for hid in self._owned_handoffs():
             try:
                 self.handoff_bus.delete(hid)
             except Exception:
                 pass
         self._owned_handoff_ids.clear()
+
+        # 2) 清理交接卡自动关联的 ho-* StateCard（此前落 <cwd> 的孤儿卡根因；
+        #    现随 data_dir/state 收敛，随卡删除连带 .lock 一并回收）
+        for sid in list(self._owned_state_card_ids):
+            try:
+                self.state_manager.delete_card(sid)
+            except Exception:
+                pass
+        self._owned_state_card_ids.clear()
+
+        # 3) 清理本会话状态卡（连带 .lock / .owner.json）
+        ok = self.state_manager.delete_card(self.session_id)
+
+        # 4) 删除本会话归属台账（台账本身也是本会话数据的一部分）
+        try:
+            ledger_path = self._ledger_path()
+            if os.path.exists(ledger_path):
+                os.remove(ledger_path)
+        except OSError:
+            pass
+
+        # 5) 清理本会话的原文归档（并回收 <content>/<session>/ 空子目录）
+        try:
+            self.archive.delete_session(self.session_id)
+        except Exception:
+            pass
         return ok
 
     # ------------------------------------------------------------------
@@ -449,7 +553,8 @@ class SecretarySession:
             auto_state_card=True,
         )
         if hc and hc.id:
-            self._owned_handoff_ids.append(hc.id)
+            # 认领本交接卡 + 其关联 ho-* StateCard（落盘归属台账，跨实例可清）
+            self._record_ownership(hc.id, hc.state_card_id)
         return hc
 
     # ------------------------------------------------------------------

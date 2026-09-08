@@ -103,15 +103,37 @@ class StateManager:
         return card
 
     def delete_card(self, session_id: str) -> bool:
-        """删除一张 StateCard（同步清理内存缓存）"""
+        """删除一张 StateCard（同步清理内存缓存）。
+
+        一次回收该会话在状态卡目录内的**全部**伴生数据：
+        - 卡文件 ``<session>.json``
+        - 卡 flock 锁文件 ``<session>.lock``（card_lock 产生的写锁残骸）
+        - 卡 owner 租约文件 ``<session>.owner.json``（OwnershipGuard 占用声明）
+
+        生命周期语义完整：delete_session 后磁盘不残留 .lock / .owner.json。
+        状态卡数据根（state/）目录自身保留——同根可容纳其他会话卡且供实例
+        复用重建，不属于"本会话残骸"。
+        """
         if not self._is_valid_session_id(session_id):
             return False
         self._mem_cache.pop(session_id, None)
-        path = self._card_path(session_id)
-        if os.path.exists(path):
-            os.remove(path)
-            return True
-        return False
+        card_path = self._card_path(session_id)
+        lock_path = os.path.join(self.data_dir, f"{session_id}.lock")
+        # 注意：须与 ownership.OwnershipGuard.LOCK_SUFFIX(".owner.json") 保持一致
+        # （ownership 模块 import 本模块，此处避免循环引用故用字面量并留注释对齐）
+        lease_path = os.path.join(self.data_dir, f"{session_id}.owner.json")
+        existed = False
+        # 删除卡文件 / 锁文件 / 租约文件（全部本会话伴生文件）
+        for path in (card_path, lock_path, lease_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    existed = True
+            except OSError:
+                pass
+        # 数据根目录（state/）保留：同根可容纳其他会话卡，且供实例复用重建，
+        # 不属于本会话的"残骸"；delete_session 只需清掉本会话自身文件。
+        return existed
 
     def list_cards(self) -> List[StateCard]:
         """列出所有 StateCard"""

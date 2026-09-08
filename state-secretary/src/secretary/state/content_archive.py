@@ -198,7 +198,11 @@ class ContentArchive:
         return False
 
     def delete_session(self, session_id: str) -> int:
-        """删除某会话全部归档，返回删除条目数。"""
+        """删除某会话全部归档，返回删除条目数。
+
+        归档目录删空后回收目录自身（<root>/<session>/），
+        使 delete_session 不留"归档空目录残骸"。
+        """
         self._validate_identifier(session_id, "session_id")
         sdir = self._session_dir(session_id)
         if not os.path.isdir(sdir):
@@ -211,6 +215,14 @@ class ContentArchive:
                     n += 1
                 except OSError:
                     pass
+        # 回收会话子目录自身（<root>/<session>/ 已删空时）。
+        # 注意：只删 session 子目录，不删除归档根（content/），
+        # 同根其他会话仍复用该目录。
+        try:
+            if not os.listdir(sdir):
+                os.rmdir(sdir)
+        except OSError:
+            pass
         return n
 
     # ------------------------------------------------------------------

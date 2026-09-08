@@ -19,10 +19,29 @@ class HandoffBus:
 
     M9 集成：创建交接卡时若指定 auto_state_card=True，
     自动为交接创建/关联一张 StateCard（M9 状态卡）。
+
+    数据根收敛：交接卡本体（handoffs/）与其关联的 StateCard 可属于
+    两个独立数据根——
+    - state_root: 关联 ho-* StateCard 的落盘根（不传时与历史一致退化为 <cwd>）
+    - data_dir:   交接卡 JSON 落盘目录
+    SecretarySession 会同时注入本会话 data_dir 下的 state/ 与 handoffs/，
+    使交接卡与其关联状态卡收敛到同一会话数据根，不再落 `<cwd>/data/state` 孤儿。
     """
 
-    def __init__(self, data_dir: Optional[str] = None):
+    def __init__(self, data_dir: Optional[str] = None,
+                 state_root: Optional[str] = None):
+        """初始化交接总线。
+
+        Args:
+            data_dir: 交接卡 JSON 落盘目录（默认 <cwd>/data/handoffs）
+            state_root: 关联 ho-* StateCard 的状态根（默认 None → 退化历史行为，
+                在 auto_state_card 时使用 <cwd> 作为 StateManager 数据根）。
+                传入后 auto_state_card 生成的关联状态卡落盘于
+                ``<state_root>/state``，与调用方 StateManager 收敛同根。
+        """
         self.data_dir = data_dir or os.path.join(os.getcwd(), "data", "handoffs")
+        # 关联 ho-* StateCard 的状态根：None → 历史行为（<cwd>）
+        self.state_root = state_root
         os.makedirs(self.data_dir, exist_ok=True)
         # 线程锁：Web server 以 ThreadingHTTPServer 多线程复用模块级单例交接总线，
         # 并发 create_handoff/list_pending/update_status 会并行读写数据目录，
@@ -47,7 +66,11 @@ class HandoffBus:
             if auto_state_card:
                 try:
                     from secretary.state.manager import StateManager
-                    sm = StateManager()
+                    # 关联 ho-* 状态卡落盘根：显式 state_root 则收敛到其 state/ 子目录；
+                    # 未传入保持历史行为（默认 <cwd>），避免破坏既有调用方假设。
+                    sm = StateManager(
+                        data_dir=os.path.join(self.state_root, "state")
+                        if self.state_root else None)
                     # 会话ID = 交接卡意图的简单哈希，保证稳定可检索
                     hash_hex = hashlib.md5(
                         f"{source_unit}-{target_unit}-{intent}".encode()
@@ -126,8 +149,11 @@ class HandoffBus:
         with self._lock:
             path = os.path.join(self.data_dir, f"{card_id}.json")
             if os.path.exists(path):
-                os.remove(path)
-                return True
+                try:
+                    os.remove(path)
+                    return True
+                except OSError:
+                    return False
             return False
 
     def _save(self, card: HandoffCard):

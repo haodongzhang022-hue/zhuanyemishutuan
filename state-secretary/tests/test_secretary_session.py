@@ -436,3 +436,102 @@ class TestDataRootAndCleanup:
             not f.endswith(".json") for f in os.listdir(sec.handoff_bus.data_dir))
 
 
+
+
+# ------------------------------------------------------------------
+# 评审回归：数据根收敛到交接关联卡（🔴 #A）+ delete_session 无残留（🔴 #B）
+# ------------------------------------------------------------------
+
+class TestHandoffStateCardConvergence:
+    """🔴 #A：交接 auto_state_card 关联的 ho-* 状态卡应收敛到本会话数据根，
+    且 delete_session 应一并回收，不再落 <cwd> 孤儿。"""
+
+    def test_ho_state_card_lands_in_session_root(self, tmp_dir):
+        """create_handoff(auto_state_card) 的 ho-* 卡落 <data_root>/state 而非 <cwd>。"""
+        sec = SecretarySession("ho-root1", data_dir=tmp_dir)
+        ho = sec.create_handoff("team-a", "team-b", "收敛意图", "上下文")
+        assert ho is not None and ho.state_card_id
+
+        state_dir = os.path.abspath(sec.state_manager.data_dir)
+        # ho-* 卡在会话数据根下（而非 cwd/data/state 孤儿）
+        assert os.path.exists(os.path.join(state_dir, f"{ho.state_card_id}.json"))
+        cwd_state = os.path.abspath(os.path.join(os.getcwd(), "data", "state"))
+        assert not os.path.exists(
+            os.path.join(cwd_state, f"{ho.state_card_id}.json")), \
+            "ho-* 状态卡不应落 <cwd>/data/state 孤儿"
+        sec.delete_session()
+
+    def test_delete_session_removes_ho_state_card(self, tmp_dir):
+        """delete_session 应删除本会话关联的 ho-* 状态卡（含其 .lock）。"""
+        sec = SecretarySession("ho-del1", data_dir=tmp_dir)
+        ho = sec.create_handoff("unit-a", "unit-b", "待清理意图", "内容")
+        sid = ho.state_card_id
+        state_dir = sec.state_manager.data_dir
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json"))
+
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json"))
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.lock"))
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.owner.json"))
+
+
+class TestDeleteSessionNoResidue:
+    """🔴 #B：delete_session 不应残留 .lock / 归档空目录 / 跨实例交接卡。"""
+
+    def test_no_lock_and_no_empty_archive_dir_residue(self, tmp_dir):
+        """删除后 <session>.lock 移除、content/<session>/ 空目录回收。"""
+        sec = SecretarySession("residue-1", data_dir=tmp_dir)
+        sec.add_task("任务", task_type="deliverable")
+        sec.fold("归档原文一\n\n归档原文二")
+
+        state_dir = sec.state_manager.data_dir
+        archive_sdir = os.path.join(tmp_dir, "content", "residue-1")
+        assert os.path.exists(os.path.join(state_dir, "residue-1.lock"))
+        assert os.path.isdir(archive_sdir)
+
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, "residue-1.lock")), \
+            ".lock 不应残留"
+        assert not os.path.isdir(archive_sdir), "归档空目录不应残留"
+
+    def test_cross_instance_delete_cleans_previous_handoff(self, tmp_dir):
+        """上一实例创建的交接卡/ho-* 卡，本实例据台账重开后 delete_session 应能回收。"""
+        # 实例1：创建交接卡后不删除即释放
+        s1 = SecretarySession("xinst-1", data_dir=tmp_dir)
+        ho1 = s1.create_handoff("src-x", "dst-x", "跨实例意图", "内容")
+        handoff_id = ho1.id
+        state_card_id = ho1.state_card_id
+        ho_dir = s1.handoff_bus.data_dir
+        state_dir = s1.state_manager.data_dir
+        # 释放实例1（不调 delete_session，模拟中途退出/超时未清理）
+        del s1
+
+        # 文件确实存在于磁盘
+        assert os.path.exists(os.path.join(ho_dir, f"{handoff_id}.json"))
+        assert os.path.exists(os.path.join(state_dir, f"{state_card_id}.json"))
+
+        # 实例2：以同一 session_id + 同一 data_dir 重开 → 应接管上一实例的归属
+        s2 = SecretarySession("xinst-1", data_dir=tmp_dir)
+        s2.delete_session()
+        assert not os.path.exists(os.path.join(ho_dir, f"{handoff_id}.json")), \
+            "跨实例交接卡不应残留"
+        assert not os.path.exists(os.path.join(state_dir, f"{state_card_id}.json")), \
+            "跨实例 ho-* 状态卡不应残留"
+
+    def test_multi_session_no_cross_claim(self, tmp_dir):
+        """同数据根下两个会话：删除 B 不得误删 A 的交接卡/ho-* 卡。"""
+        sec_a = SecretarySession("multi-a", data_dir=tmp_dir)
+        ho_a = sec_a.create_handoff("src-a", "dst-a", "A的意图", "ctx")
+        sec_b = SecretarySession("multi-b", data_dir=tmp_dir)
+        ho_dir = sec_b.handoff_bus.data_dir
+        state_dir = sec_b.state_manager.data_dir
+
+        # 删除 B → A 的数据不受影响
+        sec_b.delete_session()
+        assert os.path.exists(os.path.join(ho_dir, f"{ho_a.id}.json")), \
+            "删除 B 不应误删 A 的交接卡"
+        assert os.path.exists(os.path.join(state_dir, f"{ho_a.state_card_id}.json")), \
+            "删除 B 不应误删 A 的 ho-* 状态卡"
+        # B 自身状态卡已删
+        assert not os.path.exists(os.path.join(state_dir, "multi-b.json"))
+        sec_a.delete_session()
