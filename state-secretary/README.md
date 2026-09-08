@@ -76,6 +76,8 @@ summary = sec.summarize_for_upstream() # 向上级提交汇总态
 # 三层上下文装配（缓存键 = layer_a 哈希）
 result = sec.assemble_context(user_text="查询进度")
 cache_key = result["cache_key"]        # 同一会话稳定不变
+# ⚠ 若未配置 static_prefix，所有会话的 layer_a 相同 → 缓存键共享；
+#   需要隔离时请在 SecretarySession 传入独立的 static_prefix。
 ```
 
 ## 目录结构
@@ -106,7 +108,7 @@ state-secretary/
 │       └── session/             # 会话门面层（L3 秘书统一入口）
 │           ├── __init__.py
 │           └── session.py       # SecretarySession（推荐使用）
-├── tests/                       # 90 项测试（含门面 16 项）
+├── tests/                       # 97 项测试（含门面 23 项 + 评审回归 7 项）
 ├── poc/                         # POC 脚本 + benchmark
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC

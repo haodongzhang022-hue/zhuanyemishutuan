@@ -121,6 +121,15 @@ class HandoffBus:
                         pending.append(card)
             return pending
 
+    def delete(self, card_id: str) -> bool:
+        """删除一张交接卡（线程安全）。返回是否删除成功。"""
+        with self._lock:
+            path = os.path.join(self.data_dir, f"{card_id}.json")
+            if os.path.exists(path):
+                os.remove(path)
+                return True
+            return False
+
     def _save(self, card: HandoffCard):
         if not card.id:
             card.id = f"{card.source_unit}-{card.target_unit}-{time.time_ns()}"

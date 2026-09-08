@@ -24,13 +24,30 @@ from typing import Dict, List, Optional, Any
 
 from ..state import (
     StateManager, StateCard, TaskRecord,
-    TaskState, TaskType, FoldState,
+    TaskState, TaskType,
 )
 from ..state.fold_engine import FoldEngine
 from ..state.content_archive import ContentArchive
 from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
+
+
+class _StateCardProxy:
+    """StateCard 的**装配视图代理**：暴露 compact_context() 供 ContextAssembler 层B使用。
+
+    ContextAssembler._build_layer_b 优先调用 state_card.compact_context() 来生成
+    "会话态上下文"（展开任务要素 + 折叠任务编号引用）。StateCard 本身是数据模型，
+    不耦合 FoldEngine 折叠逻辑；由门面在此注入 FoldEngine 代理，使层B能真正携带
+    任务标题/折叠引用，而非只落到"目标/进度/会话"的降级摘要。
+    """
+
+    def __init__(self, card: StateCard, fold_engine: FoldEngine):
+        self._card = card
+        self._fold_engine = fold_engine
+
+    def compact_context(self) -> str:
+        return self._fold_engine.compact_context(self._card)
 
 
 class SecretarySession:
@@ -67,9 +84,10 @@ class SecretarySession:
             objective: 会话总体目标
             unit_id: 所属行业单元
             role_name: 秘书角色名（默认 "secretary"）
-            data_dir: 状态数据目录（默认 <cwd>/data/state）
-            archive_root: 原文归档根目录（默认 <cwd>/data/state/content）
-            static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）
+            data_dir: 会话数据根目录（默认 <cwd>/data）。同一会话的状态卡、
+                原文归档、交接卡均收敛在此根之下派生（state/ content/ handoffs/）。
+            archive_root: 原文归档根目录（默认 <data_dir>/content）。
+            static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+$', session_id):
@@ -82,26 +100,33 @@ class SecretarySession:
         self.objective = objective
         self.static_prefix = static_prefix
 
+        # 统一数据根：同一会话的状态卡/原文归档/交接卡收敛到同一根之下，
+        # 避免"数据根分裂"（状态卡在 A、归档在 B、交接卡在 C）。
+        # 默认 <cwd>/data，传入 data_dir 时以之为根。
+        self._session_root = data_dir or os.path.join(os.getcwd(), "data")
+        state_dir = os.path.join(self._session_root, "state")
+        # archive_root 显式给出则使用；否则从数据根派生 content
+        self._archive_root = archive_root or os.path.join(
+            self._session_root, "content")
+        ho_dir = os.path.join(self._session_root, "handoffs")
+
         # 初始化底层组件
-        self.state_manager = StateManager(data_dir=data_dir)
+        self.state_manager = StateManager(data_dir=state_dir)
         self.fold_engine = FoldEngine(
             session_id=session_id,
             unit_id=unit_id,
             role_name=role_name,
-            archive_root=archive_root,
+            archive_root=self._archive_root,
         )
-        self.archive = ContentArchive(root_dir=archive_root)
+        self.archive = ContentArchive(root_dir=self._archive_root)
         self.context_assembler = ContextAssembler(
             static_prefix_provider=(
                 lambda u, r: static_prefix if static_prefix else None
             ) if static_prefix else None,
         )
-        # handoff data_dir 与 state data_dir 同级但目录名独立
-        ho_dir = os.path.join(
-            os.path.dirname(data_dir) if data_dir else os.getcwd(),
-            "data", "handoffs",
-        )
         self.handoff_bus = HandoffBus(data_dir=ho_dir)
+        # 记录本会话创建过的交接卡 ID，供 delete_session 一并清理
+        self._owned_handoff_ids: List[str] = []
 
         # 确保 StateCard 已创建（get_or_create）
         self._ensure_card()
@@ -123,6 +148,22 @@ class SecretarySession:
         """获取当前会话的 StateCard"""
         return self.state_manager.get_card(self.session_id)
 
+    @staticmethod
+    def _max_content_seq(card: Optional[StateCard]) -> int:
+        """取任务卡中已有 content_ref 的最大段号（无则 0）。
+
+        用于续号：{session}-seg{NNN} 中 NNN 的最大值。
+        """
+        max_seq = 0
+        if card is None:
+            return max_seq
+        for t in card.tasks:
+            ref = t.content_ref or ""
+            m = re.match(r'^[A-Za-z0-9_-]+-seg(\d+)$', ref)
+            if m:
+                max_seq = max(max_seq, int(m.group(1)))
+        return max_seq
+
     # ------------------------------------------------------------------
     # 会话生命周期
     # ------------------------------------------------------------------
@@ -132,8 +173,25 @@ class SecretarySession:
         return self._card()
 
     def delete_session(self) -> bool:
-        """删除本会话的状态卡"""
-        return self.state_manager.delete_card(self.session_id)
+        """清理本会话的全部数据（状态卡 + 原文归档 + 本会话创建的交接卡）。
+
+        生命周期语义完整：一次 delete 即回收该会话秘书占用的全部存储，
+        不残留归档/交接文件于磁盘。
+        """
+        ok = self.state_manager.delete_card(self.session_id)
+        # 清理本会话的原文归档
+        try:
+            self.archive.delete_session(self.session_id)
+        except Exception:
+            pass
+        # 清理本会话创建的交接卡
+        for hid in list(self._owned_handoff_ids):
+            try:
+                self.handoff_bus.delete(hid)
+            except Exception:
+                pass
+        self._owned_handoff_ids.clear()
+        return ok
 
     # ------------------------------------------------------------------
     # 任务管理
@@ -161,6 +219,7 @@ class SecretarySession:
             task_type=task_type,
             depends_on=depends_on,
             files=files,
+            summary=summary,
             **kwargs,
         )
 
@@ -233,10 +292,14 @@ class SecretarySession:
 
         # 调用 fold_engine 分段
         segments = self.fold_engine._split_segments(content)
-        total = len(segments)
 
-        # 归档原文全文
-        refs = self.archive.store_segments(self.session_id, segments)
+        # 续号：基于既有任务卡最大 content_ref 段号 + 1，保证同一会话多次
+        # 折叠编号连续、不覆盖既有归档文件，content_ref 与任务一一对应。
+        start_seq = self._max_content_seq(card) + 1
+
+        # 归档原文全文（从 start_seq 续号）
+        refs = self.archive.store_segments(
+            self.session_id, segments, start_seq=start_seq)
         # 去除空段后重新对齐
         segments = [s.strip() for s in segments if s.strip()]
 
@@ -281,10 +344,19 @@ class SecretarySession:
             return f"(空会话 {self.session_id})"
         return self.fold_engine.render_navigation(card)
 
-    def retrieve_original(self, content_ref: str) -> Optional[str]:
-        """按 content_ref 精确检索并取回原文全文。"""
-        return self.archive.retrieve_content(
-            self.session_id, content_ref)
+    def retrieve_original(self, content_ref: Optional[str]) -> Optional[str]:
+        """按 content_ref 精确检索并取回原文全文。
+
+        参数非法（None/空串/含非法字符）或归档不存在时返回 None；
+        作为公共 API 不抛裸 TypeError/ValueError。
+        """
+        if not content_ref:
+            return None
+        try:
+            return self.archive.retrieve_content(
+                self.session_id, content_ref)
+        except Exception:
+            return None
 
     def search_tasks(self, keyword: str,
                      include_original: bool = False) -> List[dict]:
@@ -314,13 +386,16 @@ class SecretarySession:
         Returns dict 含 layer_a/layer_b/layer_c/full_context/cache_key 等。
         """
         card = self._card()
+        # 传装配视图代理：让层B能经 FoldEngine 生成携带任务标题/折叠引用的
+        # 会话态上下文（StateCard 本身无 compact_context 方法）。
+        state_card = _StateCardProxy(card, self.fold_engine) if card else None
         result = self.context_assembler.assemble(
             session_id=self.session_id,
             role_name=self.role_name,
             unit_id=self.unit_id,
             user_text=user_text,
             static_prefix=static_prefix or self.static_prefix,
-            state_card=card,
+            state_card=state_card,
             objective=self.objective,
         )
         return result
@@ -366,13 +441,16 @@ class SecretarySession:
         context: str = "",
     ) -> HandoffCard:
         """创建一张交接卡（跨单元协作），自动关联本会话 StateCard。"""
-        return self.handoff_bus.create_handoff(
+        hc = self.handoff_bus.create_handoff(
             source_unit=source_unit,
             target_unit=target_unit,
             intent=intent,
             context=context,
             auto_state_card=True,
         )
+        if hc and hc.id:
+            self._owned_handoff_ids.append(hc.id)
+        return hc
 
     # ------------------------------------------------------------------
     # 进度统计

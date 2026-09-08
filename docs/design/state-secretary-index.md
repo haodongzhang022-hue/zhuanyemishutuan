@@ -48,7 +48,7 @@
 
 > **2026-09-08**：状态管理秘书模块已落地可运行代码（`state-secretary/`），
 > 代码源自 `hanghangchuzhuangyuan` M9/M10 状态管理层拷贝移植，包名适配为 `secretary.*`。
-> 90 项 pytest 测试全部通过（含 SecretarySession 门面 16 项），POC benchmark 可运行。
+> 97 项 pytest 测试全部通过（含 SecretarySession 门面 23 项 + 评审回归 7 项），POC benchmark 可运行。
 > **2026-09-08 补**：新增 `SecretarySession` 会话门面层——将 state/context/handoff
 > 整合为 L3 会话秘书的统一完整接口，一个实例 = 一个会话秘书，开箱即用。
 

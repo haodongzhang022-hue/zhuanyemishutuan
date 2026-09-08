@@ -99,20 +99,26 @@ class ContentArchive:
 
     def store_segments(self, session_id: str,
                        segments: List[str],
-                       titles: Optional[List[str]] = None) -> List[str]:
+                       titles: Optional[List[str]] = None,
+                       start_seq: int = 1) -> List[str]:
         """把多段原文（对应 fold 后的多个折叠任务）批量归档。
 
         每段生成形如 ``{session}-seg{NNN}`` 的 content_ref（与 FoldEngine
         的编号约定一致，保证 fold_content 产出的引用可真正取回原文）。
 
-        返回归档生成的 content_ref 列表（与传入 segments 一一对应）。
+        Args:
+            start_seq: 起始段号（默认 1）。多次归档同一会话时，调用方应传入
+                既有最大段号 + 1 以**续号**，避免新一轮归档从 seg001 重启并
+                覆盖既有归档文件、造成 content_ref 错位。
+
+        返回归档生成的 content_ref 列表（与传入的非空 segments 一一对应）。
         """
         refs: List[str] = []
         for i, seg in enumerate(segments):
             seg = seg.strip()
             if not seg:
                 continue
-            seq = len(refs) + 1
+            seq = start_seq + len(refs)
             ref = f"{session_id}-{_SEG_PREFIX}{seq:03d}"
             title = (titles[i] if titles and i < len(titles) else "") or \
                 self._first_line(seg)

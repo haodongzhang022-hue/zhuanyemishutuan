@@ -9,17 +9,12 @@
 from __future__ import annotations
 
 import os
-import sys
 import shutil
 import tempfile
 
 import pytest
 
-sys.path.insert(0, os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-
 from secretary.session import SecretarySession
-from secretary.state import StateManager, TaskState
 
 
 @pytest.fixture
@@ -302,3 +297,142 @@ class TestTaskStateMachine:
         # todo 不能从 in_progress 回退（非法迁移应被拒绝）
         assert sec.mark_task(task.task_id, "todo") is False
         sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 评审回归：fold 续号不覆盖（🔴 #1）
+# ------------------------------------------------------------------
+
+class TestFoldContinuationRegression:
+    def test_multi_fold_refs_do_not_overwrite(self, tmp_dir):
+        """同一会话连续两次 fold，第二次的 content_ref 续号且不覆盖第一次。
+
+        评审指出的数据正确性缺陷：重复 fold 导致 content_ref 错位覆盖，
+        第二轮任务拿到第一轮的引用。本用例回归验证。
+        """
+        sec = SecretarySession("fold-reg1", objective="续号回归",
+                               data_dir=tmp_dir)
+        sec.fold("第一轮任务A\n\n第一轮任务B")
+        first_tasks = sec.list_tasks()
+        first_refs = {t.task_id: t.content_ref for t in first_tasks}
+
+        # 再折叠一轮
+        sec.fold("第二轮任务C\n\n第二轮任务D")
+        all_tasks = sec.list_tasks()
+
+        # 两次任务的 content_ref 均唯一且不重复
+        refs = [t.content_ref for t in all_tasks]
+        assert len(refs) == len(set(refs)), "content_ref 不应重复"
+
+        # 第一次的任务 ref 仍是第一轮的 seg001/seg002
+        first_tasks_after = sec.list_tasks()
+        for t in first_tasks_after[:2]:
+            assert t.content_ref == first_refs[t.task_id]
+
+        # 每条任务的 ref 可精确找回各自原文
+        for t in all_tasks:
+            orig = sec.retrieve_original(t.content_ref)
+            assert orig is not None
+        # 第一轮 ref 找回第一轮原文
+        assert "第一轮任务A" in sec.retrieve_original(first_tasks[0].content_ref)
+        assert "第二轮任务C" in sec.retrieve_original(all_tasks[2].content_ref)
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 评审建议回归：add_task summary 透传（🟡 #2）
+# ------------------------------------------------------------------
+
+class TestAddTaskSummary:
+    def test_summary_passthrough(self, tmp_dir):
+        """add_task 的 summary 参数应透传到 TaskRecord，不被静默吞掉。"""
+        sec = SecretarySession("sum-reg1", data_dir=tmp_dir)
+        t = sec.add_task("任务A", summary="这是折叠摘要")
+        assert t.summary == "这是折叠摘要"
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 评审建议回归：层B携带任务标题/折叠引用（🟡 #3）
+# ------------------------------------------------------------------
+
+class TestLayerBNavigationContent:
+    def test_layer_b_carries_task_navigation(self, tmp_dir):
+        """assemble_context 的 layer_b 应携带任务标题/折叠引用，
+        而非只落到"目标/进度/会话"降级摘要。"""
+        sec = SecretarySession("layerb-1", objective="导航测试",
+                               data_dir=tmp_dir)
+        sec.add_task("做开发任务", task_type="deliverable", objective="开发")
+        sec.add_task("设计缓存任务", objective="缓存")
+        res = sec.assemble_context(user_text="查询")
+        layer_b = res["layer_b"]
+        # 展开任务标题应出现
+        assert "做开发任务" in layer_b
+        # 任务编号/折叠引用应出现（可驱动导航）
+        assert "layerb-1-0001" in layer_b
+        assert "layerb-1-0002" in layer_b
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 评审建议回归：retrieve_original 非法入参不抛裸异常（🟡 #4）
+# ------------------------------------------------------------------
+
+class TestRetrieveOriginalGuard:
+    def test_invalid_ref_returns_none(self, tmp_dir):
+        """retrieve_original 对 None/空串/非法字符/不存在引用返回 None，
+        不抛裸 TypeError/ValueError。"""
+        sec = SecretarySession("retr-reg1", data_dir=tmp_dir)
+        assert sec.retrieve_original(None) is None
+        assert sec.retrieve_original("") is None
+        assert sec.retrieve_original("bad/../path") is None
+        assert sec.retrieve_original("nonexist-seg001") is None
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 评审建议回归：数据根收敛（🟡 #5）+ 删除清理（🟡 #6）
+# ------------------------------------------------------------------
+
+class TestDataRootAndCleanup:
+    def test_single_data_root(self, tmp_dir):
+        """状态卡/原文归档/交接卡应收敛到同一数据根下，不再三处割裂。"""
+        sec = SecretarySession("root-reg1", objective="根收敛",
+                               data_dir=tmp_dir)
+        root = os.path.abspath(tmp_dir)
+        assert os.path.abspath(sec.state_manager.data_dir).startswith(root)
+        assert os.path.abspath(sec.archive.root_dir).startswith(root)
+        assert os.path.abspath(sec.handoff_bus.data_dir).startswith(root)
+        sec.delete_session()
+
+    def test_data_root_has_no_double_data(self, tmp_dir):
+        """显式传 data_dir 时，不应产生 <cwd>/data/data/… 双嵌套。"""
+        sec = SecretarySession("root-reg2", data_dir=tmp_dir)
+        # 三个数据目录都直接在根下派生，无 "data/data" 嵌套
+        for p in (sec.state_manager.data_dir,
+                  sec.archive.root_dir, sec.handoff_bus.data_dir):
+            norm = os.path.normpath(p)
+            assert "data/data" not in norm, f"出现双 data 嵌套: {norm}"
+        sec.delete_session()
+
+    def test_delete_session_cleans_archive_and_handoff(self, tmp_dir):
+        """delete_session 应清理状态卡 + 原文归档 + 本会话创建的交接卡。"""
+        sec = SecretarySession("clean-reg1", data_dir=tmp_dir)
+        sec.add_task("任务A", task_type="deliverable")
+        sec.fold("要归档的原文\n\n第二段")
+        sec.create_handoff("team-a", "team-b", "交接意图", "内容")
+
+        # 删除前应存在归档与交接文件
+        assert sec.archive.list_refs("clean-reg1"), "归档应有条目"
+        assert os.path.exists(sec.handoff_bus.data_dir)
+
+        sec.delete_session()
+
+        # 状态卡、归档已清空
+        assert sec.get_card() is None
+        assert sec.archive.list_refs("clean-reg1") == []
+        # 本会话创建的交接卡文件已删除
+        assert not os.listdir(sec.handoff_bus.data_dir) or all(
+            not f.endswith(".json") for f in os.listdir(sec.handoff_bus.data_dir))
+
+
