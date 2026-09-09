@@ -535,3 +535,84 @@ class TestDeleteSessionNoResidue:
         # B 自身状态卡已删
         assert not os.path.exists(os.path.join(state_dir, "multi-b.json"))
         sec_a.delete_session()
+
+
+# ------------------------------------------------------------------
+# P2-① 回归：共享 ho-* 卡跨会话误删（Issue #4）
+# 共享 ho-* 卡 ID = hash(source,target,intent)，同源/同目标/同意图的多个
+# 会话共享同一张卡。删 A 会话不得影响 B 会话持有的 ho-* 卡引用。
+# ------------------------------------------------------------------
+
+class TestSharedHoCardCrossSession:
+    """P2-①：共享 ho-* 卡删除前须做存活引用检查，引用未清不得删。"""
+
+    def _same_shared_ho(self, tmp_dir, sess_a, sess_b,
+                        source="team-x", target="team-y",
+                        intent="同一交接意图"):
+        """两个会话创建同源/同目标/同意图的交接 → 共享同一张 ho-* 卡。"""
+        sec_a = SecretarySession(sess_a, data_dir=tmp_dir)
+        ho_a = sec_a.create_handoff(source, target, intent, "A上下文")
+        sec_b = SecretarySession(sess_b, data_dir=tmp_dir)
+        ho_b = sec_b.create_handoff(source, target, intent, "B上下文")
+        assert ho_a.state_card_id == ho_b.state_card_id, \
+            "同源/同目标/同意图应共享同一张 ho-* 卡"
+        assert ho_a.id != ho_b.id, "交接卡本身各自独立"
+        return sec_a, sec_b, ho_a, ho_b
+
+    def test_delete_a_keeps_b_shared_ho_reference(self, tmp_dir):
+        """删 A 会话：B 持有的共享 ho-* 卡与 handoff 卡引用均不受影响。"""
+        sec_a, sec_b, ho_a, ho_b = self._same_shared_ho(
+            tmp_dir, "sh-a1", "sh-b1")
+        sid = ho_b.state_card_id
+        state_dir = sec_b.state_manager.data_dir
+        ho_dir = sec_b.handoff_bus.data_dir
+
+        sec_a.delete_session()
+
+        # B 持有的共享 ho-* 卡仍在，可读且任务仍在
+        ho_path = os.path.join(state_dir, f"{sid}.json")
+        assert os.path.exists(ho_path), \
+            "删 A 后共享 ho-* 卡不应被删除（B 仍存活引用）"
+        card = sec_b.state_manager.get_card(sid)
+        assert card is not None, "B 仍能读到共享 ho-* 卡"
+        assert card.tasks, "共享 ho-* 卡内交接任务应保留"
+        # B 自身 handoff 卡仍在
+        assert os.path.exists(os.path.join(ho_dir, f"{ho_b.id}.json")), \
+            "B 持有的 handoff 卡不应被删"
+        sec_b.delete_session()
+
+    def test_last_referrer_delete_reclaims_ho_card(self, tmp_dir):
+        """共享卡最后存活引用者删除后，ho-* 卡与交接卡一并回收（无孤儿）。"""
+        sec_a, sec_b, ho_a, ho_b = self._same_shared_ho(
+            tmp_dir, "sh-a2", "sh-b2")
+        sid = ho_b.state_card_id
+        state_dir = sec_b.state_manager.data_dir
+
+        sec_a.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "前置：A 删除后共享卡仍保留（B 引用中）"
+
+        sec_b.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "最后引用者删除后共享 ho-* 卡应一并回收"
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.lock"))
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.owner.json"))
+
+    def test_independent_ho_cards_not_blocked(self, tmp_dir):
+        """各自独立意图（不同源）的 ho-* 卡互不干扰，删除仍回收。"""
+        sec_a = SecretarySession("sh-a3", data_dir=tmp_dir)
+        ho_a = sec_a.create_handoff("team-a1", "team-y", "意图A", "ctx")
+        sec_b = SecretarySession("sh-b3", data_dir=tmp_dir)
+        ho_b = sec_b.create_handoff("team-b1", "team-y", "意图B", "ctx")
+        assert ho_a.state_card_id != ho_b.state_card_id
+
+        state_dir = sec_b.state_manager.data_dir
+        sec_a.delete_session()
+        # A 的独立 ho-* 卡已回收；B 的卡不受影响
+        assert not os.path.exists(
+            os.path.join(state_dir, f"{ho_a.state_card_id}.json")), \
+            "A 独占的 ho-* 卡应随 A 删除回收"
+        assert os.path.exists(
+            os.path.join(state_dir, f"{ho_b.state_card_id}.json")), \
+            "B 的 ho-* 卡不受 A 删除影响"
+        sec_b.delete_session()

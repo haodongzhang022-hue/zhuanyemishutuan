@@ -78,6 +78,15 @@
   3. 多会话同根互不误删。
 - **回归测试**：`TestDeleteSessionNoResidue`
 
+### 🔴 修复 #C — 共享 ho-* 卡跨会话误删（P2-① / Issue #4）
+- **问题**：ho-* 卡 ID = hash(source,target,intent)，同源/同目标/同意图的多个会话共享同一张卡；任一会话 `delete_session()` 会把它连带删除，另一存活会话引用失效。
+- **修复**：ho-* 卡删除前做**存活引用检查**（`_scan_ho_referencing_sessions`）：扫描同数据根下其他会话归属台账 `.session-<id>.owned`，仅当引用该卡的会话自身已删（引用已清）才物理删除；引用未清不得删。最后存活引用者删除时一并回收。
+- **怎么测**：
+  1. A/B 同源同目标同意图建交接 → 共享同一张 ho-* 卡；删 A 后 B 的 ho-* 卡/交接卡引用仍可读。
+  2. A 先删、B 最后删 → 共享卡在 B 删除后才回收，无孤儿无残留。
+  3. 不同意图的独立 ho-* 卡互不阻塞，随各会话删除即回收。
+- **回归测试**：`TestSharedHoCardCrossSession`（3 项）
+
 ---
 
 ## 三、可复现缺陷记录（P2 待办）
@@ -86,7 +95,7 @@
 
 | P2 | 问题 | 对应 Issue | 状态 |
 |---|---|---|---|
-| ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | open |
+| ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | ✅ 已修复（#C） |
 | ② | 独立 HandoffBus 未传 state_root 落 cwd 孤儿 | Issue #5 | open |
 | ③ | delete_card 返回值 docstring 语义漂移 | 待评估 | open |
 
@@ -95,3 +104,4 @@
 - Python 3.13 + pytest 8.3
 - 运行：`cd state-secretary && pytest -q`
 - 配置：`pytest.ini` 已配置 `pythonpath=src`
+

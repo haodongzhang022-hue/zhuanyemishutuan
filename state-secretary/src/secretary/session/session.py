@@ -245,6 +245,60 @@ class SecretarySession:
         self._load_ledger()
         return list(self._owned_handoff_ids)
 
+    def _scan_ho_referencing_sessions(self, state_card_id: str) -> List[str]:
+        """扫描同数据根下的其他会话台账，找出仍"存活引用"该 ho-* 卡的会话。
+
+        存活引用判定（两个条件同时满足）：
+        1. 该会话台账 ``.session-<id>.owned`` 的 state_card_ids 含本 ho-* 卡 ID；
+        2. 该会话自身的 StateCard（``<state>/<id>.json``）仍存在——即该会话
+           尚未 delete_session，仍可能经交接卡读取这张共享 ho-* 卡。
+
+        共享 ho-* 卡 ID = hash(source,target,intent)，同源/同目标/同意图的多个
+        会话共享同一张卡。因此删除前须确认没有其他存活会话仍引用它，否则会
+        造成另一会话的引用失效（P2-① 跨会话误删根因）。
+        """
+        referrers: List[str] = []
+        state_dir = self.state_manager.data_dir
+        ho_dir = self.handoff_bus.data_dir
+        if not os.path.isdir(ho_dir):
+            return referrers
+        prefix, suffix = ".session-", ".owned"
+        for f in os.listdir(ho_dir):
+            if not (f.startswith(prefix) and f.endswith(suffix)):
+                continue
+            other_sid = f[len(prefix):-len(suffix)]
+            if not other_sid or other_sid == self.session_id:
+                continue
+            # 会话自身已删除 → 其台账引用视为失效，不阻塞共享卡回收
+            if not os.path.exists(os.path.join(state_dir, f"{other_sid}.json")):
+                continue
+            try:
+                with open(os.path.join(ho_dir, f), "r",
+                          encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if state_card_id in (data.get("state_card_ids") or []):
+                referrers.append(other_sid)
+        return referrers
+
+    def _delete_ho_state_card_if_safe(self, state_card_id: str) -> bool:
+        """删除一张 ho-* StateCard，删除前执行"存活引用检查"。
+
+        共享 ho-* 卡被同数据根下同源/同目标/同意图的多个会话共同引用。
+        只有确认**没有其他存活会话**仍引用它（引用已清）才允许物理删除；
+        引用未清不得删——否则另一会话持有的引用会失效（P2-①）。
+        """
+        if not state_card_id:
+            return False
+        if self._scan_ho_referencing_sessions(state_card_id):
+            # 仍有其他存活会话引用该共享卡 → 保留，供其继续使用
+            return False
+        try:
+            return self.state_manager.delete_card(state_card_id)
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     # 会话生命周期
     # ------------------------------------------------------------------
@@ -270,13 +324,12 @@ class SecretarySession:
                 pass
         self._owned_handoff_ids.clear()
 
-        # 2) 清理交接卡自动关联的 ho-* StateCard（此前落 <cwd> 的孤儿卡根因；
-        #    现随 data_dir/state 收敛，随卡删除连带 .lock 一并回收）
+        # 2) 清理交接卡自动关联的 ho-* StateCard（随 data_dir/state 收敛，随卡
+        #    删除连带 .lock 一并回收）。ho-* 卡 ID = hash(source,target,intent)，
+        #    同源/同目标/同意图的多个会话共享同一张卡——删除前先做"存活引用
+        #    检查"：仍有其他存活会话引用时不得删（P2-① 共享卡跨会话误删根因）。
         for sid in list(self._owned_state_card_ids):
-            try:
-                self.state_manager.delete_card(sid)
-            except Exception:
-                pass
+            self._delete_ho_state_card_if_safe(sid)
         self._owned_state_card_ids.clear()
 
         # 3) 清理本会话状态卡（连带 .lock / .owner.json）
