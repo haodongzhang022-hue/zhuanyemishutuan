@@ -20,10 +20,14 @@ class HandoffBus:
     M9 集成：创建交接卡时若指定 auto_state_card=True，
     自动为交接创建/关联一张 StateCard（M9 状态卡）。
 
-    数据根收敛：交接卡本体（handoffs/）与其关联的 StateCard 可属于
-    两个独立数据根——
-    - state_root: 关联 ho-* StateCard 的落盘根（不传时与历史一致退化为 <cwd>）
+    数据根收敛：交接卡本体（handoffs/）与其关联的 StateCard 应同根——
     - data_dir:   交接卡 JSON 落盘目录
+    - state_root: 关联 ho-* StateCard 的落盘根（显式传入时使用）
+    - 默认推导：data_dir 显式传入且未指定 state_root 时，以 data_dir 父目录
+      推导 state_root，使 ho-* 卡落 ``<parent(data_dir)>/state``，
+      与 SecretarySession 三子目录（state/ content/ handoffs/）收敛逻辑一致，
+      不再落 `<cwd>/data/state` 孤儿；
+      data_dir 亦未传时保持历史退化行为（<cwd>/data/handoffs + <cwd> 根）。
     SecretarySession 会同时注入本会话 data_dir 下的 state/ 与 handoffs/，
     使交接卡与其关联状态卡收敛到同一会话数据根，不再落 `<cwd>/data/state` 孤儿。
     """
@@ -34,14 +38,30 @@ class HandoffBus:
 
         Args:
             data_dir: 交接卡 JSON 落盘目录（默认 <cwd>/data/handoffs）
-            state_root: 关联 ho-* StateCard 的状态根（默认 None → 退化历史行为，
-                在 auto_state_card 时使用 <cwd> 作为 StateManager 数据根）。
-                传入后 auto_state_card 生成的关联状态卡落盘于
+            state_root: 关联 ho-* StateCard 的状态根。默认推导规则——
+                - data_dir 显式传入且未指定 state_root：以 ``data_dir`` 的
+                  父目录作为状态根，ho-* 卡落 ``<parent(data_dir)>/state``，
+                  与 SecretarySession 三子目录收敛到同一数据根一致；
+                - 仅 data_dir 缺省（用 <cwd>/data/handoffs）：状态根保持历史
+                  行为（<cwd>），向后兼容；
+                显式传入后 auto_state_card 生成的关联状态卡落盘于
                 ``<state_root>/state``，与调用方 StateManager 收敛同根。
         """
+        # data_dir 缺省时才退化为 <cwd>/data/handoffs（历史默认）
         self.data_dir = data_dir or os.path.join(os.getcwd(), "data", "handoffs")
-        # 关联 ho-* StateCard 的状态根：None → 历史行为（<cwd>）
-        self.state_root = state_root
+        # 关联 ho-* StateCard 的状态根推导：
+        # - 显式 state_root：直接使用（最高优先）；
+        # - 未传 state_root 但 data_dir 显式传入：以 data_dir 父目录推导，
+        #   使 ho-* 卡与交接卡收敛同一数据根（state/ handoffs/ 同根），
+        #   不再落 <cwd>/data/state 孤儿；
+        # - 二者均未传：保持历史退化行为，关联 StateCard 默认落 <cwd>。
+        if state_root is not None:
+            self.state_root = state_root
+        elif data_dir is not None:
+            self.state_root = os.path.dirname(
+                os.path.normpath(os.path.abspath(data_dir)))
+        else:
+            self.state_root = None
         os.makedirs(self.data_dir, exist_ok=True)
         # 线程锁：Web server 以 ThreadingHTTPServer 多线程复用模块级单例交接总线，
         # 并发 create_handoff/list_pending/update_status 会并行读写数据目录，
@@ -66,8 +86,9 @@ class HandoffBus:
             if auto_state_card:
                 try:
                     from secretary.state.manager import StateManager
-                    # 关联 ho-* 状态卡落盘根：显式 state_root 则收敛到其 state/ 子目录；
-                    # 未传入保持历史行为（默认 <cwd>），避免破坏既有调用方假设。
+                    # 关联 ho-* 状态卡落盘：状态根已按推导规则收敛
+                    # （显式 state_root / data_dir 父目录 / 历史 <cwd>），
+                    # 统一落 <state_root>/state 子目录。
                     sm = StateManager(
                         data_dir=os.path.join(self.state_root, "state")
                         if self.state_root else None)

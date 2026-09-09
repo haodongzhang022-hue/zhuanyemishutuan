@@ -304,7 +304,9 @@ def test_handoff_completeness_and_standard():
     from secretary.handoff.models import HandoffCard
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        bus = HandoffBus(data_dir=tmpdir)
+        # 使用 <tmpdir>/handoffs 作为交接卡目录：独立 HandoffBus 显式 data_dir
+        # 时默认以父目录推导 state_root，ho-* 卡收敛到 <tmpdir>/state（不外溢）。
+        bus = HandoffBus(data_dir=os.path.join(tmpdir, "handoffs"))
 
         # 1. 不完整卡 → completeness_check 应报缺失字段
         incomplete = HandoffCard(
@@ -378,3 +380,101 @@ if __name__ == "__main__":
     test_handoff_completeness_and_standard()
     test_cli_arb_and_state_search()
     print("✅ M9 状态管理层测试全部通过")
+
+
+# =====================================================================
+# P2-② 回归：独立 HandoffBus 显式 data_dir 默认推导 state_root
+# 背景：独立使用 HandoffBus（不经 SecretarySession）只传 data_dir 时，
+#       ho-* 关联状态卡曾落 <cwd>/data/state 孤儿。
+# 修复：data_dir 显式传入且未传 state_root 时，以 data_dir 父目录推导
+#       state_root → ho-* 卡落 <parent(data_dir)>/state。
+# =====================================================================
+
+def _assert_no_cwd_ho_orphan(state_card_id):
+    """校验某 ho-* 卡未落 <cwd>/data/state 孤儿目录。"""
+    cwd_state = os.path.abspath(os.path.join(os.getcwd(), "data", "state"))
+    return not os.path.exists(
+        os.path.join(cwd_state, f"{state_card_id}.json"))
+
+
+def test_standalone_handoff_explicit_data_dir_derives_state_root():
+    """独立 HandoffBus(data_dir=…/handoffs) 未传 state_root：
+    ho-* 卡落 <data_dir 父目录>/state，不落 cwd 孤儿。"""
+    from secretary.handoff import HandoffBus
+    with tempfile.TemporaryDirectory() as tmpdir:
+        session_root = os.path.join(tmpdir, "sess-x")
+        ho_dir = os.path.join(session_root, "handoffs")
+        bus = HandoffBus(data_dir=ho_dir)
+        # state_root 由 data_dir 父目录推导
+        assert bus.state_root == os.path.abspath(session_root), \
+            f"state_root 应由 data_dir 父目录推导: {bus.state_root}"
+
+        ho = bus.create_handoff("src-a", "dst-a", "收敛意图", "ctx",
+                                auto_state_card=True)
+        assert ho.state_card_id and ho.state_card_id.startswith("ho-")
+        # ho-* 卡落在 <session_root>/state
+        expected = os.path.join(session_root, "state",
+                                f"{ho.state_card_id}.json")
+        assert os.path.exists(expected), \
+            f"ho-* 卡应落 data_dir 父目录派生 state/: {expected}"
+        # 不落 cwd 孤儿
+        assert _assert_no_cwd_ho_orphan(ho.state_card_id), \
+            "ho-* 状态卡不应落 <cwd>/data/state 孤儿"
+
+
+def test_standalone_handoff_data_dir_is_state_root_directly():
+    """data_dir 本身即 <根>（而非 <根>/handoffs）时，state_root 推导为其父目录，
+    ho-* 卡落 <父目录>/state —— 保证永不落 data_dir 内部自嵌套。"""
+    from secretary.handoff import HandoffBus
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 在 tmpdir 内再嵌套一层 outer，令其父目录仍处于 tmpdir 内，
+        # 使推导产物 <父目录>/state 落在临时目录内、随测试自动回收。
+        outer = os.path.join(tmpdir, "outer")
+        os.makedirs(outer)
+        bus = HandoffBus(data_dir=outer)
+        assert bus.state_root == os.path.abspath(tmpdir)
+        ho = bus.create_handoff("ua", "ub", "直接根意图", auto_state_card=True)
+        expected = os.path.join(tmpdir, "state", f"{ho.state_card_id}.json")
+        assert os.path.exists(expected), f"应落父目录 state/: {expected}"
+        assert _assert_no_cwd_ho_orphan(ho.state_card_id)
+
+
+def test_standalone_handoff_explicit_state_root_still_wins():
+    """显式传 state_root 仍为最高优先（不经 data_dir 父目录推导）。"""
+    from secretary.handoff import HandoffBus
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ho_dir = os.path.join(tmpdir, "ho")
+        root = os.path.join(tmpdir, "custom-root")
+        bus = HandoffBus(data_dir=ho_dir, state_root=root)
+        assert bus.state_root == os.path.abspath(root)
+        ho = bus.create_handoff("ua", "ub", "显式根意图", auto_state_card=True)
+        assert os.path.exists(os.path.join(
+            root, "state", f"{ho.state_card_id}.json"))
+        assert _assert_no_cwd_ho_orphan(ho.state_card_id)
+
+
+def test_standalone_handoff_no_data_dir_backward_compatible():
+    """未传 data_dir（含未传 state_root）→ 保持历史退化行为：
+    data_dir=<cwd>/data/handoffs，state_root=None → ho-* 卡落默认
+    <cwd>/data/state（由 StateManager 默认路径承载），向后兼容。"""
+    from secretary.handoff import HandoffBus
+    with tempfile.TemporaryDirectory() as tmpdir:
+        old = os.getcwd()
+        os.chdir(tmpdir)
+        try:
+            bus = HandoffBus()
+            assert bus.data_dir == os.path.join(tmpdir, "data", "handoffs")
+            assert bus.state_root is None, \
+                "未传 data_dir/state_root 应保持 state_root=None（历史行为）"
+            ho = bus.create_handoff("ua", "ub", "退化路径意图",
+                                    auto_state_card=True)
+            # 历史行为：关联卡落 StateManager 默认目录 <cwd>/data/state
+            default_state = os.path.join(tmpdir, "data", "state")
+            assert os.path.exists(os.path.join(
+                default_state, f"{ho.state_card_id}.json")), \
+                "退化路径应保持落 <cwd>/data/state（向后兼容）"
+            # 交接卡本体落 <cwd>/data/handoffs
+            assert os.path.exists(os.path.join(
+                tmpdir, "data", "handoffs", f"{ho.id}.json"))
+        finally:
+            os.chdir(old)

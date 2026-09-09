@@ -138,30 +138,24 @@ def test_handoff_auto_state_card():
     """HandoffBus 自动创建 StateCard"""
     from secretary.handoff import HandoffBus
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 注意：HandoffBus 内部 StateManager 使用默认路径
-        # 需要在指定 data_dir 时确保 HandoffBus 的 StateManager 一致
-        import os
-        old_cwd = os.getcwd()
-        os.chdir(tmpdir)  # 让 StateManager 的默认路径在 tmpdir 下
+        # 独立 HandoffBus 显式 data_dir 时，ho-* 关联状态卡收敛到
+        # <parent(data_dir)>/state（即 <tmpdir>/state），随 tmpdir 自动回收，
+        # 不再需要 chdir 迁就 StateManager 默认路径。
+        bus = HandoffBus(data_dir=os.path.join(tmpdir, "handoffs"))
+        card = bus.create_handoff(
+            source_unit="unit-a",
+            target_unit="unit-b",
+            intent="测试交接",
+            context="上下文",
+            auto_state_card=True,
+        )
+        assert card.state_card_id is not None
+        assert card.state_card_id.startswith("ho-")
 
-        try:
-            bus = HandoffBus(data_dir=os.path.join(tmpdir, "handoffs"))
-            card = bus.create_handoff(
-                source_unit="unit-a",
-                target_unit="unit-b",
-                intent="测试交接",
-                context="上下文",
-                auto_state_card=True,
-            )
-            assert card.state_card_id is not None
-            assert card.state_card_id.startswith("ho-")
-
-            # 验证交接卡持久化
-            card2 = bus.get(card.id)
-            assert card2 is not None
-            assert card2.state_card_id == card.state_card_id
-        finally:
-            os.chdir(old_cwd)
+        # 验证交接卡持久化
+        card2 = bus.get(card.id)
+        assert card2 is not None
+        assert card2.state_card_id == card.state_card_id
 
 
 def test_planner_auto_state_card():

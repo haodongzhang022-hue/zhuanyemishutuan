@@ -111,22 +111,21 @@ def test_handoff_same_state_card_no_dup_task():
     """复用同一稳定 StateCard 时，交接任务不重复堆积"""
     from secretary.handoff import HandoffBus
     with tempfile.TemporaryDirectory() as tmpdir:
-        old = os.getcwd()
-        os.chdir(tmpdir)
-        try:
-            bus = HandoffBus(data_dir=os.path.join(tmpdir, "h"))
-            c1 = bus.create_handoff("ua", "ub", "同意图", "c1",
-                                    auto_state_card=True)
-            c2 = bus.create_handoff("ua", "ub", "同意图", "c2",
-                                    auto_state_card=True)
-            assert c2.state_card_id == c1.state_card_id  # 复用同一会话卡
-            mgr = StateManager()
-            card = mgr.get_card(c1.state_card_id)
-            titles = [t.title for t in card.tasks]
-            assert len(card.tasks) == 1, f"重复 add_task 未去重: {titles}"
-            assert titles[0].startswith("交接:")
-        finally:
-            os.chdir(old)
+        # 独立 HandoffBus 显式 data_dir 时，ho-* 状态卡收敛到
+        # <parent(data_dir)>/state（此处即 <tmpdir>/state），无需 chdir。
+        bus = HandoffBus(data_dir=os.path.join(tmpdir, "handoffs"))
+        c1 = bus.create_handoff("ua", "ub", "同意图", "c1",
+                                auto_state_card=True)
+        c2 = bus.create_handoff("ua", "ub", "同意图", "c2",
+                                auto_state_card=True)
+        assert c2.state_card_id == c1.state_card_id  # 复用同一会话卡
+        # ho-* 状态卡随 data_dir 父目录推导的 state_root 落盘
+        mgr = StateManager(data_dir=os.path.join(bus.state_root, "state"))
+        card = mgr.get_card(c1.state_card_id)
+        assert card is not None, "ho-* 状态卡应落 state_root/state 可读"
+        titles = [t.title for t in card.tasks]
+        assert len(card.tasks) == 1, f"重复 add_task 未去重: {titles}"
+        assert titles[0].startswith("交接:")
 
 
 # ==== 修复回归：submit_chain_up 断链记录可安全展示 ====
