@@ -97,13 +97,21 @@
 |---|---|---|---|
 | ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | ✅ 已修复（#C） |
 | ② | 独立 HandoffBus 未传 state_root 落 cwd 孤儿 | Issue #5 | ✅ 修复（本分支）：data_dir 显式时默认以父目录推导 state_root，ho-* 卡落 `<parent(data_dir)>/state`；未传 data_dir 保持历史退化兼容。回归测试见下（106 项全过） |
-| ③ | delete_card 返回值 docstring 语义漂移 | Issue #6 | open |
+| ③ | delete_card 返回值 docstring 语义漂移 | Issue #6 | ✅ 修复（本分支）：统一返回「状态卡是否存在」（.lock/.owner.json 伴生残留不影响返回值，幂等清理），delete_card/delete_session 两处 docstring 对齐。回归测试见下（115 项全过） |
 
 > P2-② 新增回归测试：
 > - `test_standalone_handoff_explicit_data_dir_derives_state_root` — data_dir 显式 → ho-* 卡落父目录推导的 state/，无 cwd 孤儿
 > - `test_standalone_handoff_data_dir_is_state_root_directly` — data_dir 即根时推导父目录 state/，不自嵌套
 > - `test_standalone_handoff_explicit_state_root_still_wins` — 显式 state_root 最高优先
 > - `test_standalone_handoff_no_data_dir_backward_compatible` — 未传 data_dir 保持历史退化行为（向后兼容）
+
+
+> P2-③ 新增回归测试（返回值语义统一）：
+> - `test_delete_card_card_exists_returns_true` — 状态卡存在 → delete_card 返回 True
+> - `test_delete_card_card_missing_residue_only_returns_false` — 状态卡缺、仅剩 .lock/.owner 残留 → 返回 False（漂移边界），伴生残留仍幂等清理
+> - `test_delete_card_nothing_exists_returns_false` — 卡与残留均无 → False（幂等）
+> - `test_delete_card_idempotent_second_call_returns_false` — 二次删除返回 False
+> - `TestDeleteSessionReturnSemantics` — delete_session 有卡返 True；卡缺仅残留时返 False 且清理完全
 
 ## 四、测试环境
 

@@ -311,9 +311,15 @@ class SecretarySession:
         """清理本会话的全部数据（状态卡 + 原文归档 + 交接卡 + 关联 ho-* 状态卡）。
 
         生命周期语义完整：一次 delete 即回收该会话秘书占用的全部存储，
-        不残留 .lock / 空目录 / 跨实例交接卡 / 交接自动关联的孤儿状态卡。
-        返回"本会话状态卡是否存在"（卡已不存在时返回 False，
-        即使归档/交接等伴生数据已全部清理）。
+        不残留 .lock / .owner.json / 空目录 / 跨实例交接卡 / 交接自动关联的
+        孤儿状态卡。
+
+        **返回值语义（P2-③ 统一）**：返回「清理前本会话状态卡是否存在」，
+        与 ``StateManager.delete_card`` 完全一致——
+        - 状态卡存在 → 已删除，返回 ``True``（清理完成）；
+        - 状态卡本已缺失（仅剩 .lock / .owner.json 等伴生残留）→ 仍会幂等
+          清理全部伴生残留，但返回 ``False``（本会话已不存在）。
+        返回值不代表"清理是否发生"，只代表"清理前会话是否仍存在"。
         """
         # 1) 清理本会话"创建/认领过"的交接卡——含上一实例创建、本实例据台账
         #    恢复认领的卡（跨实例不留残余）
@@ -332,7 +338,10 @@ class SecretarySession:
             self._delete_ho_state_card_if_safe(sid)
         self._owned_state_card_ids.clear()
 
-        # 3) 清理本会话状态卡（连带 .lock / .owner.json）
+        # 3) 清理本会话状态卡（连带 .lock / .owner.json 伴生残留）。
+        #    ok = delete_card 返回"清理前状态卡是否存在"，即本 delete_session
+        #    的返回值（本会话是否曾被建立）。状态卡缺失但伴生残留时 delete_card
+        #    仍会幂等清理残留、返回 False。
         ok = self.state_manager.delete_card(self.session_id)
 
         # 4) 删除本会话归属台账（台账本身也是本会话数据的一部分）

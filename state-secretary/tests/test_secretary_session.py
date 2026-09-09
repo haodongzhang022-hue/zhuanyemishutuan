@@ -616,3 +616,45 @@ class TestSharedHoCardCrossSession:
             os.path.join(state_dir, f"{ho_b.state_card_id}.json")), \
             "B 的 ho-* 卡不受 A 删除影响"
         sec_b.delete_session()
+
+
+# ------------------------------------------------------------------
+# P2-③ 回归：delete_session 返回值语义统一（Issue #6）
+# 与 StateManager.delete_card 对齐：返回「清理前本会话状态卡是否存在」。
+# 状态卡缺失、仅剩伴生残留时同样清理完全但返回 False。
+# ------------------------------------------------------------------
+
+class TestDeleteSessionReturnSemantics:
+    def test_delete_session_returns_true_when_card_existed(self, tmp_dir):
+        """会话有卡：delete_session 返回 True，且全部伴生数据清理完成。"""
+        sec = SecretarySession("delret-1", data_dir=tmp_dir)
+        assert sec.get_card() is not None
+        sec.add_task("任务A", task_type="deliverable")
+        sec.fold("归档原文一\n\n归档原文二")
+        sec.create_handoff("team-a", "team-b", "删除语义", "内容")
+
+        ret = sec.delete_session()
+        assert ret is True, "清理前状态卡存在时应返回 True"
+        assert sec.get_card() is None
+        assert sec.archive.list_refs("delret-1") == []
+
+    def test_delete_session_returns_false_when_card_missing_residue(self, tmp_dir):
+        """状态卡已缺、仅剩 .lock/.owner 残留时 delete_session 返回 False，
+        且残留一并清理（与 delete_card 语义对齐，消除漂移）。"""
+        sec = SecretarySession("delret-2", data_dir=tmp_dir)
+        state_dir = sec.state_manager.data_dir
+        # 保留 .lock/.owner.json 伴生残留，物理移除状态卡本体 → 卡已缺
+        lock_path = os.path.join(state_dir, "delret-2.lock")
+        owner_path = os.path.join(state_dir, "delret-2.owner.json")
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write("")
+        with open(owner_path, "w", encoding="utf-8") as f:
+            f.write('{"owner": "secretary"}')
+        assert os.path.exists(os.path.join(state_dir, "delret-2.json"))
+        os.remove(os.path.join(state_dir, "delret-2.json"))
+
+        ret = sec.delete_session()
+        assert ret is False, "状态卡已缺失时应返回 False（不得因伴生残留返 True）"
+        assert not os.path.exists(lock_path), ".lock 残留应被一并清理"
+        assert not os.path.exists(owner_path), ".owner.json 残留应被一并清理"
+        assert sec.get_card() is None

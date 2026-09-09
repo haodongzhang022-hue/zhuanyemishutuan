@@ -366,6 +366,75 @@ def test_api_state_search():
         results = engine.search_tasks([card], "搜索")
         assert len(results) >= 1
         assert results[0]["title"] == "需要实现一个搜索功能"
+
+
+# =====================================================================
+# P2-③ 回归：delete_card 返回值语义统一（Issue #6）
+# 统一语义：返回「调用前本会话状态卡(<session>.json)是否存在」。
+# - 状态卡存在并删除 → True
+# - 状态卡已缺失、仅剩伴生残留(.lock/.owner.json) → False（此前漂移为 True）
+# - 无论返回 True/False，伴生残留均被幂等清理
+# =====================================================================
+
+def _write_sidecars(mgr, session_id):
+    """显式落盘 .lock / .owner.json 伴生残留。"""
+    lock = os.path.join(mgr.data_dir, f"{session_id}.lock")
+    owner = os.path.join(mgr.data_dir, f"{session_id}.owner.json")
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("")
+    with open(owner, "w", encoding="utf-8") as f:
+        f.write('{"owner": "secretary"}')
+    return lock, owner
+
+
+def test_delete_card_card_exists_returns_true():
+    """状态卡存在时 delete_card 返回 True，伴生残留一并清理。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = StateManager(data_dir=tmpdir)
+        mgr.create_card("p2c-ok", objective="P2-③ 语义回归")
+        card_path = os.path.join(mgr.data_dir, "p2c-ok.json")
+        assert os.path.exists(card_path)
+        assert mgr.delete_card("p2c-ok") is True
+        assert not os.path.exists(card_path)
+        assert mgr.get_card("p2c-ok") is None
+
+
+def test_delete_card_card_missing_residue_only_returns_false():
+    """状态卡缺失、仅剩 .lock/.owner.json 残留时返回 False（语义漂移边界）。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = StateManager(data_dir=tmpdir)
+        mgr.create_card("p2c-res", objective="P2-③ 语义回归")
+        card_path = os.path.join(mgr.data_dir, "p2c-res.json")
+        lock_path, owner_path = _write_sidecars(mgr, "p2c-res")
+        # 移除状态卡本体：卡已缺，仅剩伴生残留
+        os.remove(card_path)
+        assert os.path.exists(lock_path)
+        assert os.path.exists(owner_path)
+
+        ret = mgr.delete_card("p2c-res")
+        assert ret is False, "状态卡已缺失时应返回 False（不得因伴生残留返 True）"
+        # 伴生残留仍被幂等清理
+        assert not os.path.exists(lock_path)
+        assert not os.path.exists(owner_path)
+        assert not os.path.exists(card_path)
+
+
+def test_delete_card_nothing_exists_returns_false():
+    """卡与伴生残留均不存在 → 返回 False（幂等）。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = StateManager(data_dir=tmpdir)
+        assert mgr.delete_card("p2c-none") is False
+
+
+def test_delete_card_idempotent_second_call_returns_false():
+    """重复删除：第一次 True（卡存在），第二次 False（已无卡）。"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = StateManager(data_dir=tmpdir)
+        mgr.create_card("p2c-idem", objective="幂等")
+        assert mgr.delete_card("p2c-idem") is True
+        assert mgr.delete_card("p2c-idem") is False
+        assert mgr.get_card("p2c-idem") is None
+
 if __name__ == "__main__":
     test_create_and_get_state_card()
     test_add_and_update_task()
