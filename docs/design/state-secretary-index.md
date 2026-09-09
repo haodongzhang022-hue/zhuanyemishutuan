@@ -48,7 +48,9 @@
 
 > **2026-09-08**：状态管理秘书模块已落地可运行代码（`state-secretary/`），
 > 代码源自 `hanghangchuzhuangyuan` M9/M10 状态管理层拷贝移植，包名适配为 `secretary.*`。
-> 74 项 pytest 测试全部通过，POC benchmark 可运行。
+> 102 项 pytest 测试全部通过（SecretarySession 门面 28 项，含数据生命周期/评审回归 12 项），POC benchmark 可运行。
+> **2026-09-08 补**：新增 `SecretarySession` 会话门面层——将 state/context/handoff
+> 整合为 L3 会话秘书的统一完整接口，一个实例 = 一个会话秘书，开箱即用。
 
 | 设计文档 | 已落地代码 |
 |---------|-----------|
@@ -57,3 +59,12 @@
 | org.md | `state-secretary/src/secretary/state/hierarchy.py` |
 | cache.md | `state-secretary/src/secretary/context/assembler.py` |
 | poc.md | `state-secretary/poc/state_m9_benchmark.py` |
+| org.md + schema.md + cache.md | `state-secretary/src/secretary/session/session.py` — SecretarySession 门面 |
+
+## 6. 后续待开发项
+
+| 项 | 状态 | 说明 |
+|---|------|------|
+| R7 跨行业复合交接 POC | ⏳ 待开发 | R6 标记的下一步：跨行业复合诉求 = 拆子任务 → 各路由到对应单元 → 交接卡汇合 |
+| 秘书角色×状态机集成验证 | ⏳ 待验证 | 将 SecretarySession 与 CNB NPC/角色实际使用场景对接验证 |
+| CP2 人工确认 | ⏳ 待确认 | 对 POC benchmark 结果做人工验收放行 |

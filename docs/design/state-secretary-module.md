@@ -33,10 +33,13 @@ zhuanyemishutuan/            # 通用层
     │       │   ├── cache_guard.py     # 缓存守卫
     │       │   ├── rules.py           # 规则引擎
     │       │   └── slib_guard.py      # SLIB 装配守卫
-    │       └── handoff/     # 交接总线（M5）
-    │           ├── models.py          # HandoffCard
-    │           └── handoff.py         # HandoffBus
-    ├── tests/               # 74 项 pytest 测试（全部通过）
+    │       ├── handoff/     # 交接总线（M5）
+    │       │   ├── models.py          # HandoffCard
+    │       │   └── handoff.py         # HandoffBus
+    │       └── session/     # 会话门面层（L3 秘书统一入口）
+    │           ├── __init__.py
+    │           └── session.py         # SecretarySession
+    ├── tests/               # 102 项 pytest 测试（全部通过）
     └── poc/                 # POC 脚本 + benchmark
         ├── m1_router.sh             # 单单元路由
         ├── m2_router_composite.sh   # 复合路由
@@ -54,10 +57,12 @@ zhuanyemishutuan/            # 通用层
 | state-secretary-org.md | `state/hierarchy.py` | SecretaryTree + 向上提交 |
 | state-secretary-cache.md | `context/assembler.py` + `cache_guard.py` | 三层装配 + 稳定前缀 |
 | state-secretary-poc.md | `poc/state_m9_benchmark.py` | 已可运行的量化对比 |
+| org.md + schema.md + cache.md | `session/session.py` | SecretarySession 会话门面统一入口 |
 
 ## 4. 落地状态
 
-1. ✅ schema/fold/org 最小可运行代码 + 测试（74 项通过）
+1. ✅ schema/fold/org 最小可运行代码 + 测试（102 项通过，门面 28 项（数据生命周期/评审回归 12 项））
+1. ✅ SecretarySession 会话门面：L3 会话秘书统一入口（state+fold+context+handoff 整合）
 2. ✅ cache 稳定前缀策略（context/assembler.py 三层装配）
 3. ✅ poc/benchmark 可运行
 4. ✅ 独立可部署，不依赖现有模块内部实现

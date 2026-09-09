@@ -25,6 +25,7 @@
 | 批量落盘 | `FlushQueue` / `DeferredWriter` | 架构保障 |
 | 上下文装配 | `ContextAssembler` — 三层物理隔离 + 稳定前缀 | cache.md |
 | POC benchmark | `poc/state_m9_benchmark.py` — token/命中 A/B | poc.md |
+| 会话统一门面 | `SecretarySession` — L3 会话秘书完整驱动（状态+折叠+装配+交接） | org.md |
 
 ## 快速开始
 
@@ -44,9 +45,9 @@ python3 -m pytest tests/ -v
 ## Python API 示例
 
 ```python
+# 底层 API（M9/M10）
 from secretary.state import StateManager, FoldEngine, TaskState
 
-# 创建一张状态卡
 mgr = StateManager(data_dir="/tmp/state-data")
 card = mgr.create_card(
     session_id="my-session",
@@ -54,19 +55,29 @@ card = mgr.create_card(
     unit_id="zhuanyemishutuan",
     role_name="secretary",
 )
-
-# 添加任务
-task = mgr.add_task(
-    session_id="my-session",
-    title="设计数据模型",
-    task_type="deliverable",  # 交付任务恒展开
-)
-
-# 折叠并生成压缩上下文
+task = mgr.add_task(session_id="my-session", title="设计数据模型",
+                    task_type="deliverable")
 engine = FoldEngine("my-session")
 card = mgr.apply_fold_policy("my-session")
 compact = engine.compact_context(card)
-print(compact)  # 只含折叠引用 + 展开任务要素
+
+# ── 推荐用法：SecretarySession 会话门面 ─────────────────────────
+# 一个 L3 会话秘书 = 一个 SecretarySession 实例
+from secretary.session import SecretarySession
+
+sec = SecretarySession("issue-42", objective="实现状态管理秘书机制")
+sec.add_task("设计数据模型", task_type="deliverable")   # 交付任务恒展开
+sec.fold("需求澄清：Q1 四层秘书定义…", meta={"objective": "澄清"})
+
+ctx = sec.get_compact_context()        # 压缩上下文（驱动下一轮）
+nav = sec.get_navigation()             # 任务导航视图
+summary = sec.summarize_for_upstream() # 向上级提交汇总态
+
+# 三层上下文装配（缓存键 = layer_a 哈希）
+result = sec.assemble_context(user_text="查询进度")
+cache_key = result["cache_key"]        # 同一会话稳定不变
+# ⚠ 若未配置 static_prefix，所有会话的 layer_a 相同 → 缓存键共享；
+#   需要隔离时请在 SecretarySession 传入独立的 static_prefix。
 ```
 
 ## 目录结构
@@ -91,10 +102,13 @@ state-secretary/
 │       │   ├── cache_guard.py   # 缓存守卫
 │       │   ├── rules.py         # 规则引擎
 │       │   └── slib_guard.py    # SLIB 装配守卫
-│       └── handoff/             # 交接总线（M5）
-│           ├── models.py        # HandoffCard
-│           └── handoff.py       # HandoffBus
-├── tests/                       # 74 项测试
+│       ├── handoff/             # 交接总线（M5）
+│       │   ├── models.py        # HandoffCard
+│       │   └── handoff.py       # HandoffBus
+│       └── session/             # 会话门面层（L3 秘书统一入口）
+│           ├── __init__.py
+│           └── session.py       # SecretarySession（推荐使用）
+├── tests/                       # 102 项测试（门面 28 项，含数据生命周期/评审回归 12 项）
 ├── poc/                         # POC 脚本 + benchmark
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC
