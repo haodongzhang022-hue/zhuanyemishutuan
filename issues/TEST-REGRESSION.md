@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **133 项通过**（123 + 🔴#4 复评回归 10）
+- 测试基线：全量 pytest **137 项通过**（123 + 🔴#4 复评回归 14）
 
 ---
 
@@ -121,9 +121,39 @@
 
 > 复评 🟡 一并落地：
 > - 🟡1 `test_malformed_field_types_treated_as_empty` 恒真断言 → 换为判别性断言（非法字段不产生任何存活引用）。
-> - 🟡2 测试计数同步：README/设计文档 102 → **132**。
+> - 🟡2 测试计数同步：README/设计文档 102 → **137**。
 > - 🟡3 共享卡「后到者上下文静默丢弃」语义写入 `SecretarySession.create_handoff` / `HandoffBus.create_handoff` docstring。
 > - 🟢 `Optional[set]` → `Optional[Set[str]]`。
+
+### 🔴 修复 #F — 🔴#4 跟进收口（Issue #4 复评 #E 的残差）
+> 评审对象 `11dfdd9`（修复 #E）。四布局扫描界已过，但 #E 的实现仍留 2 处残差，
+> 与本角色独立探针（不变量「存活交接卡 → 其 ``state_card_id`` 状态卡必须存在」）
+> 的复现一致。
+- **残差 1（同型同根因）**：`delete_session()` 以 `exclude_handoff_ids=set(owned_handoffs)`
+  把**本会话认领的交接卡 ID 从索引中排除**，假定"自身卡一定已删"。若该卡
+  **删除失败**（OSError / 权限 / 竞态）仍留盘，排除它会让共享卡被误删、而残卡
+  仍持有失效引用——破坏不变量。修复：**取消自身卡排除**，凡磁盘上实际存在的
+  交接卡一律计为存活引用（宁可延迟回收，绝不误删）；残卡清除后引用自然清空、
+  共享卡可回收，不产生永久孤儿。
+- **残差 2**：`os.walk` 递归扫描界只剪枝隐藏目录与归档根，未剪枝 `node_modules`
+  等重型非数据目录。`data_dir` 指向工作区根时全树遍历代价高，且其内无关 JSON
+  可能被形状校验误判为交接卡引用 → **永久阻塞共享卡回收**。修复：新增
+  `_SKIP_SCAN_DIRS` 剪枝；形状校验收紧为须同时含 `state_card_id` +
+  `source_unit` + `target_unit` + `id`。
+- **怎么测**：
+  1. **自身卡删除失败**：monkeypatch `os.remove` 令自身交接卡删除抛 `OSError` →
+     共享卡不得被删、自身状态卡仍正常回收；残卡清除后共享卡可回收。
+  2. **重型目录剪枝**：`node_modules` 内伪交接卡（含全部字段）不得产生任何引用。
+  3. **形状校验**：`state/` 下 StateCard JSON 不得被误判为交接卡，真实交接卡引用仍计入。
+- **回归测试**：`TestSharedHoCardSelfResidueInvariant`（2 项）+ `TestSharedHoCardScanPruning`（2 项）
+  —— 其中 3 项在 `11dfdd9` 上失败（有判别力）。
+
+> 🟡 复评 #E 收口：
+> - 🟡1 `test_malformed_field_types_treated_as_empty` 的"判别性断言"仍偏弱（仅断言
+>   非法值不作为 key）。**加强**：非法台账会话不得出现在**任何**引用者标签中 +
+>   同目录正常交接卡引用必须仍被计入（证明索引非"空而恒真"）。
+> - 🟡3 `_scan_ho_referencing_sessions` 补 `.. deprecated::` 标注（#E 遗漏）。
+> - 测试计数同步 README/设计文档 → **137**。
 
 ## 三、可复现缺陷记录（P2 待办）
 

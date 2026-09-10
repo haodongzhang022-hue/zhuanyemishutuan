@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Any
 
 from ..state import (
     StateManager, StateCard, TaskRecord,
@@ -34,6 +34,13 @@ from ..state.content_archive import ContentArchive
 from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
+
+# 扫描界递归时跳过的重型/非数据目录（防 data_dir 指向工作区根时全树遍历，
+# 亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）
+_SKIP_SCAN_DIRS = frozenset({
+    "node_modules", "__pycache__", "venv", ".venv", "env",
+    "dist", "build", "target", "site-packages", "vendor", "coverage",
+})
 
 
 class _StateCardProxy:
@@ -286,12 +293,13 @@ class SecretarySession:
             return False
         if '"state_card_id"' not in raw:
             return False
-        return '"source_unit"' in raw or '"target_unit"' in raw
+        if '"source_unit"' not in raw or '"target_unit"' not in raw:
+            return False
+        # 交接卡必有 id 字段；StateCard 有 session_id 无 source_unit/target_unit，
+        # 归档/台账亦不含这些字段，故三者不会误入
+        return '"id"' in raw
 
-    def _build_ho_reference_index(
-        self,
-        exclude_handoff_ids: Optional[Set[str]] = None,
-    ) -> Dict[str, List[str]]:
+    def _build_ho_reference_index(self) -> Dict[str, List[str]]:
         """一次扫描建立 ``state_card_id -> 存活引用者标签`` 索引。
 
         **扫描界 = 本会话数据根 ``self._session_root``（递归）**，而非仅本会话
@@ -320,16 +328,19 @@ class SecretarySession:
 
         剪枝：跳过隐藏目录、跳过原文归档根（归档条目永不含 ``state_card_id``）。
 
+        **保守方向（不变量优先）**：凡扫描界内**实际存在**的交接卡/登记一律
+        计入引用，**不做**"排除自身认领卡"处理。调用方（``delete_session``）
+        在取索引前已先删除本会话交接卡（🔴#1），故自身卡通常已不在磁盘；若
+        某张自身卡**删除失败**仍留在盘上，它就是一个**真实的存活引用**——
+        此时排除它会让共享卡被误删、而该残卡仍持有失效引用，破坏不变量
+        「存活交接卡 → 其 ``state_card_id`` 状态卡必须存在」。宁可多保留
+        （引用未清 → 不删共享卡，仅延迟回收），绝不误删。
+
         引用者标签：会话引用记会话 ID；交接卡引用记 ``handoff:<card_id>``，
-        两类语义可区分。本会话自身台账/交接卡不计入——调用方
-        （``delete_session``）须**先撤销自身引用**再取本索引（🔴#1）。
+        两类语义可区分。
 
         一次遍历同时建立全量索引，删除路径不再"每张卡各扫一遍目录"，
         复杂度由 O(卡数 × 台账数) 降为 O(台账数 + 卡数)。
-
-        Args:
-            exclude_handoff_ids: 额外排除的交接卡 ID（如本会话已认领但删除
-                失败的卡，避免自身残卡被误判为"他人的存活引用"）。
         """
         index: Dict[str, List[str]] = {}
         state_dir = os.path.abspath(self.state_manager.data_dir)
@@ -345,12 +356,15 @@ class SecretarySession:
             if label not in bucket:
                 bucket.append(label)
 
-        own_handoff_ids = set(self._owned_handoff_ids)
-        own_handoff_ids |= set(exclude_handoff_ids or ())
         prefix, suffix = ".session-", ".owned"
         for dirpath, dirnames, filenames in os.walk(scan_root):
-            # 剪枝：隐藏目录（如 .git）与原文归档根（归档条目不含引用字段）
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            # 剪枝：隐藏目录（如 .git）、原文归档根（归档条目不含引用字段）、
+            # 重型非数据目录（node_modules/venv 等——全树遍历代价高，且其内
+            # 无关 JSON 可能被误判为交接卡引用而永久阻塞共享卡回收）
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith(".") and d not in _SKIP_SCAN_DIRS
+            ]
             if os.path.abspath(dirpath) == archive_root:
                 dirnames[:] = []
                 continue
@@ -380,8 +394,6 @@ class SecretarySession:
                 if fname.startswith(".") or not fname.endswith(".json"):
                     continue
                 card_id = fname[:-5]
-                if card_id in own_handoff_ids:
-                    continue  # 本会话自身引用，不计入
                 # 预筛 + 形状校验：仅"交接卡"（含 state_card_id 且具
                 # source_unit/target_unit）计入，避免把 StateCard / 租约文件
                 # 等误判为引用者，也不为其做无谓 JSON 解析。
@@ -406,8 +418,6 @@ class SecretarySession:
                 card_id = data.get("card_id")
                 if not isinstance(card_id, str) or not card_id:
                     continue
-                if card_id in own_handoff_ids:
-                    continue  # 本会话自身引用，不计入
                 scid = data.get("state_card_id")
                 if not isinstance(scid, str) or not scid:
                     continue
@@ -431,7 +441,10 @@ class SecretarySession:
         return bool(index.get(state_card_id))
 
     def _scan_ho_referencing_sessions(self, state_card_id: str) -> List[str]:
-        """兼容包装：返回仍存活引用该 ho-* 卡的引用者标签列表。
+        """.. deprecated:: 使用 ``_build_ho_reference_index`` 直接取索引。
+
+        兼容包装（保留历史调用点，勿在新代码使用）：返回仍存活引用该
+        ho-* 卡的引用者标签列表。
 
         标签语义与 ``_build_ho_reference_index`` 一致——会话引用为会话 ID，
         交接卡引用为 ``handoff:<card_id>``（两类可区分）。空列表 = 引用已清、
@@ -487,6 +500,13 @@ class SecretarySession:
         **引用源（🔴#2 修复）**：存活引用 = 其他存活会话归属台账 ∪ 未删除
         交接卡的 ``state_card_id``（覆盖不落台账的独立 ``HandoffBus`` 使用者）。
 
+        **扫描界（🔴#4 修复）**：引用扫描界不再只到 ``handoff_bus.data_dir``
+        单目录，而是提升到**会话数据根**（递归，剪枝隐藏目录与原文归档根），
+        并并入 state 根级引用登记 ``<state_root>/handoff-refs/*.ref``（覆盖
+        交接卡目录完全在会话数据根之外的独立使用者）。否则"独立使用者交接
+        目录 ≠ 会话 handoffs/、但 state 根相同"时，其交接卡引用不在扫描界内
+        → 判定"无存活引用"→ 删共享卡 → 存活引用静默失效（🔴#4）。
+
         **返回值语义（P2-③ 统一）**：返回「清理前本会话状态卡是否存在」，
         与 ``StateManager.delete_card`` 完全一致——
         - 状态卡存在 → 已删除，返回 ``True``（清理完成）；
@@ -523,8 +543,9 @@ class SecretarySession:
 
         # 4) 自身引用已全部撤销 → 一次扫描建立存活引用索引，回收已无引用的
         #    共享 ho-* 卡（引用未清不得删：P2-①；顺序 🔴#1 / 引用源 🔴#2）
-        reference_index = self._build_ho_reference_index(
-            exclude_handoff_ids=set(owned_handoffs))
+        #    不再传"自身卡排除"：自身交接卡已在上一步撤销；若撤销失败而残卡
+        #    仍在磁盘，它即真实存活引用，须计入以守住"存活卡 → 状态卡存在"不变量。
+        reference_index = self._build_ho_reference_index()
         for sid in ho_cards:
             self._delete_ho_state_card_if_safe(sid, reference_index)
         self._owned_state_card_ids.clear()

@@ -845,6 +845,117 @@ class TestSharedHoCardIndependentBusReference:
         reclaim.delete_session()
 
 
+class TestSharedHoCardSelfResidueInvariant:
+    """🔴#4 跟进：不变量「存活交接卡 → 其 state_card_id 状态卡必须存在」在
+    **自身交接卡删除失败**时同样成立。
+
+    原实现把本会话认领的交接卡 ID 作为 ``exclude_handoff_ids`` 从索引中排除，
+    假定"自身卡一定已删"。若删除失败（OSError/权限/竞态）卡仍在盘上，排除它
+    会让共享卡被误删，而残卡仍持有失效引用 —— 与 🔴#4 同型。修复：不再排除，
+    磁盘上仍在的卡即真实存活引用（宁可延迟回收，绝不误删）。
+    """
+
+    def test_own_handoff_delete_failure_keeps_shared_card(self, tmp_dir, monkeypatch):
+        """自身交接卡删除失败仍留盘 → 共享卡不得被删（引用仍有效）。"""
+        sec = SecretarySession("sr-a", data_dir=tmp_dir)
+        ho = sec.create_handoff("s-x", "t-y", "删除失败意图", "ctx")
+        sid = ho.state_card_id
+        state_dir = sec.state_manager.data_dir
+        handoff_path = os.path.join(sec.handoff_bus.data_dir, f"{ho.id}.json")
+
+        # 模拟删除失败：仅对该交接卡文件的 os.remove 抛 OSError
+        real_remove = os.remove
+
+        def flaky_remove(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(handoff_path):
+                raise OSError("simulated removal failure")
+            return real_remove(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "remove", flaky_remove)
+        sec.delete_session()
+        monkeypatch.undo()
+
+        assert os.path.exists(handoff_path), "前置：自身交接卡仍留盘"
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "留盘的交接卡仍持有有效引用 → 共享卡不得被删（否则引用静默失效）"
+        assert not os.path.exists(os.path.join(state_dir, "sr-a.json")), \
+            "秘书自身状态卡仍应正常回收"
+
+    def test_own_residue_reclaims_after_card_removed(self, tmp_dir):
+        """残卡清除后引用清空 → 共享卡可由后续删除者回收（不永久孤儿）。"""
+        sec_a = SecretarySession("sr-b", data_dir=tmp_dir)
+        ho = sec_a.create_handoff("s-x", "t-y", "残卡回收意图", "ctx")
+        sid = ho.state_card_id
+        state_dir = sec_a.state_manager.data_dir
+        handoff_path = os.path.join(sec_a.handoff_bus.data_dir, f"{ho.id}.json")
+
+        # 模拟"删除失败"：自身卡留盘、台账与状态卡已撤（delete_session 顺序）
+        real_remove = os.remove
+
+        def flaky_remove(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(handoff_path):
+                raise OSError("simulated removal failure")
+            return real_remove(path, *args, **kwargs)
+
+        os.remove = flaky_remove
+        try:
+            sec_a.delete_session()
+        finally:
+            os.remove = real_remove
+        assert os.path.exists(handoff_path), "前置：残卡仍留盘"
+
+        other = SecretarySession("sr-c", data_dir=tmp_dir)
+        assert f"handoff:{ho.id}" in other._build_ho_reference_index().get(sid, []), \
+            "残卡留盘期间仍应计为存活引用（不误删）"
+
+        # 残卡清除 → 引用清空 → 共享卡可回收（不永久孤儿）
+        os.remove(handoff_path)
+        index = other._build_ho_reference_index()
+        assert not index.get(sid), "残卡清除后不应再有存活引用"
+        assert other._delete_ho_state_card_if_safe(sid, index) is True
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "引用清空后共享卡应可回收（无永久孤儿）"
+        other.delete_session()
+
+
+class TestSharedHoCardScanPruning:
+    """🔴#4 跟进：扫描界须剪枝重型非数据目录，且形状校验须能排除伪交接卡。"""
+
+    def test_heavy_dirs_pruned_and_no_pseudo_reference(self, tmp_dir):
+        """node_modules 内伪交接卡（含 state_card_id/source_unit/target_unit/id）
+        不应被计入引用——否则会永久阻塞共享卡回收，且拖慢删除路径。"""
+        import json
+
+        nm = os.path.join(tmp_dir, "node_modules", "pkg")
+        os.makedirs(nm)
+        for i in range(20):
+            with open(os.path.join(nm, f"f{i}.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": f"p{i}", "source_unit": "x", "target_unit": "y",
+                           "state_card_id": f"fake-{i}"}, f)
+
+        sec = SecretarySession("sp-a", data_dir=tmp_dir)
+        index = sec._build_ho_reference_index()
+        assert not any(k.startswith("fake-") for k in index), \
+            "重型非数据目录应被剪枝，其 JSON 不得产生伪引用"
+        sec.delete_session()
+
+    def test_state_card_files_not_mistaken_as_handoff(self, tmp_dir):
+        """state/ 下的 StateCard JSON 不得被误判为交接卡引用。"""
+        sec_a = SecretarySession("sp-b", data_dir=tmp_dir)
+        sec_b = SecretarySession("sp-c", data_dir=tmp_dir)
+        ho = sec_a.create_handoff("s-x", "t-y", "形状校验意图", "ctx")
+
+        index = sec_b._build_ho_reference_index()
+        # StateCard 无 source_unit/target_unit → 不应贡献 handoff: 标签
+        for labels in index.values():
+            assert not any(l.startswith("handoff:sp-b") for l in labels), \
+                "StateCard JSON 不得被误判为交接卡"
+        assert f"handoff:{ho.id}" in index.get(ho.state_card_id, []), \
+            "真实交接卡引用仍应被计入（判别性）"
+        sec_a.delete_session()
+        sec_b.delete_session()
+
+
 class TestSharedHoCardStateRootRegistry:
     """🔴#4：state 根级引用登记——覆盖"交接卡目录在会话数据根之外"的布局，
     且登记随卡回收、stale 登记不得永久阻塞共享卡回收。"""
@@ -901,8 +1012,8 @@ class TestSharedHoCardStateRootRegistry:
         os.makedirs(root)
         bus = HandoffBus(data_dir=os.path.join(tmp_dir, "elsewhere"),
                          state_root=root)
-        ho = bus.create_handoff("ua", "ub", "根外意图", "ctx",
-                                auto_state_card=True)
+        bus.create_handoff("ua", "ub", "根外意图", "ctx",
+                           auto_state_card=True)
         sec = SecretarySession("oor-1", data_dir=root)
         ho_sec = sec.create_handoff("ua", "ub", "根外意图", "ctx")
         sid = ho_sec.state_card_id
@@ -957,11 +1068,21 @@ class TestLedgerMalformedRobustness:
         assert not os.path.exists(os.path.join(state_dir, "crash.json"))
 
     def test_malformed_field_types_treated_as_empty(self, tmp_dir):
-        """handoff_ids/state_card_ids 字段类型不符（字符串/数字）视为空，不崩。"""
+        """handoff_ids/state_card_ids 字段类型不符（字符串/数字/对象）视为空台账，不崩。
+
+        判别性断言（替换原恒真断言 ``index == {} or all(v ...)``——索引值由
+        ``_add`` 构造必为非空列表，该式恒真、无判别力）：
+        ① 字段类型不符的**其他会话**台账不得贡献任何引用者标签；
+        ② 同目录正常交接卡的引用必须**仍被计入**——证明索引非"空而恒真"，
+        而是确实扫到并区分了合法/非法台账。
+        """
         import json
+
+        from secretary.handoff import HandoffBus
 
         ho_dir = os.path.join(tmp_dir, "handoffs")
         os.makedirs(ho_dir, exist_ok=True)
+        # 本会话自身台账字段类型不符
         with open(os.path.join(ho_dir, ".session-weird.owned"),
                   "w", encoding="utf-8") as f:
             json.dump({"handoff_ids": "not-a-list",
@@ -969,11 +1090,29 @@ class TestLedgerMalformedRobustness:
 
         sec = SecretarySession("weird", data_dir=tmp_dir)
         assert sec._owned_handoffs() == [], "字段类型不符应视为空台账"
-        # 判别性断言：非法台账不得产生任何存活引用（旧断言恒真、无判别力）
+
+        # 同根另一存活会话台账字段类型同样不符（对象/字符串）
+        sec_other = SecretarySession("weird2", data_dir=tmp_dir)
+        with open(os.path.join(ho_dir, ".session-weird2.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"handoff_ids": {"a": 1}, "state_card_ids": "42"}, f)
+
+        # 同目录一张正常交接卡：其引用必须仍被计入（判别性）
+        bus = HandoffBus(data_dir=ho_dir)
+        ho = bus.create_handoff("s-x", "t-x", "类型不符意图", "ctx",
+                                auto_state_card=True)
+
         index = sec._build_ho_reference_index()
-        assert index.get("not-a-list") is None
-        assert index.get("42") is None
+        labels = index.get(ho.state_card_id, [])
+        assert f"handoff:{ho.id}" in labels, \
+            "正常交接卡的引用应被计入（否则断言无判别力）"
+        assert "weird2" not in labels, \
+            "字段类型不符的台账不得贡献引用者标签"
+        assert all("weird2" not in v for v in index.values()), \
+            "非法台账会话不得出现在任何引用者标签中"
+
         sec.delete_session()
+        sec_other.delete_session()
 
     def test_reference_index_single_scan_multi_card(self, tmp_dir):
         """一次扫描建立 state_card_id → 引用者集合索引（O(台账+卡) 而非逐卡扫）。"""
