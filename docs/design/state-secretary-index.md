@@ -14,6 +14,7 @@
 | `state-secretary-cache.md` | 缓存命中保障 + 稳定前缀 + 丢弃时机机制 |
 | `state-secretary-poc.md` | POC 验证方案（token 消耗与缓存命中 A/B） |
 | `state-secretary-module.md` | 落库新增独立模块划分建议（Q5） |
+| `state-secretary-handoff-visibility.md` | 交接卡引用可见性契约边界（P0-1/P0-2/P1-1 修复后更新；仅 🟡B 边界随 Issue #8） |
 
 ## 2. 对 SKILL.state 论文的三层改进对照
 
@@ -48,7 +49,7 @@
 
 > **2026-09-08**：状态管理秘书模块已落地可运行代码（`state-secretary/`），
 > 代码源自 `hanghangchuzhuangyuan` M9/M10 状态管理层拷贝移植，包名适配为 `secretary.*`。
-> 102 项 pytest 测试全部通过（SecretarySession 门面 28 项，含数据生命周期/评审回归 12 项），POC benchmark 可运行。
+> 308 项 pytest 测试全部通过（SecretarySession 门面 148 项 + 独立探针 65 项 + Issue #4 验收矩阵 13 项，含数据生命周期/评审回归），POC benchmark 可运行。
 > **2026-09-08 补**：新增 `SecretarySession` 会话门面层——将 state/context/handoff
 > 整合为 L3 会话秘书的统一完整接口，一个实例 = 一个会话秘书，开箱即用。
 
@@ -60,6 +61,20 @@
 | cache.md | `state-secretary/src/secretary/context/assembler.py` |
 | poc.md | `state-secretary/poc/state_m9_benchmark.py` |
 | org.md + schema.md + cache.md | `state-secretary/src/secretary/session/session.py` — SecretarySession 门面 |
+
+## 5.1 契约边界
+
+交接卡引用的**可见性保证范围**见 `state-secretary-handoff-visibility.md`：
+- 🔴 **P0-1 已修复**：剪枝不再按裸目录名判定（保护子树永不剪枝 + 名单目录形状判定）
+  → 名单名目录（`build`/`dist`/`env`/`venv` 等）内真实/遗留交接卡引用可见；
+- 🔴 **P0-2 已修复**：`registry isdir→listdir` TOCTOU 加 `OSError` 守卫；扫描异常
+  保守跳过回收且不中断清理；
+- 🔴 **P1-3 已修复**：`card_id` 白名单校验，`delete`/`_unregister_ref`/台账
+  `handoff_ids` 不再构成路径穿越删除面；
+- 🟡 **P1-1 已修复**：**双通道登记**（主 `handoff-refs/` + 备 `.handoff-refs/`）
+  任一生效即引用可见；双通道全失败且为唯一可见性路径时 fail-fast（原 🟡D/🟡E 闭环）；
+- ⚠️ 仅剩 🟡B（形状校验必含 `id`）为已知边界，随 **Issue #8** 跟踪，**不阻断合并**。
+核心契约（扫描界 / 引用源并集 / 登记生命周期 / 自身残卡不变量 / 回收语义）已冻结。
 
 ## 6. 后续待开发项
 

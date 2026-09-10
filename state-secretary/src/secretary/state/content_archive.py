@@ -19,9 +19,10 @@ import time
 from typing import Dict, List, Optional
 
 # 标识符白名单：仅允许字母/数字/下划线/短横线，防路径穿越
-_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# 尾锚 ``\Z``（非 ``$``，后者会放行尾换行）——🟡-4 同族收紧。
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\Z")
 # content_ref 常形如 {session}-seg001；保留 {session}-seg 前缀以兼容 FoldEngine
-_REF_PATTERN = re.compile(r"^[A-Za-z0-9_-]+-seg[0-9]+$")
+_REF_PATTERN = re.compile(r"^[A-Za-z0-9_-]+-seg[0-9]+\Z")
 # 分隔符：session 与段号
 _SEG_PREFIX = "seg"
 

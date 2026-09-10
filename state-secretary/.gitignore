@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 data/state/
+data/content/
 data/bindings/
 data/handoffs/
+data/handoff-refs/
+data/.handoff-refs/
 *.lock

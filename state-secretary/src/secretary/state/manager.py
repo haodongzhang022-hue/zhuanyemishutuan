@@ -12,7 +12,8 @@ from .persist import FlushQueue
 from .models import StateCard, TaskRecord, TaskState, FoldState
 
 # session_id 白名单：仅允许字母/数字/下划线/短横线
-_SESSION_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+# 尾锚 ``\Z``（非 ``$``，后者会放行尾换行）——🟡-4 同族收紧。
+_SESSION_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 
 class _CardLockContext:
