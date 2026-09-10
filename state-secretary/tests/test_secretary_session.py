@@ -1820,6 +1820,8 @@ class TestKeptSkipDepthOrderIndependence:
 # ------------------------------------------------------------------
 
 HIDDEN_DATA_DIR_NAMES = [".staging", ".cache", ".data", ".build"]
+# 评审验收口径（复评第 5 轮 M-1）：点前缀名 × 3 触发（in-root）**0 破坏**
+REVIEWER_HIDDEN_NAMES = [".data", ".cache", ".secretary", ".state", ".queue"]
 HIDDEN_TRIGGERS = ("legacy_no_registry", "registry_failed",
                    "ref_externally_removed")
 
@@ -1868,6 +1870,18 @@ class TestHiddenDirVisibility:
     @pytest.mark.parametrize("trigger", HIDDEN_TRIGGERS)
     def test_hidden_named_data_dir_keeps_live_reference(
             self, tmp_dir, dirname, trigger):
+        self._case(tmp_dir, dirname, trigger)
+
+    @pytest.mark.parametrize("dirname", REVIEWER_HIDDEN_NAMES)
+    @pytest.mark.parametrize("trigger", HIDDEN_TRIGGERS)
+    def test_reviewer_acceptance_hidden_names(self, tmp_dir, dirname, trigger):
+        """评审 M-1 验收口径：点前缀名（``.data``/``.cache``/``.secretary``/
+        ``.state``/``.queue``）× 3 触发路径（in-root）→ **0 破坏**。
+
+        判别力：还原 ``_keep_scan_dir`` 的 ``name.startswith(".") → False``
+        裸名剪枝分支 → 本组 **15/15 FAIL**（基线 ``8790e5f`` 独立探针实测
+        15/15 破坏，已复现）。
+        """
         self._case(tmp_dir, dirname, trigger)
 
     def test_non_hidden_named_data_dir_control(self, tmp_dir):
@@ -1957,13 +1971,14 @@ class TestScanBudgetBoundary:
 # ------------------------------------------------------------------
 
 class TestFailFastRollbackBoundary:
-    """🟡C：双通道登记全失败 + 根外布局 → ``create_handoff`` fail-fast 回滚
-    **交接卡**；但此前已建的 ``ho-*`` 关联卡（``state/``）**不在回滚面内**
-    → 留盘残骸，且无台账/引用可达 → 后续 ``delete_session`` 不回收。
+    """🟡C / 🟡1：双通道登记全失败 + 根外布局 → ``create_handoff`` fail-fast
+    回滚**本次调用产生的全部落盘物**（交接卡 + 本次新建的 ``ho-*`` 卡）。
 
-    定级 🟡（反向资源泄漏，不破坏不变量；且该 ho-* 卡可能是**既有共享卡**
-    ——hash 复用，回滚前须判"是否本次新建"，属行为变更）。本轮**范围冻结**
-    （总师 §7.1），故**不**改行为，仅以确定性用例锁定该已知边界 + 文档声明。
+    🔴 复评第 5 轮 🟡1 修复前：只回滚交接卡本体，``sm.get_or_create`` 刚落盘的
+    ``ho-*.json`` + ``ho-*.lock`` 不回滚 → 连续失败累积孤儿卡（回执「fail-fast
+    且零残留」与实际不符）。修复后：**仅当该 ho-* 卡由本次调用新建**时一并回收
+    （``delete_card`` 幂等清理 .json/.lock/.owner.json）；**先已存在的共享卡不动**
+    （hash 复用场景，误删会破坏他处引用）。
     """
 
     def test_fail_fast_rolls_back_handoff_card(self, tmp_dir):
@@ -1981,10 +1996,9 @@ class TestFailFastRollbackBoundary:
         assert os.listdir(outside) == [], \
             "fail-fast 须回滚交接卡本体（不产生悬空引用）"
 
-    def test_fail_fast_leaves_ho_card_known_boundary(self, tmp_dir):
-        """已知边界锁定：fail-fast 后 ``state/`` 的 ``ho-*`` 卡 + ``.lock``
-        仍在盘上，且后续 ``delete_session`` 不回收（无台账、无引用）。
-        该断言若失败 → 行为已变（如 🟡C 被修复），须同步更新契约文档。"""
+    def test_fail_fast_rolls_back_newly_created_ho_card(self, tmp_dir):
+        """🟡1 修复：fail-fast 须一并回收**本次新建**的 ``ho-*`` 卡
+        （不留 ``.json``/``.lock`` 孤儿）；连续 3 次失败不得累积残骸。"""
         root = os.path.join(tmp_dir, "root")
         outside = os.path.join(tmp_dir, "outside")
         os.makedirs(root, exist_ok=True)
@@ -1993,20 +2007,200 @@ class TestFailFastRollbackBoundary:
             with open(os.path.join(root, name), "w", encoding="utf-8") as f:
                 f.write("x")
         bus = HandoffBus(data_dir=outside, state_root=root)
-        with pytest.raises(OSError):
-            bus.create_handoff("ua", "ub", "边界意图", "ctx",
-                               auto_state_card=True)
+        for i in range(3):
+            with pytest.raises(OSError):
+                bus.create_handoff("ua", "ub", f"孤儿意图{i}", "ctx",
+                                   auto_state_card=True)
 
         state_dir = os.path.join(root, "state")
-        leftovers = [n for n in os.listdir(state_dir)
-                     if n.startswith("ho-")]
-        assert leftovers, "已知边界：fail-fast 后 ho-* 关联卡残骸留盘（🟡C）"
+        leftovers = (sorted(os.listdir(state_dir))
+                     if os.path.isdir(state_dir) else [])
+        assert leftovers == [], (
+            f"🟡1 回归：fail-fast 须回滚本次新建的 ho-* 卡（不留 .json/.lock "
+            f"孤儿），实测残留 {leftovers}")
 
-        SecretarySession("ff-a", data_dir=root).delete_session()
-        still = [n for n in os.listdir(state_dir) if n.startswith("ho-")]
-        assert still, (
-            "已知边界：残骸无台账/无引用可达 → 后续 delete_session 不回收"
-            "（🟡C，契约文档 §4 已声明）")
+    def test_fail_fast_keeps_preexisting_shared_ho_card(self, tmp_dir):
+        """反向对照（防误删）：``ho-*`` 卡**先已存在**（他处合法持有）时，
+        fail-fast 只回滚交接卡本体，**不得**删该共享卡。"""
+        root = os.path.join(tmp_dir, "root")
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(outside, exist_ok=True)
+
+        pre = HandoffBus(data_dir=os.path.join(root, "handoffs"),
+                         state_root=root)
+        pre_card = pre.create_handoff("ua", "ub", "共享意图", "ctx",
+                                      auto_state_card=True)
+        sid = pre_card.state_card_id
+        state_dir = os.path.join(root, "state")
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "前置：ho-* 卡须已存在"
+
+        for name in ("handoff-refs", ".handoff-refs"):
+            reg = os.path.join(root, name)
+            if os.path.isdir(reg):
+                shutil.rmtree(reg, ignore_errors=True)
+            with open(reg, "w", encoding="utf-8") as f:
+                f.write("x")
+        bus = HandoffBus(data_dir=outside, state_root=root)
+        with pytest.raises(OSError):
+            bus.create_handoff("ua", "ub", "共享意图", "ctx",
+                               auto_state_card=True)
+
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "🟡1：fail-fast 不得误删**先已存在**的共享 ho-* 卡（仅回滚本次新建物）"
+
+
+# ------------------------------------------------------------------
+# 🟡2 异常族收口：非 OSError 扫描异常不得逃逸 delete_session
+# ------------------------------------------------------------------
+
+class TestYellow2NonOserrorScanEscape:
+    """🟡2：``delete_session`` 的扫描异常守卫原只兜 ``OSError``；注入
+    ``TypeError``/``RuntimeError`` 等**非 OSError** 异常会逃逸出
+    ``delete_session`` → 归档/台账清理被跳过（契约 §2「扫描异常不得逃逸」
+    应写明异常族）。修复后收口为**兜全部异常**。"""
+
+    @pytest.mark.parametrize("exc", [TypeError, RuntimeError, ValueError])
+    def test_non_oserror_scan_failure_does_not_escape(self, tmp_dir,
+                                                      monkeypatch, exc):
+        sec = SecretarySession("y2-a", data_dir=tmp_dir)
+        ho = sec.create_handoff("ua", "ub", "非OSError意图", "ctx")
+        sid = ho.state_card_id
+        sec.fold("段落一\n段落二")
+        state_dir = sec.state_manager.data_dir
+
+        def boom(self, *a, **k):
+            raise exc("simulated scan failure")
+
+        monkeypatch.setattr(SecretarySession, "_build_ho_reference_index", boom)
+        ret = sec.delete_session()      # 旧实现此处逃逸
+        monkeypatch.undo()
+
+        assert ret is True
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "扫描不可用 → 保守不删共享卡（宁可不删）"
+        assert not os.path.isdir(os.path.join(tmp_dir, "content", "y2-a")), \
+            "非 OSError 逃逸不得跳过归档清理（异常族须收口）"
+
+
+# ------------------------------------------------------------------
+# 🟡3 / 🟡4 已知边界固化（非本轮 🔴，登记 + 判别性用例）
+# ------------------------------------------------------------------
+
+class TestYellow3ConservativeSkipSemantics:
+    """🟡3：扫描不可用 → **保守跳过回收**（不误删）；口径 = 「不误删；
+    残卡/未回收卡须**显式清理**或由**本实例重试**再判定」，**不存在**
+    "新实例顺带自动回收"路径（``_owned_state_card_ids`` 为实例内存态、
+    归属台账已随本会话撤销）。"""
+
+    def test_conservative_skip_no_auto_reclaim_by_new_instance(self, tmp_dir,
+                                                               monkeypatch):
+        sec = SecretarySession("y3-a", data_dir=tmp_dir)
+        ho = sec.create_handoff("ua", "ub", "保守跳过意图", "ctx")
+        sid = ho.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        def boom(self, *a, **k):
+            raise OSError("simulated scan failure")
+
+        monkeypatch.setattr(SecretarySession, "_build_ho_reference_index", boom)
+        sec.delete_session()
+        monkeypatch.undo()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "🟡3：扫描不可用须保守不删（不误删）"
+
+        SecretarySession("y3-a", data_dir=tmp_dir).delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "🟡3 语义固化：无「新实例自动回收」路径（须显式清理/本实例重试）"
+
+
+class TestYellow4LegacyCardIdCharset:
+    """🟡4：``card_id`` 白名单（``[A-Za-z0-9_-]+``）的**兼容面**——旧版遗留卡
+    id 含 ``.`` 或非 ASCII 时 ``get``→``None``、``delete``→``False`` → 卡不可读
+    不可删 → 其引用永久阻塞共享卡回收。**最低要求 = 迁移前提文档化**
+    （契约 §5 第 4 条）；本用例固化该已知边界，防日后误判为回归。"""
+
+    @pytest.mark.parametrize("legacy_id", [
+        "unit.a-unit.b-123",          # 旧版点号分隔
+        "架构·开发-架构·评审-123",     # 非 ASCII 单元名
+    ])
+    def test_legacy_card_id_unreadable_unremovable(self, tmp_dir, legacy_id):
+        import json as _json
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        legacy_dir = os.path.join(tmp_dir, "legacy")
+        os.makedirs(legacy_dir, exist_ok=True)
+        with open(os.path.join(legacy_dir, f"{legacy_id}.json"), "w",
+                  encoding="utf-8") as f:
+            _json.dump({"id": legacy_id, "source_unit": "a", "target_unit": "b",
+                        "state_card_id": "ho-legacy"}, f)
+        assert bus.get(legacy_id) is None, \
+            "🟡4 已知边界：非法字符集 card_id 读不到（None）"
+        assert bus.delete(legacy_id) is False, \
+            "🟡4 已知边界：非法字符集 card_id 删不掉（False）"
+        assert os.path.exists(os.path.join(legacy_dir, f"{legacy_id}.json")), \
+            "🟡4 已知边界：遗留卡文件仍在盘上 → 须按契约 §5 第 4 条迁移"
+
+
+# ------------------------------------------------------------------
+# 🔴 M-2：有界遍历深度上界与实测自洽（常量单一语义源）
+# ------------------------------------------------------------------
+
+class TestM2DepthBoundConsistency:
+    """``_SKIP_DIR_PROBE_DEPTH``（形状判定递归上界，含文件层）与 os.walk 侧
+    ``_KEPT_SKIP_MAX_CARD_DIR_DEPTH`` 派生自同一语义源；实测可见上界 = 卡目录
+    相对被保留目录 **2 层**（3 层不可见）。"""
+
+    def test_constants_single_source(self):
+        from secretary.session.session import (
+            _SKIP_DIR_PROBE_DEPTH, _KEPT_SKIP_MAX_CARD_DIR_DEPTH)
+        assert _KEPT_SKIP_MAX_CARD_DIR_DEPTH == _SKIP_DIR_PROBE_DEPTH - 1, (
+            "遍历上界须由形状判定上界派生（勿各写一套，M-2）")
+
+    @pytest.mark.parametrize("dirname", ["node_modules", ".venv", ".cache"])
+    def test_card_dir_depth_two_visible(self, tmp_dir, dirname):
+        """卡目录相对被保留目录 **2 层** → 可见（不变量不破坏）。"""
+        base = os.path.join(tmp_dir, dirname, "a")
+        os.makedirs(base, exist_ok=True)
+        bus = HandoffBus(data_dir=os.path.join(base, "handoffs"),
+                         state_root=tmp_dir)
+        victim = bus.create_handoff("ua", "ub", "深度2意图", "ctx",
+                                    auto_state_card=True)
+        for name in ("handoff-refs", ".handoff-refs"):
+            ref = os.path.join(tmp_dir, name, f"{victim.id}.ref")
+            if os.path.isfile(ref):
+                os.remove(ref)
+        sec = SecretarySession("m2-a", data_dir=tmp_dir)
+        own = sec.create_handoff("ua", "ub", "深度2意图", "ctx")
+        assert own.state_card_id == victim.state_card_id
+        sec.delete_session()
+        assert os.path.exists(os.path.join(
+            tmp_dir, "state", f"{victim.state_card_id}.json")), \
+            f"M-2：{dirname}/a/ 卡目录相对层级 2 应可见"
+
+    @pytest.mark.parametrize("dirname", ["node_modules", ".venv", ".cache"])
+    def test_card_dir_depth_three_documented_boundary(self, tmp_dir, dirname):
+        """卡目录相对被保留目录 **3 层** → 不可见（**已文档化的有界浅扫代价**，
+        非 M-1 面）。固化契约实测口径，防文档再次漂移（原文档误写「嵌套 > 3 层」）。"""
+        base = os.path.join(tmp_dir, dirname, "a", "b")
+        os.makedirs(base, exist_ok=True)
+        bus = HandoffBus(data_dir=os.path.join(base, "handoffs"),
+                         state_root=tmp_dir)
+        victim = bus.create_handoff("ua", "ub", "深度3意图", "ctx",
+                                    auto_state_card=True)
+        for name in ("handoff-refs", ".handoff-refs"):
+            ref = os.path.join(tmp_dir, name, f"{victim.id}.ref")
+            if os.path.isfile(ref):
+                os.remove(ref)
+        sec = SecretarySession("m2-b", data_dir=tmp_dir)
+        own = sec.create_handoff("ua", "ub", "深度3意图", "ctx")
+        assert own.state_card_id == victim.state_card_id
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(
+            tmp_dir, "state", f"{victim.state_card_id}.json")), \
+            "深度 3 应不可见（有界浅扫上界 = 2 层）；若可见则实现/文档口径已漂移"
 
 
 # ------------------------------------------------------------------

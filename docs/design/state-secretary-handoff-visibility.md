@@ -63,8 +63,13 @@
 > `data_dir`（`.staging`/`.cache`/`.data`/`.build`）内真实卡不可见 → 共享卡被误删
 > （实测 4/4 破坏）。现与名单目录同一口径（形状判定后再剪）。
 
-- **有界**：形状判定与保留子树遍历深度 ≤ 3、访问条目 ≤ 2000，避免对 `node_modules`
-  深层树全树遍历（实测 2000 目录扫描 **1.2ms**）。
+- **有界**：形状判定与保留子树遍历深度 ≤ `_SKIP_DIR_PROBE_DEPTH`（= 3，**含文件
+  层**）、访问条目 ≤ 2000，避免对 `node_modules` 深层树全树遍历（实测 2000 目录
+  扫描 **1.2ms**）。
+- **深度上界单一语义源（🔴 M-2 更正）**：`_KEPT_SKIP_MAX_CARD_DIR_DEPTH =
+  _SKIP_DIR_PROBE_DEPTH - 1` —— 形状判定（递归，含文件层）与 `os.walk` 剪枝
+  （相对保留根层级）**共用同一语义源**，不再各写一套（原两处常量语义不同 →
+  「形状判定保留、遍历却剪掉」不自洽）。
 - **🔴A 复评修复（`7300b22` 打回）——保留根多重重叠时取最小深度**：`kept_skip_dirs`
   为 `set`，当 `dirpath` 同时落在**多个**保留根之下（嵌套保留目录各自入列，如
   `<root>/build` 与 `<root>/build/dist`）时，原实现取「首个前缀命中即 return」→
@@ -72,10 +77,12 @@
   变化 → 同一布局时而截断、时而放行（实测 10 seed 中 6 破坏不变量）。现改为取
   **所有匹配根的最小深度**，判定与迭代顺序无关。
 - **残留边界（有界浅扫的代价，已知）**：
-  1. **深度**：保留目录（名单名 / 隐藏名）内**再嵌套 ≥ 3 层**的交接卡仍不可见。
-     实测边界（卡目录相对保留目录的层级深度，`_SKIP_DIR_PROBE_DEPTH = 3`）：
-     `<root>/node_modules/a/b/` **可见**（深度 2）、`<root>/node_modules/a/b/c/`
-     **不可见**（深度 3）；
+  1. **深度**：**卡目录**相对保留根（名单名 / 隐藏名）的层级 >
+     `_KEPT_SKIP_MAX_CARD_DIR_DEPTH`（= 2）时不可见。**实测口径（M-2 更正）**：
+     `<root>/node_modules/a/b/handoffs`（卡目录相对层级 **2**）**可见**；
+     `<root>/node_modules/a/b/c/handoffs`（相对层级 **3**）**不可见**。
+     （原文档写「嵌套 ≥ 3 层不可见」，把形状判定的**含文件层**深度直接当作卡目录
+     层级 → 口径错误；现按实测更正为「卡目录相对层级 > 2 层」。）
   2. **条目预算**：形状判定为**有界**浅扫，`max_entries = 2000` 耗尽即判定 False
      → 该子树内真实卡不可见（🟡E 文档化）。实测 `node_modules/` 下 2500 个兄弟
      目录时其内真实卡不可见；且 `os.scandir` 顺序参与预算消耗，**天然不确定**。
@@ -99,7 +106,7 @@
 | 登记双通道任一生效（含卡目录在 `state_root` 子树**外**） | ✅ 可见（来源 3） |
 | 登记双通道全失败 + 唯一可见性路径 | ✅ 建卡即失败（fail-fast，**不产生**悬空卡） |
 | 登记双通道全失败 + 卡目录在 `state_root` 子树**内** | ✅ 目录扫描兜底（来源 1/2） |
-| 卡目录在**保留目录**（名单名 / 隐藏名）内，深度 ≥ 3 或条目预算耗尽 | ⚠️ **不可见**（已知边界，见上） |
+| 卡目录在**保留目录**（名单名 / 隐藏名）内，卡目录相对层级 > 2 或条目预算耗尽 | ⚠️ **不可见**（已知边界，见上） |
 
 **结论**：不存在"写入成功但引用静默悬空"（fail-fast 兜住）；但**不声称**"任何
 布局下引用恒可见"——超深 / 预算耗尽两类边界下，若同时**双通道登记被外部删除**，
@@ -108,15 +115,15 @@
 ## 4. 风险与影响
 
 - **手写卡落在保留目录（名单名 / 隐藏名）**：P0-1 + 🔴B 修复后可见（形状判定保留
-  子树）；仅当**再嵌套 ≥ 3 层**或**条目预算耗尽**时仍不可见（有界浅扫的代价，避免
-  `node_modules` 全树遍历）。边界实测见 §3。
+  子树）；仅当**卡目录相对层级 > 2** 或**条目预算耗尽**时仍不可见（有界浅扫的代价，
+  避免 `node_modules` 全树遍历）。边界实测见 §3（M-2 口径更正）。
 - **保留根多重重叠（🔴A）**：嵌套保留目录下深度截断**取最小深度**（与迭代顺序无关），
   不再随 `PYTHONHASHSEED` 漂移。
-- **fail-fast 回滚面（🟡C，已知边界）**：双通道登记全失败 + 根外布局时，回滚**交接卡
-  本体**；此前已建的 `ho-*` 关联卡（`state/`）**不在回滚面内** → 留盘残骸且无台账/
-  引用可达（后续 `delete_session` 不回收）。定级 🟡（反向资源泄漏，**不破坏不变量**）；
-  且该 `ho-*` 卡可能为**既有共享卡**（hash 复用），回滚前须判"是否本次新建"，属行为
-  变更 → 本轮范围冻结（总师 §7.1）**不改行为**，仅文档声明 + 用例锁定。
+- **fail-fast 回滚面（🟡1，复评第 5 轮已修）**：双通道登记全失败 + 根外布局时，
+  回滚**本次调用产生的全部落盘物**——交接卡本体 **+ 本次新建的 `ho-*` 卡**
+  （`delete_card` 幂等清 `.json`/`.lock`/`.owner.json`）。**先已存在的共享 `ho-*` 卡
+  不动**（hash 复用场景，误删会破坏他处引用）——回滚前以「该卡是否本次新建」判定。
+  回归：`TestFailFastRollbackBoundary`（3 项，含反向对照）。
 - **根外卡 + 登记不可用**：`data_dir` 在 `state_root` 子树**之外**且双通道登记均
   不可用（外部删 `.ref` / 磁盘异常）时，引用不可见 → 共享卡可能被误删。此为
   **baseline 既有面**（`6393886` main 同场景即破坏，非本 PR 引入），属 🟡D 同族，
@@ -124,8 +131,17 @@
 - **无 `id` 的手写卡**：仍不可见（🟡B）。改走 `HandoffBus` API 即覆盖。
 - **登记失败**：双通道（主 + 备）任一生效即引用可见；双通道全失败时，子树外布局
   fail-fast（不产生悬空卡）、子树内布局由目录扫描兜底。
-- **扫描异常（P0-2）**：扫描抛 `OSError` 时保守**跳过回收**（不误删），且不中断
-  归档/台账清理；`registry listdir` 竞态（TOCTOU）已加守卫。
+- **扫描异常（P0-2 / 🟡2）**：扫描抛**任意异常**（不止 `OSError`，复评第 5 轮
+  收口为全异常族）时保守**跳过回收**（不误删），且不中断归档/台账清理；
+  `registry listdir` 竞态（TOCTOU）已加守卫。
+- **保守跳过后的可回收性（🟡3，已知边界）**：扫描不可用时本次认领的 `ho-*` 卡
+  留盘且**不再由任何新实例自动回收**（`_owned_state_card_ids` 为实例内存态、归属
+  台账已随本会话撤销）→ 须**显式清理**或**本实例重试**再判定方可回收。
+  口径 = 「不误删；须显式清理」，**不存在**"新实例顺带自动回收"路径。
+- **历史卡 id 字符集（🟡4，迁移面）**：`card_id`/`source_unit`/`target_unit`
+  白名单 `[A-Za-z0-9_-]+` 为**本 PR 新增**约束。旧版遗留卡 id 含 `.` 或非 ASCII
+  （如 `unit.a-unit.b-*`、`架构·开发-架构·评审-*`）→ `get`→`None`、`delete`→`False`
+  → 卡不可读不可删、其引用永久阻塞共享卡回收。**迁移前提见 §5 第 4 条**。
 - **路径穿越（P1-3）**：参与路径拼接的标识（`card_id` **及** `source_unit`/
   `target_unit`）均已加白名单校验——`HandoffBus.delete` / `_unregister_ref` /
   台账 `handoff_ids` 不再构成 `data_dir` 之外的**删除**面；`create_handoff` /
@@ -151,12 +167,16 @@
      `{"card_id":…, "state_card_id":…, "card_path":<绝对路径>}`。
 3. **不变量**：迁移期间若共享 `ho-*` 卡被误删，其根外引用会悬空——建议在迁移
    完成前**冻结**跨根交接卡的删除操作（或先执行补偿登记再删除）。
-4. **存量非 ASCII 单元名卡**（🔴 P1-3 单元名白名单为**新增前提**）：`source_unit`/
-   `target_unit` 白名单 `[A-Za-z0-9_-]+` 为**本 PR 新增**约束。旧版（≤ `6a2e713`）
-   经 `create_handoff("单元","目标")` 产出的**存量卡**其 `card_id` 含非 ASCII →
-   白名单后 `get`→`None`、`delete`→`False`，**无法经 API 清理**，须**重建或改名**：
+4. **存量非 ASCII / 含点单元名卡**（🔴 P1-3 单元名白名单为**新增前提**）：
+   `source_unit`/`target_unit`/`card_id` 白名单 `[A-Za-z0-9_-]+` 为**本 PR 新增**
+   约束。旧版（≤ `6a2e713`）产出的**存量卡**其 `card_id` 含**非 ASCII**
+   （`架构·开发-架构·评审-*`）**或含 `.`**（`unit.a-unit.b-*`）→ 白名单后
+   `get`→`None`、`delete`→`False`，**无法经 API 清理**，须**重建或改名**：
    - 重命名 `card_id`（去非 ASCII）并同步改写卡内 `id`；或
    - 改走 `HandoffBus` API 以合规单元名重建该卡（旧卡手工删文件回收）。
+   **盘点要求（最低要求）**：升级前须盘点 `handoffs/*.json` 的**文件名**（= `card_id`），
+   凡不符白名单者先行清理/改名/补偿登记；**未完成此盘点不得启用共享卡回收**
+   （否则该卡引用永久阻塞共享卡回收，形成"永久孤儿"）。
    **不变量仍成立**：形状扫描仍计入其引用、共享 `ho-*` 卡保留（不误删）；该面属
    **迁移面**（存量数据），非本 PR 新增缺陷。
 
@@ -167,7 +187,11 @@
 
 - 登记：Issue #8（本草案关联；含 🟡E 第三条 gap —— **已闭环**）
 - 代码口径标注：`session.py::_build_ho_reference_index` docstring「可见性保证范围」
-- 台账：`issues/TEST-REGRESSION.md` §三 P2-④ + §二 修复 #J
+- 🔴 M-1/M-2 + 🟡1–🟡5（复评第 5 轮）：`_keep_scan_dir` 隐藏名取消裸名剪枝；
+  深度上界常量单一语义源（`_KEPT_SKIP_MAX_CARD_DIR_DEPTH = _SKIP_DIR_PROBE_DEPTH - 1`）
+  + 本文档深度口径按实测更正；fail-fast 回滚补本次新建 `ho-*` 卡；扫描异常族收口。
+  详见 §8 / `issues/TEST-REGRESSION.md` §九。
+- 台账：`issues/TEST-REGRESSION.md` §三 P2-④ + §二 修复 #J + §九 M-1/M-2/🟡1–🟡5
 - 独立探针（架构·测试）：`state-secretary/tests/test_ho_ref_invariant_probes.py`
 
 ## 7. 总师裁定 + 🔴1 根因收口（Issue #4 复评第 4 轮 · 2026-09-10）
@@ -248,8 +272,8 @@
 
 | 项 | 处置 |
 |---|---|
-| 🟡C fail-fast 回滚面 | **已知边界，声明不改行为**（范围冻结）：回滚交接卡本体，已建 `ho-*` 卡留盘残骸、无台账可达 → 后续 `delete_session` 不回收。理由：该 `ho-*` 卡可能为**既有共享卡**（hash 复用），回滚前须判"是否本次新建"，属行为变更。`TestFailFastRollbackBoundary` 锁定边界 |
-| 🟡D 口径过度声明 | **撤回**「API 写入路径引用恒可见**无条件成立**」→ 改为**带边界表述**（见 §3 表）；§5「根内卡无需迁移」补前置（深度 < 3 且预算未耗尽） |
+| 🟡C → 🟡1 fail-fast 回滚面 | **复评第 5 轮已修**（原"范围冻结不改行为"已解除）：回滚**本次新建**的 `ho-*` 卡（`delete_card` 清 `.json`/`.lock`/`.owner.json`），先已存在的共享卡不动（以"是否本次新建"判定）。`TestFailFastRollbackBoundary`（3 项，含反向对照） |
+| 🟡D 口径过度声明 | **撤回**「API 写入路径引用恒可见**无条件成立**」→ 改为**带边界表述**（见 §3 表）；§5「根内卡无需迁移」补前置（卡目录相对层级 ≤ 2 且预算未耗尽，M-2 口径） |
 | 🟡E 条目预算未文档化 | §3/§4 补「条目预算 `max_entries=2000` 耗尽 → 不可见」边界，并点明 `os.scandir` 顺序参与预算消耗（**天然不确定**）；`TestScanBudgetBoundary` 锁定预算语义 |
 
 ### 8.4 判别性回归（🟡F 四类缺口补齐）
@@ -262,14 +286,34 @@
 | `TestKeptSkipDepthOrderIndependence`（5） | ① 嵌套保留根顺序（含 `_OrderedRoots` 两顺序 + 端到端 + **多 seed 子进程**） | 3 FAIL |
 | `TestHiddenDirVisibility`（14） | ② 隐藏名（非 `.venv`）data_dir × 4 名 × 3 触发 + 对照 + `.git` 剪枝收益 | 8 FAIL |
 | `TestScanBudgetBoundary`（3） | ③ 条目预算耗尽 / 充足 / 大规模有界 | — |
-| `TestFailFastRollbackBoundary`（2） | ④ fail-fast 孤儿残骸边界锁定 | — |
+| `TestFailFastRollbackBoundary`（3） | ④ fail-fast 回滚（本次新建 `ho-*` 一并回收 + 反向对照） | 🟡1 修复前 2 FAIL |
+| `TestYellow2NonOserrorScanEscape`（3） | ⑤ 非 `OSError` 扫描异常不逃逸 | 🟡2 修复前 3 FAIL |
+| `TestYellow3ConservativeSkipSemantics`（1） | ⑥ 保守跳过无"新实例自动回收"路径 | — |
+| `TestYellow4LegacyCardIdCharset`（2） | ⑦ 历史卡 id 字符集迁移面固化 | — |
+| `TestM2DepthBoundConsistency`（7） | ⑧ 深度上界单一语义源 + 实测 2/3 层边界 | M-2 修复前 6 FAIL |
+| `TestHiddenDirVisibility`（+15） | ⑨ **评审 M-1 验收口径**：点前缀名 × 3 触发 0 破坏 | M-1 修复前 15 FAIL |
 
 ### 8.5 自测（本角色）
 
-- 全量 `pytest -q`：**261 passed**（门面 **114** = 90 + 24，独立探针 65）。
-- `compileall src` OK；`flake8 --max-line-length=100`（两改动文件）**0 告警**。
+- 全量 `pytest -q`：**295 passed**（门面 **148**，独立探针 65）。
+- `compileall src` OK；`pyflakes`（改动文件）**0 告警**。
 - 独立探针（本角色自写，不复用作者/测试用例）：10-seed 矩阵 **0/10 破坏**、
-  隐藏名 4 名 × 3 触发 **0/12 破坏**、剪枝收益不退化。
+  隐藏名 4 名 × 3 触发 **0/12 破坏**、评审 M-1 口径 5 名 × 3 触发 **0/15 破坏**、
+  剪枝收益不退化（2000 目录 `.git`/`node_modules` 索引 ~1.2–1.7ms）。
+
+## 9. 复评第 5 轮补收口：M-2 深度口径 + 🟡1–🟡5（2026-09-10）
+
+> 在 §8（🔴A/🔴B）之上，按评审 M-1/M-2 验收口径与「🟡1–🟡5 请一并登记」要求补收口。
+
+| 项 | 处置 | 回归 |
+|---|---|---|
+| 🔴 M-1（=🔴B）验收口径 | 点前缀名（`.data`/`.cache`/`.secretary`/`.state`/`.queue`）× 3 触发（in-root）**0/15 破坏**；基线 `8790e5f` 独立探针实测 **15/15 破坏** | `TestHiddenDirVisibility::test_reviewer_acceptance_hidden_names`（15） |
+| 🔴 M-2 深度口径 | 文档 §3「嵌套 ≥ 3 层」→ 实测「**卡目录**相对层级 > 2 层」；新增 `_KEPT_SKIP_MAX_CARD_DIR_DEPTH = _SKIP_DIR_PROBE_DEPTH - 1`（单一语义源） | `TestM2DepthBoundConsistency`（7，修复前 6 FAIL） |
+| 🟡1 fail-fast 回滚 | 回滚本次新建 `ho-*` 卡（先已存在共享卡不动） | `TestFailFastRollbackBoundary`（3） |
+| 🟡2 异常族收口 | `delete_session` 扫描守卫由 `except OSError` → `except Exception` | `TestYellow2NonOserrorScanEscape`（3） |
+| 🟡3 保守跳过语义 | 固化「不误删；无新实例自动回收路径」 | `TestYellow3ConservativeSkipSemantics`（1） |
+| 🟡4 id 字符集迁移 | 契约 §5 第 4 条补「盘点 `handoffs/*.json` 文件名」最低要求 | `TestYellow4LegacyCardIdCharset`（2） |
+| 🟡5 回执符号准确性 | 复核 `_ALWAYS_SKIP_SCAN_DIR_NAMES`/`_AMBIGUOUS_SCAN_DIR_NAMES`/`_contains_data_root` 及 4 个测试类名在全历史命中数为 **0**（旧回执误记）；本轮回执按实际符号 | — |
 
 ## 9. 🟡 收口轮（Issue #4 复评第 5 轮 · 架构·评审 `proceed` 后 · 非门禁）
 

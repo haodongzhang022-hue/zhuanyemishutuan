@@ -37,12 +37,22 @@ from ..handoff.models import HandoffCard
 
 # 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
 # 遍历，亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）。
-# 🔴 P0-1 修复：**不按裸目录名剪枝**——名单中的名字（build/dist/env/venv 等）
-# 完全可能被合法选作 data_dir，按名剪枝会让落在其中的真实交接卡不可见 → 共享卡
-# 被误删。故剪枝前先做「保护子树判定」+「形状判定」，见
+# 🔴 P0-1 / M-1 修复：**不按裸目录名剪枝**——名单中的名字（build/dist/env/venv
+# 等）**以及隐藏目录名**（.git/.cache/.data/.state 等）完全可能承载真实交接卡
+# 或被合法选作 data_dir，按名剪枝会让落在其中的真实交接卡不可见 → 共享卡被误删。
+# 故剪枝前一律先做「保护子树判定」+「形状判定」，见
 # ``SecretarySession._keep_scan_dir`` / ``_dir_holds_handoff_data``。
-# 名单目录"形状判定 + 有界遍历"的深度上界（相对名单目录自身；含文件层）
+#
+# 有界遍历上界（**唯一语义源**，形状判定与 os.walk 剪枝共用，勿各写一套）。
+# 语义：``_SKIP_DIR_PROBE_DEPTH`` = 形状判定的**递归深度上界（含文件层）**——
+# 被保留目录自身的内容 = 深度 1，其下一层子目录的内容 = 深度 2，依此类推。
+# 故「卡目录相对被保留目录的最大层级」= ``_SKIP_DIR_PROBE_DEPTH - 1``；
+# os.walk 侧按同一语义派生（相对层级 > 该上界即止步），两侧常量不得各写一套。
+# 实测口径（M-2，卡目录相对被保留目录的层级）：2 层**可见**
+# （``<root>/node_modules/a/b/card.json``）；3 层**不可见**
+# （``<root>/node_modules/a/b/c/card.json``）。
 _SKIP_DIR_PROBE_DEPTH = 3
+_KEPT_SKIP_MAX_CARD_DIR_DEPTH = _SKIP_DIR_PROBE_DEPTH - 1
 
 _SKIP_SCAN_DIRS = frozenset({
     "node_modules", "__pycache__", "venv", ".venv", "env",
@@ -382,7 +392,12 @@ class SecretarySession:
         """``dirpath`` 是否已超出"保留的名单目录"子树的有界遍历深度。
 
         防"保留目录内命中一张（伪）卡后，整棵 node_modules / 隐藏树被全树
-        遍历"——深度超过 ``_SKIP_DIR_PROBE_DEPTH`` 即止步（与形状判定同一上界）。
+        遍历"——`dirpath` 相对保留根的层级 > ``_KEPT_SKIP_MAX_CARD_DIR_DEPTH``
+        （= ``_SKIP_DIR_PROBE_DEPTH - 1``）即止步。**上界与形状判定共用同一
+        语义源**（M-2），两处常量不得各写一套。
+
+        实测口径（M-2）：`<root>/node_modules/a/b/`（卡目录相对层级 2）**可见**；
+        `<root>/node_modules/a/b/c/`（相对层级 3）**不可见**。
 
         **多根重叠（🔴A 复评修复）**：``dirpath`` 可同时落在多个保留根之下
         （嵌套名单目录/隐藏目录各自入列），此时取**最小深度**判定——不得
@@ -405,7 +420,10 @@ class SecretarySession:
                 depth = len(abspath[len(r) + 1:].split(os.sep))
                 if best is None or depth < best:
                     best = depth
-        return best is not None and best >= _SKIP_DIR_PROBE_DEPTH
+        # M-2：上界与形状判定共用同一语义源（`_SKIP_DIR_PROBE_DEPTH - 1`
+        # = 可见卡目录的最大相对层级），避免两处常量各自漂移导致
+        # 「形状判定保留、遍历却剪掉」的不自洽。
+        return best is not None and best > _KEPT_SKIP_MAX_CARD_DIR_DEPTH
 
     @staticmethod
     def _under_any(path: str, roots: set) -> bool:
@@ -783,15 +801,20 @@ class SecretarySession:
         #    不再传"自身卡排除"：自身交接卡已在上一步撤销；若撤销失败而残卡
         #    仍在磁盘，它即真实存活引用，须计入以守住"存活卡 → 状态卡存在"不变量。
         #
-        #    🔴 P0-2 修复（第二道防线）：扫描本身若因文件系统竞态抛 OSError，
-        #    一律**保守跳过回收**（宁可不删，绝不误删）——扫描不可用时无法
-        #    证明"引用已清"，不得据此删除共享卡；且异常不得中断后续归档/台账
-        #    回收（原实现异常逃逸 → delete_session 半途而废、留 ho-*.json/.lock、
-        #    归档、台账残骸）。
+        #    🔴 P0-2 / 🟡2 修复（第二道防线）：扫描本身若抛异常（**全异常族**，
+        #    不止 OSError），一律**保守跳过回收**（宁可不删，绝不误删）——扫描
+        #    不可用时无法证明"引用已清"，不得据此删除共享卡；且异常不得中断
+        #    后续归档/台账回收（原实现异常逃逸 → delete_session 半途而废、
+        #    留 ho-*.json/.lock、归档、台账残骸）。
         reference_index: Optional[Dict[str, List[str]]] = None
         try:
             reference_index = self._build_ho_reference_index()
-        except OSError:
+        except Exception:  # noqa: BLE001
+            # 🟡2 修复（异常族收口）：原实现只兜 ``OSError``，注入
+            # ``TypeError``/``RuntimeError`` 等**非 OSError** 异常仍会逃逸
+            # ``delete_session`` → 归档/台账清理被跳过（实测逃逸 + 归档残留）。
+            # 契约 §2「扫描异常不得逃逸」此处收口为**兜全部异常**：扫描不可用
+            # 一律保守跳过回收（宁可不删，绝不误删），且不中断后续归档/台账清理。
             reference_index = None
         if reference_index is not None:
             for sid in ho_cards:

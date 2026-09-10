@@ -265,6 +265,9 @@ class HandoffBus:
             # 用纳秒时间戳 + 自增序号保证同秒同源唯一（秒级时间戳碰撞会覆盖丢卡）
             card_id = f"{source_unit}-{target_unit}-{time.time_ns()}"
             state_card_id = None
+            # 🟡1 修复：记录 ho-* 卡是否**由本次调用新建**——fail-fast 回滚时
+            # 只回收本次新建的卡，绝不误删他处已存在（共享）的 ho-* 卡。
+            state_card_created = False
 
             # M9 集成：自动创建关联 StateCard
             if auto_state_card:
@@ -282,6 +285,7 @@ class HandoffBus:
                     ).hexdigest()[:12]
                     state_card_id = f"ho-{source_unit[:8]}-{target_unit[:8]}-{hash_hex}"
                     # 获取或创建 StateCard（同一稳定会话复用时沿用既有卡）
+                    state_card_created = sm.get_card(state_card_id) is None
                     sm.get_or_create(
                         session_id=state_card_id,
                         objective=intent,
@@ -305,6 +309,7 @@ class HandoffBus:
                 except Exception:
                     # StateCard 创建失败不阻断交接卡本身
                     state_card_id = None
+                    state_card_created = False
 
             card = HandoffCard(
                 id=card_id,
@@ -325,12 +330,29 @@ class HandoffBus:
                 if (not self._register_ref(card.id, card.state_card_id)
                         and self._registry_required()):
                     # 双通道登记**全部失败**且登记为该卡唯一可见性路径 →
-                    # 回滚交接卡并 fail-fast（不产生"写入成功但引用静默悬空"）。
+                    # 回滚**本次调用产生的全部落盘物**并 fail-fast
+                    # （不产生"写入成功但引用静默悬空"，亦不留孤儿 ho-* 卡）。
+                    #
+                    # 🟡1 修复：旧实现只回滚交接卡本体，``sm.get_or_create``
+                    # 刚落盘的 ``ho-*.json`` + ``ho-*.lock`` 不回滚 → 连续失败
+                    # 会累积孤儿卡（回执「fail-fast 且零残留」与实际不符）。
+                    # 现补：**仅当该 ho-* 卡由本次调用新建**时一并回收
+                    # （``delete_card`` 幂等清理 .json/.lock/.owner.json），
+                    # 先已存在的**共享卡**不动（避免误删他处引用）。
                     try:
                         os.remove(os.path.join(
                             self.data_dir, f"{card.id}.json"))
                     except OSError:
                         pass
+                    if state_card_created:
+                        try:
+                            from secretary.state.manager import StateManager
+                            StateManager(
+                                data_dir=os.path.join(self.state_root, "state")
+                                if self.state_root else None
+                            ).delete_card(card.state_card_id)
+                        except Exception:
+                            pass  # 回滚尽力而为，不掩盖原始 fail-fast 语义
                     raise OSError(
                         "交接卡引用登记双通道均失败，且登记为其唯一可见性路径"
                         f"（data_dir 在 state_root 子树之外）：card_id={card.id}；"

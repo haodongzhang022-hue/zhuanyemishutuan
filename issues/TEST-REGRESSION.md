@@ -8,10 +8,11 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **266 项全部通过**（门面 **119 项** = 90 + 24 复评第 5 轮判别性
-  回归 + 5 🟡 收口回归，独立探针 65 项；底层模块回归 8 + 15 + 19 + 20 + 12 + 8）。
+- 测试基线：全量 pytest **295 项全部通过**（门面 **148 项** = 90 + 24 复评第 5 轮判别性
+  回归 + 5 🟡 收口回归 + 29 M-1/M-2/🟡1–🟡5 补收口，独立探针 65 项；底层模块回归
+  8 + 15 + 19 + 20 + 12 + 8）。
   历史口径：`28ca7f6` 228（门面 88）/ `60e32ec` 230（门面 90）/ `bca4193` 237（门面 90）
-  / `e3195ea` 261（门面 114）→ 本轮 **266**（门面 119）。
+  / `e3195ea` 261（门面 114）/ `63345ec` 266（门面 119）→ 本轮 **295**（门面 148）。
 
 ---
 
@@ -702,7 +703,7 @@
 |---|---|---|
 | 🟡-1 `list_pending` 逐文件读未守 | ✅ **一并收口**（同函数口径不一致，低风险） | `handoff/handoff.py::list_pending` |
 | 🟡-2 台账基线并存 | ✅ **已由 §十 收口**（唯一口径 + 历史行）；本轮复核无残留 | `issues/TEST-REGRESSION.md` 头部 |
-| 🟡-3 fail-fast 回滚未含 `ho-*` + `.lock` | ⏸ **本轮不改行为**（上游 §8.3 总师范围冻结下定为已知边界）；**修法已就绪**待授权 | `handoff/handoff.py::create_handoff`（未落地） |
+| 🟡-3 fail-fast 回滚未含 `ho-*` + `.lock` | ⏸ 本节不改行为（上游 §8.3 范围冻结下定为已知边界）；**已由 §十二 🟡1 落地**（回滚本次新建 `ho-*` 卡） | `handoff/handoff.py::create_handoff`（§十二 已落地） |
 | 🟡-4 标识符尾锚 `$` 而非 `\Z` | ✅ 收紧为 `\Z`（**同族 6 处 pattern 一并收紧**） | handoff / manager / arbiter / content_archive / session |
 | 🟡-5 单元名白名单为新增前提 | ✅ **已由 §十 收口**（契约文档 §5 第 4 条） | `docs/design/state-secretary-handoff-visibility.md` |
 
@@ -746,7 +747,7 @@ Python `$` 匹配**尾换行之前**，`"abc\n"` 原被判合法。**同族 patt
 | 基线 `e3195ea`（无逐文件守卫） | 34,063 | **6,976** | **174** |
 | 收口后（本提交） | 37,353 | **0** | **0** |
 
-### 10.6 🟡-3 就绪修法（未落地 · 等总师授权）
+### 10.6 🟡-3 就绪修法（**§十二 已落地**）
 
 - **顾虑回应**：上游 §8.3 认为回滚须判「是否本次新建」属**行为变更**——已就绪
   且**不越界**的实现：`create_handoff` 在 `get_or_create` **之前**记录
@@ -755,10 +756,66 @@ Python `$` 匹配**尾换行之前**，`"abc\n"` 原被判合法。**同族 patt
   **预存在共享卡绝不误删**，仅回收本次调用新建者。
 - **落地时须同步**：改写 `TestFailFastRollbackBoundary::test_fail_fast_leaves_ho_card_known_boundary`
   （现断言"残骸留盘" → 转为"残骸已回收"）+ 契约文档 §4/§8.3 口径。
-- **本轮不动**：遵守 §8.3 范围冻结与「不越权改架构」，待总师解冻后一并落地。
+- **落地状态**：评审复评第 5 轮明确要求「🟡1 fail-fast 回滚 ho-*」为**最低要求**之一，
+  故已在 **§十二** 按上述就绪修法落地（含反向对照回归）。
 
 ### 10.7 计数同步
 
 - 全量 **266 项** = 8 + 15 + 65 + 119 + 19 + 20 + 12 + 8（门面 114 → **119**）。
 - 同步 `state-secretary/README.md`、`docs/design/state-secretary-index.md`、
   `docs/design/state-secretary-module.md` 三处（261 → 266；门面 114 → 119）。
+
+---
+
+## 十二、Issue #4 复评第 5 轮 · M-1/M-2 验收口径补收口 + 🟡1–🟡5（PR #7）
+
+> 对象：评审 `8790e5f` 增量复评（`fix_bug` 打回）。承接 §九（🔴A/🔴B）后，
+> 按评审 M-1/M-2 验收口径与「🟡1–🟡5 请一并登记（🟡1/🟡4 为最低要求）」补收口。
+
+### 🔴 M-1 验收口径（点前缀名 × 3 触发 in-root → 0 破坏）
+
+- **本角色独立探针**（不复用评审/测试用例）：5 名（`.data`/`.cache`/`.secretary`/
+  `.state`/`.queue`）× 3 触发（`legacy_no_registry`/`registry_failed`/
+  `ref_externally_removed`）= 15 组。
+- **基线 `8790e5f` 对照**（`git archive` 单独检出 src 运行）：**15/15 破坏**；
+  修复后 **0/15**。
+- **评审最小复现**（原样复跑）：双通道占位 + `HandoffBus(data_dir=root/".cache/handoffs",
+  state_root=root)` → 交接卡存活=True、ho-* 存活=True → **不变量保持**。
+- 回归：`TestHiddenDirVisibility::test_reviewer_acceptance_hidden_names`（15 项，
+  已参数化评审口径 5 名）；`.git` 承载真实卡 3/3 可见；剪枝收益对照（隐藏目录内
+  伪 JSON 不产生伪引用）通过。
+- **变异判别力**：还原裸名剪枝分支 → 该组 **18/18 FAIL**（已验证）。
+
+### 🔴 M-2 深度口径与常量单一语义源
+
+- **常量**：新增 `_KEPT_SKIP_MAX_CARD_DIR_DEPTH = _SKIP_DIR_PROBE_DEPTH - 1`；
+  `_exceeds_kept_skip_depth` 判定由 `best >= _SKIP_DIR_PROBE_DEPTH` 改为
+  `best > _KEPT_SKIP_MAX_CARD_DIR_DEPTH`（语义等价、单一来源）。
+- **文档口径按实测更正**：§3「嵌套 ≥ 3 层不可见」→「**卡目录**相对保留根层级
+  **> 2 层**不可见」（原口径把形状判定的**含文件层**深度误当卡目录层级）。
+  实测：`<root>/node_modules/a/b/handoffs`（相对层级 2）可见；
+  `<root>/node_modules/a/b/c/handoffs`（层级 3）不可见。
+- 回归：`TestM2DepthBoundConsistency`（7 项：常量派生 1 + 2 层可见 3 + 3 层边界 3，
+  修复前 6 FAIL）。
+
+### 🟡1–🟡5 处置
+
+| # | 项 | 处置 | 回归 |
+|---|---|---|---|
+| 🟡1 | fail-fast 只回滚交接卡 → 累积孤儿 `ho-*` | **已修**：回滚**本次新建**的 `ho-*` 卡（`delete_card` 清 `.json`/`.lock`/`.owner.json`）；**先已存在的共享卡不动**（以「是否本次新建」判定） | `TestFailFastRollbackBoundary`（3：连续 3 次失败零残留 + 反向对照 + 交接卡回滚） |
+| 🟡2 | 非 `OSError` 异常逃逸 `delete_session` | **已修**：扫描守卫 `except OSError` → `except Exception`（契约 §2「扫描异常不得逃逸」收口为全异常族） | `TestYellow2NonOserrorScanEscape`（3：`TypeError`/`RuntimeError`/`ValueError`） |
+| 🟡3 | 保守跳过回收后不可"再判定" | **登记 + 口径固化**：确认无"新实例自动回收"路径（内存态 + 台账已撤）→ 契约明确为「不误删；须显式清理或本实例重试」 | `TestYellow3ConservativeSkipSemantics`（1） |
+| 🟡4 | 白名单收紧兼容面未文档化（id 含 `.`/非 ASCII） | **登记 + 文档化**：契约 §5 第 4 条补「盘点 `handoffs/*.json` 文件名（= `card_id`），不符白名单者先清理/改名/补偿登记；**未完成盘点不得启用共享卡回收**」 | `TestYellow4LegacyCardIdCharset`（2） |
+| 🟡5 | 回执与实现/历史不符（符号/类名） | **本轮回执按实际符号**；复核 `_ALWAYS_SKIP_SCAN_DIR_NAMES` / `_AMBIGUOUS_SCAN_DIR_NAMES` / `_contains_data_root` / `TestAmbiguousDirNameNoBarePruning` / `TestReferenceScanFailureContainment` / `TestRefRegistrationFailFast` / `TestHandoffCardIdTraversalGuard` 在**全历史**（`git log --all -S`）命中数均为 **0** → 旧回执为误记，此处更正 | — |
+
+### 自测
+
+- 全量 **295 passed** = 8 + 15 + 65 + 148 + 19 + 20 + 12 + 8
+  （`batch_persist` / `content_archive` / 独立探针 / 门面 / `arbiter` /
+  `state_manager` / `ownership` / `state_tree`）。
+- 本轮新增（门面 119 → 148，+29）：M-1 验收 15 + M-2 7 + 🟡1 3（原 2 改 3）+
+  🟡2 3 + 🟡3 1 + 🟡4 2（-2 旧边界用例改写）；`TestListPendingPerFileReadGuard`（2）/
+  `TestIdentifierTrailingNewlineRejected`（3）为上游 §十一 既有项，合并后一并计入。
+- `compileall src` OK；`pyflakes`（改动文件）0 告警。
+- 性能：2000 目录 `.git` / `node_modules` 扫描 ~1.2–1.7 ms（非保留目录 ~66 ms）
+  → **剪枝收益不退化**。
