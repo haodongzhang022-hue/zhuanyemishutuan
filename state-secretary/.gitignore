@@ -6,3 +6,4 @@ data/state/
 data/bindings/
 data/handoffs/
 *.lock
+data/handoff-refs/

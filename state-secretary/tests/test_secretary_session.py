@@ -852,7 +852,8 @@ class TestSharedHoCardSelfResidueInvariant:
     原实现把本会话认领的交接卡 ID 作为 ``exclude_handoff_ids`` 从索引中排除，
     假定"自身卡一定已删"。若删除失败（OSError/权限/竞态）卡仍在盘上，排除它
     会让共享卡被误删，而残卡仍持有失效引用 —— 与 🔴#4 同型。修复：不再排除，
-    磁盘上仍在的卡即真实存活引用（宁可延迟回收，绝不误删）。
+    磁盘上仍在的卡即真实存活引用（**不误删**；残卡留盘期间共享卡一并留盘，
+    **无自动回收路径**，须显式清理残卡后由后续删除者再次判定方可回收）。
     """
 
     def test_own_handoff_delete_failure_keeps_shared_card(self, tmp_dir, monkeypatch):
@@ -908,14 +909,23 @@ class TestSharedHoCardSelfResidueInvariant:
         assert f"handoff:{ho.id}" in other._build_ho_reference_index().get(sid, []), \
             "残卡留盘期间仍应计为存活引用（不误删）"
 
+        # 🟡C 措辞固化（判别性）：残卡留盘期间共享卡**无延迟/自动回收路径**——
+        # 任何新会话的 delete_session 都不会触发回收；须**显式清理残卡**后由
+        # 后续删除者再次判定方可回收。若实现改为"新会话顺带回收孤儿 ho-* 卡"，
+        # 本断言失败。
+        other.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "残卡留盘期间共享卡必须留盘（不存在延迟/自动回收路径）"
+
         # 残卡清除 → 引用清空 → 共享卡可回收（不永久孤儿）
         os.remove(handoff_path)
-        index = other._build_ho_reference_index()
+        other2 = SecretarySession("sr-c2", data_dir=tmp_dir)
+        index = other2._build_ho_reference_index()
         assert not index.get(sid), "残卡清除后不应再有存活引用"
-        assert other._delete_ho_state_card_if_safe(sid, index) is True
+        assert other2._delete_ho_state_card_if_safe(sid, index) is True
         assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
             "引用清空后共享卡应可回收（无永久孤儿）"
-        other.delete_session()
+        other2.delete_session()
 
 
 class TestSharedHoCardScanPruning:
