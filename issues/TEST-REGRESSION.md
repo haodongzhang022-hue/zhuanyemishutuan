@@ -195,7 +195,8 @@
   文档口径一致。
 - **`.gitignore` 补 `data/handoff-refs/`**：`HandoffBus(auto_state_card=True)`
   的 state 根级引用登记目录此前未被忽略（`data/state/`、`data/handoffs/` 已忽略），
-  易被误提交。补齐后与既有数据根子目录（state/ content/ handoffs/）忽略口径一致。
+  易被误提交。补齐后与既有数据根子目录（state/ content/ handoffs/ handoff-refs/）
+  忽略口径一致（`60b625d` 已同步「三子目录」措辞）。
 - **测试基线**：仍 **137 项**（🟡C 仅加强既有断言、未新增用例）；`compileall` 通过。
 
 ### 🟡 修复 #I — 复评 `042e7e6` 三项结转项收口（PR #7 · 收口轮）
@@ -214,6 +215,34 @@
 - **🟡A/🟡B/🟡D 登记后续 Issue**：**Issue #8**（P2-④ 交接卡引用可见性契约边界）。
 - **测试基线**：仍 **137 项**（本轮零新增用例，仅注释/文档）；`compileall` 通过。
 
+### 🟡 修复 #J — 增量复评 `82807ff` 口径收窄（PR #7 · 收口轮 2）
+> 评审对象 `bb9df61..82807ff`（增量 5 文件 +111/−4）。评审判定 🔴 清零、
+> `proceed`（允许合并），要求把 🟡#1 口径收窄（+ Issue #8 补第三条 gap）并
+> 顺带收口 🟡#2/#3 与 🟢#1/#2。本轮**仅改文档/注释/忽略项，行为零变更**。
+- **🟡#1 口径收窄（过度声明 → 带前置条件）**：`docs/design/state-secretary-handoff-visibility.md`
+  §3 与 `session.py::_build_ho_reference_index` docstring 原称「经 `HandoffBus` API
+  写出的卡…歧义目录与无 `id` 场景**均不误删**」，作为**一般性保证**不成立。
+  收窄为：登记兜底成立须 **① `state_root` 与会话数据根同根**（否则卡目录落在
+  扫描界之外）**且 ② `handoff-refs/<card_id>.ref` 登记写入成功**（失败被
+  `_register_ref` 静默吞、无重试无补偿）。**不带前置条件的表述属过度声明，不采用**。
+- **🟡E 新增第三条 gap（与 🟡D 同族）**：登记写入失败 + 根外卡目录 → 引用**双路径
+  皆不可见** → 共享 `ho-*` 卡被误删（违反 §2「宁可多保留，绝不误删」）。
+  **纯 API 路径反例**已复现（`auto_state_card=True`、无手写卡）：
+  `SecretarySession('sessA', data_dir=root).create_handoff(...)` → 登记目录置为不可写
+  （同名文件占位）→ `HandoffBus(data_dir='external/queue', state_root=root).create_handoff(同三元组)`
+  复用同一 `ho-*` 卡、登记未写出 → `A.delete_session()` → 卡已删、根外卡留盘。
+  已在契约文档 §3 补 🟡E 小节，并登记 Issue #8（第三条 gap）。
+- **🟡#2 措辞残留**：`issues/TEST-REGRESSION.md:198`「三子目录」已由 `60b625d` 同步，
+  本轮再补 `handoff-refs/` 使与数据根四子目录口径完全一致。
+- **🟡#3 `.gitignore` 口径**：忽略清单未含 `data/content/`，与「数据根子目录全忽略」
+  口径不符——实测 `fold()` 后 `data/content/<sess>/*.json` 为未跟踪状态。补 `data/content/`。
+- **🟢#1 影响面口径对齐**：契约文档 🟡A 计数由「8/8 目录复现」更正为对
+  `_SKIP_SCAN_DIRS` **全量 11 名逐一复现、11/11 均误删**（计数取小会弱化影响面）。
+- **🟢#2 注释换行**：`handoff.py:29-30 / 52-53` 把词组「`handoffs/ handoff-refs/`」
+  劈开 → 改为整词组不跨行，便于检索。
+- **测试基线**：仍 **137 项**（本轮零新增用例，仅文档/注释/忽略项）；`compileall` 通过；
+  `handoff.py` / `session.py` 剥离 docstring 后 AST 等价（行为零变更）。
+
 ## 三、可复现缺陷记录（P2 待办）
 
 评审/测试接力中发现、**非阻塞合并**的 P2 边界问题，已建 Issue 跟踪。
@@ -223,7 +252,7 @@
 | ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | ✅ 已修复（#C + 复评 #D：顺序/引用源/类型守卫 + 复评 #E：扫描界提升到数据根 + state 根级引用登记，覆盖异交接目录/根外布局） |
 | ② | 独立 HandoffBus 未传 state_root 落 cwd 孤儿 | Issue #5 | ✅ 修复（本分支）：data_dir 显式时默认以父目录推导 state_root，ho-* 卡落 `<parent(data_dir)>/state`；未传 data_dir 保持历史退化兼容。回归测试见下（106 项全过） |
 | ③ | delete_card 返回值 docstring 语义漂移 | Issue #6 | ✅ 修复（本分支）：统一返回「状态卡是否存在」（.lock/.owner.json 伴生残留不影响返回值，幂等清理），delete_card/delete_session 两处 docstring 对齐。回归测试见下（115 项全过） |
-| ④ | 交接卡引用**可见性契约边界**（`_SKIP_SCAN_DIRS` 歧义名 / 形状校验收紧必含 `id` / 旧版根外卡升级路径） | Issue #8 | ⏳ **待总师裁定**：现状仅保证 `HandoffBus` API 写入路径（手写/遗留卡在歧义目录或缺 `id` 时不可见）；核心契约已冻结，口径详见 `docs/design/state-secretary-handoff-visibility.md` |
+| ④ | 交接卡引用**可见性契约边界**（🟡A `_SKIP_SCAN_DIRS` 歧义名 / 🟡B 形状校验收紧必含 `id` / 🟡D 旧版根外卡升级路径 / 🟡E 登记写入失败 + 根外卡目录无兜底） | Issue #8 | ⏳ **待总师裁定**：现状仅保证 `HandoffBus` API 写入路径**且 `state_root` 与会话数据根同根、登记写入成功**（手写/遗留卡在歧义目录或缺 `id` 时不可见；登记失败 + 根外卡目录双路径皆不可见）；核心契约已冻结，口径详见 `docs/design/state-secretary-handoff-visibility.md` |
 
 > P2-② 新增回归测试：
 > - `test_standalone_handoff_explicit_data_dir_derives_state_root` — data_dir 显式 → ho-* 卡落父目录推导的 state/，无 cwd 孤儿

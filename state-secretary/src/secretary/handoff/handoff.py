@@ -26,8 +26,8 @@ class HandoffBus:
     - state_root: 关联 ho-* StateCard 的落盘根（显式传入时使用）
     - 默认推导：data_dir 显式传入且未指定 state_root 时，以 data_dir 父目录
       推导 state_root，使 ho-* 卡落 ``<parent(data_dir)>/state``，
-      与 SecretarySession 数据根四子目录（state/ content/ handoffs/
-      handoff-refs/）收敛逻辑一致，
+      与 SecretarySession 数据根四子目录
+      （state/ content/ handoffs/ handoff-refs/）收敛逻辑一致，
       不再落 `<cwd>/data/state` 孤儿；
       data_dir 亦未传时保持历史退化行为（<cwd>/data/handoffs + <cwd> 根）。
     SecretarySession 会同时注入本会话 data_dir 下的 state/ 与 handoffs/，
@@ -49,8 +49,8 @@ class HandoffBus:
             state_root: 关联 ho-* StateCard 的状态根。默认推导规则——
                 - data_dir 显式传入且未指定 state_root：以 ``data_dir`` 的
                   父目录作为状态根，ho-* 卡落 ``<parent(data_dir)>/state``，
-                  与 SecretarySession 数据根四子目录（state/ content/
-                  handoffs/ handoff-refs/）收敛到同一数据根一致；
+                  与 SecretarySession 数据根四子目录
+                  （state/ content/ handoffs/ handoff-refs/）收敛到同一数据根一致；
                 - 仅 data_dir 缺省（用 <cwd>/data/handoffs）：状态根保持历史
                   行为（<cwd>），向后兼容；
                 显式传入后 auto_state_card 生成的关联状态卡落盘于
@@ -114,7 +114,9 @@ class HandoffBus:
                 except OSError:
                     pass
         except OSError:
-            # 登记失败不阻断交接卡本身（存活检查另有目录扫描兜底）
+            # 登记失败不阻断交接卡本身。注意：目录扫描兜底**仅在交接卡目录
+            # 落在会话数据根之内**时成立；卡目录在根外时该引用双路径皆不可见
+            # （🟡E，见 docs/design/state-secretary-handoff-visibility.md）。
             pass
 
     def _unregister_ref(self, card_id: str) -> None:

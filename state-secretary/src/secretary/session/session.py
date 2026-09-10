@@ -340,11 +340,15 @@ class SecretarySession:
 
         **可见性保证范围（口径说明，非行为变更）**：上述引用可见性仅保证
         **经 ``HandoffBus`` API（``create_handoff(auto_state_card=True)`` /
-        ``delete``）写入**的交接卡——它们恒带 ``id``、恒落登记或落在扫描界内。
+        ``delete``）写入、且满足前置条件**的交接卡——它们恒带 ``id``。
+        前置条件（缺一不可）：① ``state_root`` 与会话数据根**同根**（否则卡
+        目录落在扫描界之外），**且** ② ``handoff-refs/<card_id>.ref`` 登记
+        **写入成功**（``_register_ref`` 对 ``OSError`` 静默吞、无重试无补偿；
+        登记失败且卡目录在根外时，本索引**亦不可见** → 会误删，属 🟡E 缺口）。
         **手写/外部遗留**的交接卡若缺 ``id`` 字段、或落在 ``_SKIP_SCAN_DIRS``
         所列目录内，则本索引不可见（既不阻塞回收、亦不被计入）——属已知
-        覆盖边界，如需覆盖请改走 ``HandoffBus`` API（是否收窄为 API 路径保证
-        待总师裁定，已登记 Issue #8 跟踪；口径详见
+        覆盖边界，如需覆盖请改走 ``HandoffBus`` API（是否收窄为「API 路径保证
+        + 前置条件」待总师裁定，已登记 Issue #8 跟踪；口径详见
         ``docs/design/state-secretary-handoff-visibility.md``）。
 
         **保守方向（不变量优先）**：凡扫描界内**实际存在**的交接卡/登记一律
