@@ -2,30 +2,43 @@
 
 运行：``pytest -q tests/test_ho_ref_invariant_probes.py``
 
-本文件由「架构·测试」在 Issue #4 复评阶段独立编写，与评审（架构·评审）新增的三组
-探针互为交叉验证。探针在 ``60b625d``/``570c7ee``（及此前）上**全部失败**，
-记录了 P0-1（33 项）/P0-2（2 项）/P1-3（4 项）的破坏面。
+本文件由「架构·测试」在 Issue #4 复评阶段独立编写，与评审（架构·评审）新增的
+探针互为交叉验证。**已转为硬断言（🔴 修复后）**：原 ``xfail`` 在修复后显示
+``XPASS``，但日后回归会静默转为 ``xfail`` 而不报失败、门禁失效；改为硬断言后
+任何回归直接 FAIL，作为 P0/P1 清零的**持续**可执行证据。
 
-**已转为硬断言（2026-09-10，🔴 修复后）**：上述三项已由「架构·开发」在
-``a852574`` 修复，本文件同步**移除 ``xfail`` 标注**——原 ``xfail(strict=False)``
-在修复后虽显示 XPASS，但若日后回归会**静默转为 xfail 而不报失败**，门禁失效。
-改为硬断言后，任何回归都会直接 FAIL，作为 P0/P1 清零的**持续**可执行证据。
+口径更正（评审复评 §二，2026-09-10；本文件据此重写，旧稿两处口径已撤）：
 
-覆盖三组（对应评审复评回执的确认项）：
+- **更正 ①**：``handoff.py:_unregister_ref`` 的 ``os.listdir`` **位于
+  ``try/except OSError`` 之内，有守卫、不逃逸**（旧稿"同形无守卫"系误报，已撤）。
+  本 PR 新增逃逸面**只有 ``session.py`` ``_build_ho_reference_index`` 来源 3**
+  （``isdir`` → ``listdir`` 无 try）。同形点 ``handoff.py`` ``list_pending`` 属
+  ``main`` 既有代码、非本 PR diff，不计入本 PR 新增面。
+- **更正 ②**：旧稿"``11dfdd9`` 基线 3/33（仅 ``.venv``）"**与实测不符**。旧稿
+  30 组把受害者卡目录放在**会话数据根之外**的独立 tempdir，而 ``11dfdd9`` 的
+  扫描界只到数据根 + 登记 → 根外卡双路径皆不可见 → **同样误删**；故该 30 组在
+  ``11dfdd9`` 与 ``570c7ee`` 上**都失败**，**无跨版判别力**（实测 ``11dfdd9``
+  用 ``--runxfail``：41 failed）。
+  **正确判别对照 = 卡目录放在会话数据根「之内」、仅改目录名**
+  （``TestP0_1DiscriminatingInsideRoot``）：``queue``（非剪枝名）两版皆不违反；
+  剪枝名 ``11dfdd9`` 不违反、``570c7ee`` 起违反。实测该面 11dfdd9 → 33 passed、
+  570c7ee/60b625d/ee4214e/d7c4607 → 30 xfailed（修复前）。故
+  「``570c7ee`` 相对 ``11dfdd9`` 新引入 P0-1」结论**仍成立**，判别证据即本类。
+  旧稿 30 组降级为**覆盖面**（``TestP0_1RootOutsideCoverage``，归 🟡E / Issue #8，
+  修复后由双通道登记闭环）。
 
-- **P0-1** 扫描界剪枝（``_SKIP_SCAN_DIRS`` / 隐藏目录）使**存活交接卡引用不可见**
-  → 共享 ``ho-*`` 卡被误删 → 存活交接卡引用静默失效。
-  3 条触发路径（旧版遗留无登记 / 登记失败 / 外部删 ``.ref``）× 剪枝名。
-- **P0-2** ``_build_ho_reference_index`` 来源 3（``isdir`` → ``listdir`` 无 try）
-  在 ``listdir`` 抛 ``OSError`` 时**逃逸**，``delete_session`` 中断、清理不完整。
-- **P1-3** ``_unregister_ref`` / ``HandoffBus.delete`` 未校验 ``card_id`` →
-  ``.ref`` 通道路径穿越；台账 ``handoff_ids`` 注入后经 ``delete_session`` 可达删除面，
-  并可与 P0-1 连锁（穿越删他人 ``.ref`` → 其引用不可见 → 共享卡误删）。
+覆盖四组（均在当前 head 通过；括号内为修复前破坏面，供跨版复核）：
 
-口径（与评审一致，本文件不改变实现口径）：
-- 剪枝名单共 **11** 个，其中非隐藏 **10** 个（``.venv`` 为隐藏 → 基线既有面，单列）；
-- P0-1 新增回归面 = 10 × 3 = **30/30**；``11dfdd9`` 基线为 **3/33**（仅 ``.venv``）；
-- P0-2 引入点 ``11dfdd9``（state 根级引用登记随该提交引入）。
+- **P0-1 判别面**（``570c7ee`` 引入）：卡目录在数据根**之内** + 剪枝名 → 存活引用
+  不可见 → 共享 ``ho-*`` 卡被误删。3 触发 × 10 非隐藏剪枝名 = 30 + 对照 3。
+- **P0-1 覆盖面**（🟡E / Issue #8）：卡目录在数据根**之外** + 登记不可用 →
+  引用双路径皆不可见。30 组 + 纯 API 1 组。
+- **P0-2**：来源 3 ``listdir`` 无 try → ``OSError`` 逃逸 → ``delete_session``
+  中断 → 归档残留 + ``ho-*``/``.lock`` 永久孤儿（3 项）。
+- **P1-3**：``card_id`` 未校验 → ``.ref`` 通道路径穿越；台账 ``handoff_ids`` 注入
+  经 ``delete_session`` 可达删除面；与 P0-1 连锁（4 项）。
+
+口径：剪枝名单共 **11** 个，其中非隐藏 **10** 个（``.venv`` 为隐藏 → 单列）。
 """
 from __future__ import annotations
 
@@ -42,19 +55,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from secretary.handoff import HandoffBus  # noqa: E402
 from secretary.session import SecretarySession  # noqa: E402
 
-# 与 session.py 的 _SKIP_SCAN_DIRS 逐字对齐（11 个）
+# 实现侧剪枝名单（漂移断言用）。≤11dfdd9 无此常量 → None。
+try:
+    from secretary.session.session import _SKIP_SCAN_DIRS as _IMPL_SKIP_SCAN_DIRS
+except ImportError:  # pragma: no cover - 旧版本兼容
+    _IMPL_SKIP_SCAN_DIRS = None
+
+# 是否具备剪枝名单：决定反向守卫是否适用（保证本文件跨版可跑）。
+_HAS_PRUNE_LIST = _IMPL_SKIP_SCAN_DIRS is not None
+
+# 探针侧副本（参数化用）。与实现侧的漂移由 test_prune_dirs_no_drift 断言兜底，
+# 避免实现改名/增删剪枝项时探针静默失配。
 PRUNE_DIRS = [
     "node_modules", "__pycache__", "venv", ".venv", "env",
     "dist", "build", "target", "site-packages", "vendor", "coverage",
 ]
 NON_HIDDEN_PRUNE = [d for d in PRUNE_DIRS if not d.startswith(".")]
 TRIGGERS = ("legacy_no_registry", "registry_failed", "ref_externally_removed")
-
-# 🔴 修复后（a852574）移除 xfail 标注 → 硬断言。
-# 回归即 FAIL（原 xfail(strict=False) 会让回归静默通过，门禁失效）。
-# P0-1 剪枝致存活引用不可见 → 共享 ho-* 卡误删
-# P0-2 引用登记 listdir 无 try → delete_session 逃逸
-# P1-3 card_id 未校验 → 路径穿越 / 删除面可达
 
 
 @pytest.fixture
@@ -66,19 +83,24 @@ def roots():
     shutil.rmtree(outside, ignore_errors=True)
 
 
-def _make_victim_bus(root, outside, dirname, trigger):
-    """构造异目录独立使用者：其交接卡引用共享 ho-* 卡，但引用对秘书不可见。"""
+def _make_victim_bus(root, card_base, dirname, trigger):
+    """构造独立使用者：其交接卡引用共享 ho-* 卡，但引用对秘书不可见。
+
+    ``card_base`` = 卡目录的父目录（数据根之内 = 判别面；根外 = 覆盖面）。
+    """
     if trigger == "registry_failed":
-        # 以文件占位 handoff-refs → 登记目录不可创建（登记静默失败）
+        # 占位主登记通道（备通道仍可用 → 引用经备份通道可见，P1-4 双通道）
         with open(os.path.join(root, "handoff-refs"), "w", encoding="utf-8") as f:
             f.write("x")
-    bus = HandoffBus(data_dir=os.path.join(outside, dirname), state_root=root)
+    bus = HandoffBus(data_dir=os.path.join(card_base, dirname), state_root=root)
     card = bus.create_handoff("s", "t", "shared-intent", "ctx",
                               auto_state_card=True)
     if trigger in ("legacy_no_registry", "ref_externally_removed"):
-        reg = os.path.join(root, "handoff-refs", f"{card.id}.ref")
-        if os.path.isfile(reg):
-            os.remove(reg)
+        # 外部删除双通道登记 → 该引用确已不可见（模拟外部/遗留动作，非缺陷）
+        for name in ("handoff-refs", ".handoff-refs"):
+            reg = os.path.join(root, name, f"{card.id}.ref")
+            if os.path.isfile(reg):
+                os.remove(reg)
     return bus, card
 
 
@@ -89,68 +111,133 @@ def _invariant_broken(root, bus, card, ho_id):
     「delete 之后，仍存活的交接卡所引用的状态卡必须仍存在」。
     """
     card_alive = os.path.exists(os.path.join(bus.data_dir, f"{card.id}.json"))
-    ho_alive = os.path.exists(
-        os.path.join(root, "state", f"{ho_id}.json"))
+    ho_alive = os.path.exists(os.path.join(root, "state", f"{ho_id}.json"))
     return (card_alive and not ho_alive), card_alive, ho_alive
 
 
+def _run_shared_card_case(root, card_base, dirname, trigger):
+    bus, victim = _make_victim_bus(root, card_base, dirname, trigger)
+    sec = SecretarySession("A", data_dir=root)
+    own = sec.create_handoff("s", "t", "shared-intent", "ctx")
+    assert own.state_card_id == victim.state_card_id, \
+        "前置：同源/同目标/同意图应共享同一 ho-* 卡"
+    sec.delete_session()
+    return _invariant_broken(root, bus, victim, victim.state_card_id)
+
+
 # ----------------------------------------------------------------------
-# P0-1：剪枝致存活引用不可见 → 共享 ho-* 卡误删（30/30 新增面 + .venv 基线面）
+# P0-1 判别面：数据根「之内」+ 剪枝名 → 引用不可见（570c7ee 新引入）
+# 判别对照：queue（非剪枝名）两版皆不违反；剪枝名 11dfdd9 不违反、570c7ee 起违反
+# 本类为「570c7ee 相对 11dfdd9 新引入」的判别证据（评审复评 §二 更正②）
 # ----------------------------------------------------------------------
 
-class TestP0_1PrunedDirReferenceVisibility:
+class TestP0_1DiscriminatingInsideRoot:
     @pytest.mark.parametrize("dirname", NON_HIDDEN_PRUNE)
     @pytest.mark.parametrize("trigger", TRIGGERS)
-    def test_non_hidden_prune_dir_keeps_live_handoff_reference(
+    def test_pruned_dir_inside_root_keeps_live_reference(
             self, roots, dirname, trigger):
-        root, outside = roots
-        bus, victim = _make_victim_bus(root, outside, dirname, trigger)
-        sec = SecretarySession("A", data_dir=root)
-        own = sec.create_handoff("s", "t", "shared-intent", "ctx")
-        assert own.state_card_id == victim.state_card_id, \
-            "前置：同源/同目标/同意图应共享同一 ho-* 卡"
-
-        sec.delete_session()          # 触发存活引用判定与共享卡回收
-        broken, card_alive, ho_alive = _invariant_broken(
-            root, bus, victim, victim.state_card_id)
+        root, _ = roots
+        broken, card_alive, ho_alive = _run_shared_card_case(
+            root, root, dirname, trigger)
         assert card_alive, "前置：受害者交接卡须在盘上（探针不变量前提）"
         assert not broken, (
-            f"不变量破坏：{dirname}/{trigger} 下存活交接卡引用未被计入索引 → "
-            f"共享 ho-* 卡被误删（card_alive={card_alive}, ho_alive={ho_alive}）")
+            f"不变量破坏：数据根内 {dirname}/{trigger} 下存活交接卡引用未计入"
+            f"索引 → 共享 ho-* 卡被误删（card_alive={card_alive}, ho_alive={ho_alive}）")
 
     @pytest.mark.parametrize("trigger", TRIGGERS)
-    def test_hidden_venv_baseline_surface(self, roots, trigger):
-        """``.venv`` 属隐藏目录剪枝（``11dfdd9`` 基线既有），单列不计入
-        新增面，但同根因，建议随 P0-1 一并覆盖。"""
+    def test_non_pruned_dir_inside_root_control(self, roots, trigger):
+        """判别对照（须通过，两版皆然）：非剪枝名 ``queue`` 不得违反。
+        证明判别变量为「目录名是否命中剪枝名单」，而非目录位于根内。"""
+        root, _ = roots
+        broken, card_alive, ho_alive = _run_shared_card_case(
+            root, root, "queue", trigger)
+        assert card_alive, "前置：受害者交接卡须在盘上"
+        assert not broken, (
+            f"对照破坏：非剪枝名 queue/{trigger} 亦违反 → 判别变量未隔离"
+            f"（card_alive={card_alive}, ho_alive={ho_alive}）")
+
+
+# ----------------------------------------------------------------------
+# P0-1 覆盖面 / 根外契约（🟡E / Issue #8 闭环后）：卡目录在数据根「之外」
+# 修复后契约：双通道登记（主 handoff-refs/ + 备 .handoff-refs/）任一生效即
+# 引用可见；双通道全失败且为唯一可见性路径 → 建卡 fail-fast（不产生悬空卡）。
+# 注：外部**删除已写登记**（stale 登记）会让根外引用确不可见——属外部动作、
+# 非实现缺陷，见契约 §5 迁移前提，故不作为失败面。
+# ----------------------------------------------------------------------
+
+class TestP0_1RootOutsideCoverage:
+    @pytest.mark.parametrize("dirname", NON_HIDDEN_PRUNE)
+    def test_root_outside_card_visible_via_backup_channel(self, roots, dirname):
+        """主登记通道失败、备通道正常 → 根外卡引用仍可见（🟡E 双通道闭环）。"""
         root, outside = roots
-        bus, victim = _make_victim_bus(root, outside, ".venv", trigger)
-        sec = SecretarySession("A", data_dir=root)
-        own = sec.create_handoff("s", "t", "shared-intent", "ctx")
-        assert own.state_card_id == victim.state_card_id
-        sec.delete_session()
-        broken, _, _ = _invariant_broken(root, bus, victim, victim.state_card_id)
-        assert not broken, "基线既有面：.venv 剪枝同样破坏不变量"
+        broken, card_alive, ho_alive = _run_shared_card_case(
+            root, outside, dirname, "registry_failed")
+        assert card_alive, "前置：受害者交接卡须在盘上"
+        assert not broken, (
+            f"🟡E 回归：根外 {dirname} 下主通道失败、备通道正常，引用应可见"
+            f"（card_alive={card_alive}, ho_alive={ho_alive}）")
+
+    def test_root_outside_card_visible_via_main_channel(self, roots):
+        """根外 + 双通道均正常 → 引用可见（基线，无外部删登记）。"""
+        root, outside = roots
+        broken, card_alive, ho_alive = _run_shared_card_case(
+            root, outside, "queue", "none")
+        assert card_alive, "前置：受害者交接卡须在盘上"
+        assert not broken, (
+            f"根外 queue 双通道正常时引用应可见（card_alive={card_alive}, "
+            f"ho_alive={ho_alive}）")
+
+    def test_root_outside_double_channel_failure_fails_fast(self, roots):
+        """根外 + 双通道全失败 → 建卡 fail-fast（OSError），不产生悬空卡。
+        证明「写入成功但引用静默悬空」不存在（P1-1 + 🟡E 闭环）。"""
+        root, outside = roots
+        for name in ("handoff-refs", ".handoff-refs"):
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        bus = HandoffBus(data_dir=os.path.join(outside, "queue"),
+                         state_root=root)
+        with pytest.raises(OSError):
+            bus.create_handoff("s", "t", "shared-intent", "ctx",
+                               auto_state_card=True)
 
     def test_pure_api_path_registry_failure_pruned_dir(self, roots):
-        """纯 API 路径（受害者仅用 HandoffBus，不经门面登记）：登记失败 +
-        剪枝目录同样破坏——秘书侧只要认领同一共享 ho-* 卡即可触发误删。"""
+        """纯 API 路径（受害者仅用 HandoffBus，不经门面登记）：根外 + 剪枝名 +
+        主通道失败 → 备通道兜底，引用可见。"""
         root, outside = roots
-        bus, victim = _make_victim_bus(
+        broken, card_alive, ho_alive = _run_shared_card_case(
             root, outside, "node_modules", "registry_failed")
-        sec = SecretarySession("B", data_dir=root)
-        own = sec.create_handoff("s", "t", "shared-intent", "ctx")
-        assert own.state_card_id == victim.state_card_id, \
-            "前置：秘书侧须认领同一共享 ho-* 卡"
-        sec.delete_session()
-        broken, card_alive, ho_alive = _invariant_broken(
-            root, bus, victim, victim.state_card_id)
         assert card_alive, "前置：受害者交接卡须在盘上"
-        assert not broken, "纯 API 路径下剪枝 + 登记失败同样不得误删共享卡"
+        assert not broken, (
+            f"纯 API 路径根外 + 剪枝 + 主通道失败，备通道应兜底"
+            f"（card_alive={card_alive}, ho_alive={ho_alive}）")
+
+
+class TestP0_1HiddenVenvBaseline:
+    @pytest.mark.parametrize("trigger", TRIGGERS)
+    def test_hidden_venv_baseline_surface(self, roots, trigger):
+        """``.venv`` 属隐藏目录剪枝（全版本既有），单列不计入新增面，
+        但同根因，建议随 P0-1 一并覆盖。"""
+        root, _ = roots
+        broken, _, _ = _run_shared_card_case(root, root, ".venv", trigger)
+        assert not broken, "基线既有面：.venv 剪枝同样破坏不变量"
 
 
 # ----------------------------------------------------------------------
-# P0-2：引用登记 listdir 无 try → delete_session 逃逸
+# P0-2：来源 3 引用登记 listdir 无 try → delete_session 逃逸
 # ----------------------------------------------------------------------
+
+def _install_listdir_fault(reg_dir, exc_factory):
+    """注入 listdir 故障；返回 restore 回调。"""
+    real_listdir = os.listdir
+
+    def boom(path):
+        if os.path.abspath(str(path)) == os.path.abspath(reg_dir):
+            raise exc_factory()
+        return real_listdir(path)
+
+    os.listdir = boom
+    return lambda: setattr(os, "listdir", real_listdir)
+
 
 class TestP0_2RegistryListdirEscape:
     def test_listdir_oserror_does_not_escape_delete_session(self, roots):
@@ -160,18 +247,12 @@ class TestP0_2RegistryListdirEscape:
         reg_dir = os.path.join(root, "handoff-refs")
         assert os.path.isdir(reg_dir), "前置：登记目录应存在"
 
-        real = os.listdir
-
-        def boom(path):
-            if os.path.abspath(str(path)) == os.path.abspath(reg_dir):
-                raise OSError(13, "Permission denied", str(path))
-            return real(path)
-
-        os.listdir = boom
+        restore = _install_listdir_fault(
+            reg_dir, lambda: OSError(13, "Permission denied"))
         try:
             sec.delete_session()  # 不应抛 OSError
         finally:
-            os.listdir = real
+            restore()
 
     def test_isdir_listdir_toctou_does_not_escape(self, roots):
         """``isdir`` 通过后目录消失 → ``listdir`` 抛 FileNotFoundError
@@ -180,23 +261,44 @@ class TestP0_2RegistryListdirEscape:
         sec = SecretarySession("esc-2", data_dir=root)
         reg_dir = os.path.join(root, "handoff-refs")
         os.makedirs(reg_dir, exist_ok=True)
-        real_isdir, real_listdir = os.path.isdir, os.listdir
 
-        def isdir(path):
-            if os.path.abspath(str(path)) == os.path.abspath(reg_dir):
-                return True
-            return real_isdir(path)
-
-        def listdir(path):
-            if os.path.abspath(str(path)) == os.path.abspath(reg_dir):
-                raise FileNotFoundError(2, "No such file or directory")
-            return real_listdir(path)
-
-        os.path.isdir, os.listdir = isdir, listdir
+        restore = _install_listdir_fault(
+            reg_dir, lambda: FileNotFoundError(2, "No such file or directory"))
         try:
             sec.delete_session()
         finally:
-            os.path.isdir, os.listdir = real_isdir, real_listdir
+            restore()
+
+    def test_escape_leaves_permanent_orphan_and_archive_residue(self, roots):
+        """逃逸后果：步骤 5（归档清理）不执行 → 归档残留；台账已于步骤 3
+        删除 → 重试实例无从认领 → ``ho-*.json`` + ``ho-*.lock`` 永久孤儿。"""
+        root, _ = roots
+        sec = SecretarySession("esc-3", data_dir=root)
+        sec.add_task("t1", "obj")
+        sec.fold("alpha\n\nbeta")               # 产生 content/esc-3/ 归档
+        sec.create_handoff("s", "t", "i", "c")
+        ho_ids = list(sec._owned_state_card_ids)
+        assert ho_ids, "前置：须认领 ho-* 状态卡"
+        ho_id = ho_ids[0]
+        reg_dir = sec.handoff_bus.ref_registry_dir()
+        archive_dir = os.path.join(root, "content", "esc-3")
+
+        restore = _install_listdir_fault(
+            reg_dir, lambda: FileNotFoundError(2, "No such file or directory"))
+        try:
+            sec.delete_session()
+        finally:
+            restore()
+
+        assert not os.path.isdir(archive_dir), "逃逸不得跳过步骤 5 归档清理"
+        assert not os.path.exists(os.path.join(root, "state", f"{ho_id}.json")), \
+            "逃逸不得遗留 ho-* 卡"
+        assert not os.path.exists(os.path.join(root, "state", f"{ho_id}.lock")), \
+            "逃逸不得遗留 ho-*.lock"
+        # 重试一次（不再注入）：台账已删 → 新实例无从认领 → 孤儿永久留存
+        SecretarySession("esc-3", data_dir=root).delete_session()
+        assert not os.path.exists(os.path.join(root, "state", f"{ho_id}.json")), \
+            "重试后 ho-* 卡仍残留 → 永久孤儿"
 
 
 # ----------------------------------------------------------------------
@@ -247,10 +349,14 @@ class TestP1_3CardIdPathTraversal:
             "台账 handoff_ids 不得构成路径穿越删除面"
 
     def test_traversal_chain_does_not_break_ho_invariant(self, roots):
-        """连锁升级：穿越删他人 ``.ref`` → 其异目录引用不可见 → 共享卡误删。"""
+        """连锁升级：台账注入 ``../handoff-refs/<victim.id>`` 试图穿越删他人
+        ``.ref`` → 其引用不可见 → 共享卡误删。修复后穿越被 ``card_id`` 白名单
+        拦截：victim 的 ``.ref`` 须存活，且共享卡不得被误删。"""
         root, outside = roots
-        bus, victim = _make_victim_bus(
-            root, outside, "queue", "legacy_no_registry")
+        # victim：根外独立使用者（登记为其唯一可见性路径），双通道均正常
+        bus, victim = _make_victim_bus(root, outside, "queue", "none")
+        reg = os.path.join(root, "handoff-refs", f"{victim.id}.ref")
+        assert os.path.isfile(reg), "前置：victim 主通道登记须存在"
         sec = SecretarySession("A", data_dir=root)
         own = sec.create_handoff("s", "t", "shared-intent", "ctx")
         assert own.state_card_id == victim.state_card_id
@@ -261,6 +367,8 @@ class TestP1_3CardIdPathTraversal:
                        "handoff_ids": [f"../handoff-refs/{victim.id}"],
                        "state_card_ids": []}, f)
         sec.delete_session()
+        assert os.path.isfile(reg), \
+            "穿越面不得删除他人 .ref（card_id 白名单应拦截）"
         broken, _, _ = _invariant_broken(
             root, bus, victim, victim.state_card_id)
         assert not broken, "穿越面与 P0-1 连锁不得破坏「存活卡 → 状态卡存在」不变量"
@@ -268,8 +376,11 @@ class TestP1_3CardIdPathTraversal:
 
 # ----------------------------------------------------------------------
 # 反向守卫（当前应通过）：剪枝不得被"删掉了事"——重型目录仍须剪枝且不产生伪引用
+# ≤11dfdd9 无剪枝名单 → 不适用（按版本能力 skip）
 # ----------------------------------------------------------------------
 
+@pytest.mark.skipif(not _HAS_PRUNE_LIST,
+                    reason="≤11dfdd9 无剪枝名单，反向守卫不适用")
 class TestScanGuardRegression:
     def test_heavy_dir_pseudo_refs_not_indexed(self, roots):
         root, _ = roots
@@ -284,3 +395,10 @@ class TestScanGuardRegression:
         index = sec._build_ho_reference_index()
         assert not any(k.startswith("fake-") for k in index), \
             "重型目录内伪交接卡不得产生伪引用（修复 P0-1 时须保留该剪枝语义）"
+
+    def test_prune_dirs_no_drift(self):
+        """探针侧 ``PRUNE_DIRS`` 不得与实现侧 ``_SKIP_SCAN_DIRS`` 漂移：
+        实现改名/增删剪枝项时此处即报错，避免探针覆盖面静默失配。"""
+        assert set(PRUNE_DIRS) == set(_IMPL_SKIP_SCAN_DIRS), (
+            f"剪枝名单漂移：探针 {sorted(PRUNE_DIRS)} vs 实现 "
+            f"{sorted(_IMPL_SKIP_SCAN_DIRS)}")
