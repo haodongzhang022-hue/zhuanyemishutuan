@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **210 项全部通过**（门面 87 项 + 独立探针 41 项）
+- 测试基线：全量 pytest **228 项全部通过**（门面 88 项 + 独立探针 58 项）
 
 ---
 
@@ -341,7 +341,7 @@
   `test_concurrent_create_fold_delete_no_exception`（线程并发）；
 - `TestRegistryFailFast`：`_registry_required` 判定 + 唯一路径 fail-fast 回滚 +
   子树内容忍登记失败（3 项）。
-- **测试基线**：137 → **210 项全部通过**（门面 **87 项**，独立探针 41 项；
+- **测试基线**：137 → **228 项全部通过**（门面 **88 项**，独立探针 58 项；
   含本角色 P1-3 写入面补充 +8 与总师 🔴1 竞态收口 +3）。
 - **架构·测试独立探针**（`tests/test_ho_ref_invariant_probes.py`，41 项）：
   修复前（`60b625d`）**40 项 FAIL**（P0-1 33 + P0-2 2 + P1-3 4 + 反向守卫 1），
@@ -389,3 +389,16 @@
 ### 🔴2 索引来源 3 `listdir` 无守卫 → `delete_session` 抛未捕获异常
 - 已由开发方 `a852574` 修复（`try/except OSError → []`），总师复跑确认。
 - 回归测试：`TestRegistryListdirToctouGuard` + 测试方独立探针 `TestP0_2...`（硬断言）
+
+### 🔴1 补强（复评第 4 轮 · 确定性窗口回归 + 计数同步）
+> 总师 `73361ca` 已落地 🔴1 根因收口（模块级 `_REF_REGISTRY_LOCK`）。本角色在
+> **范围冻结**约束下仅补两项**非侵入**增量（不引入新机制）：
+- **确定性窗口回归** `TestRegistryRmdirWindowDeterministic`
+  （`test_rmdir_between_makedirs_and_mkstemp_is_mutually_excluded`）：与既有
+  概率型 `TestRegistryRmdirWriteRace` 互补——以「窗口内等待对端完成一轮
+  `rmdir`」把 `makedirs → mkstemp` 竞态**确定性**对齐。判别力实证：临时移除
+  模块级互斥（等价 `8790e5f`）→ **3/3 稳定 FAIL**（根外卡误判双通道全失败 →
+  fail-fast 抛 `OSError`）；恢复锁 → 稳定 PASS。
+- **计数同步**：README / 设计索引 / module / 台账 4 处 210 → **228**
+  （门面 87 → **88**，独立探针 41 → **58**）。
+- **基线**：`pytest -q` **228 passed**；`compileall` 通过。

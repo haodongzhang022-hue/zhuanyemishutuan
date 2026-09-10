@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -1556,3 +1557,65 @@ class TestRegistryRmdirWriteRace:
             t.join()
         assert errors == [], (
             f"🔴1 回归：并发根外建卡误抛 {len(errors)} 次：{errors[:3]}")
+
+
+class TestRegistryRmdirWindowDeterministic:
+    """🔴1 **确定性**回归：他线程在 ``makedirs`` 与 ``mkstemp`` 之间 rmdir。
+
+    与 ``TestRegistryRmdirWriteRace``（概率型并发）互补——本用例以
+    "窗口内等待对端完成一轮注销" 把竞态窗口**确定性**对齐：
+
+    - 无模块级互斥（``8790e5f``）：窗口内他线程 rmdir 打断两条通道 →
+      误判双通道全失败 → 根外卡 fail-fast 抛 ``OSError``（3/3 稳定复现）；
+    - 有 ``_REF_REGISTRY_LOCK``（``73361ca``）：注销线程在窗口期间阻塞于锁，
+      窗口内无 rmdir → 登记落地（稳定通过）。
+    """
+
+    def test_rmdir_between_makedirs_and_mkstemp_is_mutually_excluded(
+            self, tmp_dir, monkeypatch):
+        import secretary.handoff.handoff as ho_mod
+
+        root = os.path.join(tmp_dir, "root")
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(outside, exist_ok=True)
+        bus = HandoffBus(data_dir=outside, state_root=root)
+        other = HandoffBus(data_dir=os.path.join(outside, "other"),
+                           state_root=root)
+        other_card = other.create_handoff("x", "y", "他卡", "ctx",
+                                          auto_state_card=True)
+
+        real_mkstemp = ho_mod.tempfile.mkstemp
+        rmdir_rounds = {"n": 0}
+        stop = threading.Event()
+
+        def churn():
+            # 持续注销 → 空目录回收 rmdir（两通道），直到主线程离开窗口
+            while not stop.is_set():
+                other._unregister_ref(other_card.id)
+                rmdir_rounds["n"] += 1
+
+        def mkstemp_after_churn(*args, **kwargs):
+            # 窗口内等待对端完成至少一轮 rmdir（无锁时它会立刻删掉两通道目录）
+            baseline = rmdir_rounds["n"]
+            waited = 0.0
+            while rmdir_rounds["n"] <= baseline and waited < 0.4:
+                time.sleep(0.005)
+                waited += 0.005
+            return real_mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(ho_mod.tempfile, "mkstemp", mkstemp_after_churn)
+        t = threading.Thread(target=churn, daemon=True)
+        t.start()
+        try:
+            card = bus.create_handoff("s", "t", "互斥意图", "ctx",
+                                      auto_state_card=True)
+        finally:
+            stop.set()
+            t.join(timeout=5)
+            monkeypatch.undo()
+
+        assert rmdir_rounds["n"] > 0, "前置：注销线程须确实执行过 rmdir"
+        assert any(os.path.exists(os.path.join(root, d, f"{card.id}.ref"))
+                   for d in ("handoff-refs", ".handoff-refs")), \
+            "窗口内他线程 rmdir 不得使登记丢失（登记/注销须跨实例互斥）"
