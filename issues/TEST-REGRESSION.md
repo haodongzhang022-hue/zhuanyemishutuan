@@ -8,9 +8,8 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **228 项全部通过**（门面 88 项 + 独立探针 58 项）
-
-- 测试基线：全量 pytest **229 项全部通过**（门面 89 项 + 独立探针 58 项）
+- 测试基线：全量 pytest **237 项全部通过**（门面 90 项 + 独立探针 65 项；
+  底层模块回归 8 + 15 + 19 + 20 + 12 + 8）
 
 ---
 
@@ -529,3 +528,88 @@
   `state_manager` / `ownership` / `state_tree`）。
 - 同步 `state-secretary/README.md`、`docs/design/state-secretary-index.md`、
   `docs/design/state-secretary-module.md` 三处（230 → 237；独立探针 58 → 65）。
+
+---
+
+## 八、Issue #4 复评第 5 轮 · 架构·测试独立复测（`bca4193`）
+
+> 角色：架构·测试。对象：PR #7 源分支 head **`bca4193`**（`60e32ec` + test-only 提交）。
+> 触发：架构·评审 `60e32ec` 增量复评（🔴 清零 / `proceed`）转交本角色复测。
+> 范围：增量 `28ca7f6..60e32ec`（6 文件 +70/−6）+ 全量 `main..60e32ec`。
+> 前置核对：`bca4193` 相对 `60e32ec` 的 `state-secretary/src` **逐字节不变**
+> （`git diff --stat 60e32ec..bca4193 -- state-secretary/src` 空），故 src 复测结论
+> 等价适用于两 head。
+> 结论：🟢 **通过（放行合并）**，无 🔴 / 🟠；3 项 🟡 结转（均为 baseline 既有面，
+> 非本 diff 引入、不在 `delete_session` 关键路径）。
+
+### 8.1 独立复跑（探针脚本未随 PR 提交，遵守范围冻结；工作树已复原）
+
+| 项 | 口径 | 结果 |
+|---|---|---|
+| 不变量（逐布局） | 11 布局 | 10 ok / 1 破坏（根外 + 双通道登记**全被外部删除**，见 8.3 🟡-3） |
+| P0-2 注入式 TOCTOU | `listdir` 对登记目录抛 `FileNotFoundError` | **不逃逸**，残骸 `[]` ✅ |
+| P0-2 自然并发 | 6 线程 × 120 轮（含 rmdir 竞态） | 逃逸 **0/720**，残骸轮次 **0/120** ✅ |
+| P0-2 判别对照 | 基线 `a852574~1` 同探针 | `ESCAPED FileNotFoundError` + 残骸 `state/ho-*.json`/`.lock` ✅ 判别成立 |
+| P0-1 根内剪枝名矩阵 | 11 名单名 × 3 触发 = 33 + `queue` 对照 3 | 违反 **0/36** ✅ |
+| P1-3 读/删/写三面 | `delete`/`get`/`create_handoff` 穿越 | 全拦截，受害文件存活 ✅ |
+| NEW-1 单元名白名单 | 非 ASCII / `../` | `ValueError` ✅；`_save` 纵深防御 `ValueError` ✅ |
+| 🔴1 登记写 × `rmdir` 竞态 | 根内 + 根外 × 6 线程 × 150 轮 | 登记丢失 **0/1800**，误抛 **0** ✅ |
+| 不变量并发保持 | 根内 / 根外 × 4 线程 × 60 轮 | 破坏 **0/120**，误抛 **0** ✅ |
+| 全量 pytest | `cd state-secretary && pytest -q` | **237 passed** ✅ |
+| `compileall src tests` | — | OK ✅ |
+| `pyflakes` | `session.py` / `handoff.py` / 两测试文件 | **0 告警**（全仓仅既有未用导入，非本 PR） |
+
+### 8.2 变异测试（判别力，非恒真实证）
+
+在 `bca4193` 检出副本上逐个注入变异体，跑全量：
+
+| 变异体 | 触发 FAIL |
+|---|---|
+| 形状校解放宽（`'"id"' in raw` → `True`） | 1 |
+| 截断读取（`f.read()` → `f.read(65536)`） | 1 |
+| 台账存活守卫移除 | 1 |
+| 来源 2 整体失效（跳过非隐藏 `*.json`） | 38 |
+| 来源 3 整体移除 | 17 |
+| 来源 3 `listdir` 守卫移除 | 22 |
+| 模块级互斥锁失效（`with _REF_REGISTRY_LOCK` → `if True`） | 3 |
+
+基线恢复后 **237 passed** → 断言非恒真、门禁持续有效。
+
+### 8.3 缺陷分级与结转
+
+- 🔴 **P0：无**。P0-1 / P0-2 独立复跑清零，判别对照成立。
+- 🟠 **P1：无**。P1-3 读/删/写三面全拦截；NEW-1 写侧穿越 `ValueError`。
+- 🟡 **P2（结转，均非本 diff 引入、不阻断合并）**：
+  - **🟡-1 `list_pending` 逐文件读路径逃逸（确认评审定级 🟡，不升级门禁）**：
+    逃逸需**不同 `HandoffBus` 实例**（各自 `_lock` 互不互斥）或**外部非原子写者**。
+    实测：独立实例 4 读 × 4 写 × 200 轮 → `JSONDecodeError` **14261**；
+    外部 `open(w)` 截断写 → `JSONDecodeError` 9765 + `TypeError` 2372。
+    同实例内不逃逸（`list_pending`/`get`/`_save` 共享 RLock）。
+    基线 `main 6393886` 同口径逃逸 **3144** → **baseline 既有面、非本 PR 引入**，
+    且不在 `delete_session` 关键路径 → **维持 🟡，不升级门禁**。
+    建议（随 Issue #8 / 后续）：`list_pending`/`get` 读侧加 `json`/`OSError` 守卫，
+    或统一走 `_save` 的原子写（`mkstemp` + `os.replace`）。
+  - **🟡-3 根外卡 + 双通道登记**被外部删除** → 不变量破坏**：基线 `main` 同场景
+    亦破坏（4/4 布局全破坏），本 PR 由双通道 + fail-fast 收窄至「仅双通道被外部
+    删除」一态 → 属 🟡D/🟡E 同族既有面，契约文档 §4/§5 已记录并给出补偿登记口径。
+  - **🟡-5 存量非 ASCII 单元名卡 → 永久残骸**（确认评审定级）：旧版（`main`）
+    `create_handoff("单元","目标")` 实测**可产出**该卡。本 PR 白名单后：
+    不变量**仍成立**（形状扫描计入引用、共享 `ho-*` 卡保留，实测 ok），
+    但该卡 `get`→`None`、`delete`→`False` → **无法经 API 清理**，须手工删文件。
+    属**迁移面**（存量数据），非本 PR 新增缺陷 → 维持 🟡。
+
+### 8.4 计数口径一致性
+
+- 实测 237 = 8 + 15 + 65 + 90 + 19 + 20 + 12 + 8
+  （`batch_persist` / `content_archive` / 独立探针 / 门面 / `arbiter` /
+  `state_manager` / `ownership` / `state_tree`）。
+- `state-secretary/README.md`、`docs/design/state-secretary-index.md`、
+  `docs/design/state-secretary-module.md` 三处均为 **237**（门面 90 + 独立探针 65）✅。
+- 台账头部原漂移（遗留 `228` / `229` 两行并存）→ **本轮修正为 237**。
+
+### 8.5 信号灯
+
+- 🟢 **通过（放行合并）**：无 🔴 / 🟠；P0/P1 独立复跑清零；判别力经 7 变异体验证；
+  全量 237 passed；`compileall` OK。
+- 🟡 结转 3 项（🟡-1 / 🟡-3 / 🟡-5）：均 baseline 既有面或迁移面，**不阻断合并**，
+  建议随 Issue #8 排期。
