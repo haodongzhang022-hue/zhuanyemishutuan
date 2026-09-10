@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **199 项全部通过**（门面 76 项 + 独立探针 41 项）
+- 测试基线：全量 pytest **207 项全部通过**（门面 84 项 + 独立探针 41 项）
 
 ---
 
@@ -314,6 +314,15 @@
 - **🔴 P1-3 `card_id` 路径穿越**：新增 `_is_valid_card_id`（`[A-Za-z0-9_-]+` 白名单），
   `get`/`delete`/`_register_ref`/`_unregister_ref` 全部前置校验；台账 `handoff_ids`
   注入经 `HandoffBus.delete` 亦被拦截，不再构成 `data_dir` 之外的删除面。
+- **🔴 P1-3 补充（本角色独立探针新发现，随本轮补齐）**：`card_id` 由
+  `source_unit` / `target_unit` **拼接**而成，但 `create_handoff` 原先只校验
+  `card_id`（在 `get`/`delete` 等**读/删**路径），**未校验单元名**——故
+  `create_handoff("../state/VICTIM", "t", …)`（含经 `SecretarySession` 门面）
+  会让 `_save` 把卡写到 `data_dir` **之外**（路径穿越**写入**面，污染数据根之外）。
+  补齐：`create_handoff` 对 `source_unit` / `target_unit` 做同一白名单校验
+  （非法抛 `ValueError`）；`_save` 另做**纵深防御**（非法 `card.id` 拒绝落盘，
+  防外部构造 `HandoffCard` 绕过）。回归：`TestHandoffUnitNameTraversalGuard`（8 项
+  ——6 参数化 + 门面 + `_save` 纵深），在修复前 head 上 **8/8 FAIL**（有判别力）。
 
 **④ 🟡 台账/忽略口径收口**
 - `.gitignore` 补 `data/content/`（原文归档根）——原忽略清单为 `state/ bindings/
@@ -332,7 +341,8 @@
   `test_concurrent_create_fold_delete_no_exception`（线程并发）；
 - `TestRegistryFailFast`：`_registry_required` 判定 + 唯一路径 fail-fast 回滚 +
   子树内容忍登记失败（3 项）。
-- **测试基线**：137 → **199 项全部通过**（门面 55 → **76 项**，独立探针 41 项）。
+- **测试基线**：137 → **207 项全部通过**（门面 **84 项**，独立探针 41 项；
+  本角色 P1-3 补充 +8）。
 - **架构·测试独立探针**（`tests/test_ho_ref_invariant_probes.py`，41 项）：
   修复前（`60b625d`）**40 项 FAIL**（P0-1 33 + P0-2 2 + P1-3 4 + 反向守卫 1），
   修复后 **41 项全部 PASS** → P0/P1 清零的可执行证据。

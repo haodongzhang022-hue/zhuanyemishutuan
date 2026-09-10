@@ -232,7 +232,18 @@ class HandoffBus:
 
         ``card_id`` 须为 ``[A-Za-z0-9_-]+``（🔴 P1-3 白名单）；非法值不参与
         路径拼接（防路径穿越删除面）。
+
+        **入参校验（🔴 P1-3 补充）**：``card_id`` 由 ``source_unit`` /
+        ``target_unit`` 拼接而成，故二者亦须为 ``[A-Za-z0-9_-]+``（非空）。
+        否则 ``create_handoff("../state/VICTIM", …)`` 会让 ``_save`` 把卡写到
+        ``data_dir`` **之外**（路径穿越写入面）。非法入参抛 ``ValueError``。
         """
+        if not _is_valid_card_id(source_unit):
+            raise ValueError(
+                f"非法 source_unit: {source_unit!r}。仅允许 [A-Za-z0-9_-]。")
+        if not _is_valid_card_id(target_unit):
+            raise ValueError(
+                f"非法 target_unit: {target_unit!r}。仅允许 [A-Za-z0-9_-]。")
         with self._lock:
             # 用纳秒时间戳 + 自增序号保证同秒同源唯一（秒级时间戳碰撞会覆盖丢卡）
             card_id = f"{source_unit}-{target_unit}-{time.time_ns()}"
@@ -371,6 +382,12 @@ class HandoffBus:
     def _save(self, card: HandoffCard):
         if not card.id:
             card.id = f"{card.source_unit}-{card.target_unit}-{time.time_ns()}"
+        # 🔴 P1-3（纵深防御）：card_id 参与路径拼接，非法则拒绝落盘——
+        # 即便调用方绕过 create_handoff 的入参校验（如外部构造 HandoffCard
+        # 后直接 _save），也不得写出 data_dir 之外。
+        if not _is_valid_card_id(card.id):
+            raise ValueError(
+                f"非法 card_id: {card.id!r}。仅允许 [A-Za-z0-9_-]。")
         path = os.path.join(self.data_dir, f"{card.id}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({

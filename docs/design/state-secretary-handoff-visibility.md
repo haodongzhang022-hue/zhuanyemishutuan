@@ -31,7 +31,7 @@
 | 回收语义 | 无「延迟/自动回收」路径——残卡留盘期间共享卡**永久留盘**，须**显式清理残卡**后由后续 `delete_session` 再判定方可回收（🟡C 措辞更正） |
 | 删除顺序 | 先撤销自身引用（交接卡 → 自身状态卡 → 台账），再建索引回收（🔴#1，防 TOCTOU） |
 | 异常守卫 | 扫描异常（含 `isdir→listdir` TOCTOU）**不得逃逸**：登记目录消失视为无登记；扫描失败保守跳过回收、且不中断归档/台账清理（🔴 P0-2） |
-| 标识符校验 | `card_id` 参与路径拼接前须过 `[A-Za-z0-9_-]+` 白名单，拒绝路径穿越（🔴 P1-3） |
+| 标识符校验 | 参与路径拼接的标识（`card_id` **及** `source_unit`/`target_unit`）须过 `[A-Za-z0-9_-]+` 白名单，拒绝路径穿越（🔴 P1-3） |
 
 ## 3. 可见性保证范围（🔴 P0-1 / P0-2 / P1-1 / P1-3 修复后更新）
 
@@ -42,6 +42,7 @@
 | 🟡D 旧版根外卡无 `.ref` 登记 | 登记静默失败（`except OSError: pass`）→ 会话侧误判"无引用" | ✅ **已修复**：登记失败不再静默——登记为该卡**唯一**可见性路径（`data_dir` 在 `state_root` 子树外）时 **fail-fast** 回滚建卡；子树内则由目录扫描兜底（见下 🟡E） |
 | 🟡E 登记写入失败 + 根外卡目录 → 无兜底 | 登记静默吞 + 卡目录在根外 → 引用双路径皆不可见 → 误删（纯 API 路径反例） | ✅ **已修复**（与 🟡D 同族）：**双通道登记**（主 `handoff-refs/` + 备 `.handoff-refs/`，不同故障域）任一生效即引用可见；仅**双通道全失败**且登记为唯一可见性路径时 `_registry_required()` 触发 fail-fast 回滚 |
 | 🔴 P1-3 `card_id` 路径穿越 | 未校验 `card_id` → `.ref` / `.json` 路径穿越删除面，可与 P0-1 连锁 | ✅ **已修复**：`card_id` 须匹配 `[A-Za-z0-9_-]+`（`_is_valid_card_id`），`get`/`delete`/`_register_ref`/`_unregister_ref` 全部前置校验；台账 `handoff_ids` 经 `HandoffBus.delete` 亦被拦截 |
+| 🔴 P1-3 补充 单元名路径穿越 | `card_id` 由 `source_unit`/`target_unit` 拼接，但 `create_handoff` 未校验单元名 → `create_handoff("../state/X",…)` 把卡写到 `data_dir` **之外**（路径穿越**写入**面，门面同样可达） | ✅ **已修复**：`create_handoff` 对 `source_unit`/`target_unit` 做同一白名单校验（非法抛 `ValueError`）；`_save` 纵深防御（非法 `card.id` 拒绝落盘） |
 
 ### 剪枝规则（P0-1 修复后）
 
@@ -81,8 +82,10 @@
   fail-fast（不产生悬空卡）、子树内布局由目录扫描兜底。
 - **扫描异常（P0-2）**：扫描抛 `OSError` 时保守**跳过回收**（不误删），且不中断
   归档/台账清理；`registry listdir` 竞态（TOCTOU）已加守卫。
-- **路径穿越（P1-3）**：`card_id` 参与路径拼接前已加白名单校验，`HandoffBus.delete` /
-  `_unregister_ref` / 台账 `handoff_ids` 均不再构成 `data_dir` 之外的删除面。
+- **路径穿越（P1-3）**：参与路径拼接的标识（`card_id` **及** `source_unit`/
+  `target_unit`）均已加白名单校验——`HandoffBus.delete` / `_unregister_ref` /
+  台账 `handoff_ids` 不再构成 `data_dir` 之外的**删除**面；`create_handoff` /
+  `_save` 亦不再构成**写入**面。
 
 ## 5. 迁移前提（🟡 P1-2 文档化）
 

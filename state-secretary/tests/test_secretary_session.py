@@ -1165,6 +1165,54 @@ class TestRegistryListdirToctouGuard:
         assert errors == [], f"并发 create/fold/delete 不应抛异常: {errors}"
 
 
+class TestHandoffUnitNameTraversalGuard:
+    """🔴 P1-3 补充：``create_handoff`` 的 ``source_unit`` / ``target_unit``
+    亦参与 ``card_id`` 拼接 → 必须同受白名单校验。
+
+    反例（本角色独立探针）：``create_handoff("../state/VICTIM", "t", …)`` 会让
+    ``_save`` 把卡写到 ``data_dir`` **之外**（路径穿越**写入**面）——虽不直接删除
+    文件，但可污染数据根之外（且 ``SecretarySession`` 门面同样可达）。
+    修复：非法 ``source_unit``/``target_unit`` 抛 ``ValueError``；``_save`` 另做
+    纵深防御（非法 ``card.id`` 拒绝落盘）。
+    """
+
+    @pytest.mark.parametrize("bad", ["../state/VICTIM", "a/b", "..", "", "a\\b", "/abs"])
+    def test_create_handoff_rejects_traversal_units(self, tmp_dir, bad):
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "data", "handoffs"))
+        with pytest.raises(ValueError):
+            bus.create_handoff(bad, "t", "意图", "ctx")
+
+    def test_facade_create_handoff_rejects_traversal_unit(self, tmp_dir):
+        """门面公共 API 同样不可被穿越单元名绕过（不写出数据根之外）。"""
+        sec = SecretarySession("un-a", data_dir=tmp_dir)
+        victim = os.path.join(tmp_dir, "state", "VICTIM.json")
+        os.makedirs(os.path.dirname(victim), exist_ok=True)
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("{}")
+
+        with pytest.raises(ValueError):
+            sec.create_handoff("../state/VICTIM", "t", "意图", "ctx")
+
+        escaped = [os.path.join(dp, f)
+                   for dp, _, fs in os.walk(tmp_dir) for f in fs
+                   if f.startswith("..")]
+        assert escaped == [], f"不得写出数据根之外（穿越卡）: {escaped}"
+
+    def test_save_rejects_illegal_card_id_defense_in_depth(self, tmp_dir):
+        """纵深防御：绕过 ``create_handoff`` 直接构造非法 ``id`` 的 HandoffCard
+        → ``_save`` 拒绝落盘（不写出 data_dir 之外）。"""
+        from secretary.handoff import HandoffBus
+        from secretary.handoff.models import HandoffCard
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "data", "handoffs"))
+        card = HandoffCard(id="../ESCAPED", source_unit="a", target_unit="b",
+                           intent="i", state_card_id="ho-x")
+        with pytest.raises(ValueError):
+            bus._save(card)
+
+
 class TestRegistryFailFast:
     """🟡 P1-1 复评修复：登记失败不得静默（唯一可见性路径时 fail-fast）。"""
 
