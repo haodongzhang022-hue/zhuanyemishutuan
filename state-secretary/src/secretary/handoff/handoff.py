@@ -22,10 +22,15 @@ _CARD_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 
 # 引用登记目录（``handoff-refs/`` 与 ``.handoff-refs/``）的**建 / 写 / 删 /
-# 空目录回收**互斥锁（🔴1）。模块级：不同 HandoffBus 实例共享同一 state_root
-# （同一登记目录）时亦互斥，否则「_unregister_ref 空目录 rmdir」与
+# 空目录回收**互斥锁（🔴1）。模块级：**同一进程内**不同 HandoffBus 实例共享同一
+# state_root（同一登记目录）时亦互斥，否则「_unregister_ref 空目录 rmdir」与
 # 「_register_ref makedirs/mkstemp」交叠 → mkstemp 抛 FileNotFoundError →
 # 双通道同时失败 → 登记静默丢失（或 fail-fast 误抛 OSError）。
+#
+# **保证范围（🟡4 口径）**：本锁为进程内 ``threading.RLock``，**不提供跨进程
+# 互斥**。多进程共享同一 ``state_root`` 时，登记目录的建/删仍可交叠（实测跨
+# 6 进程 × 300 轮登记丢失 29–55/1800）——该场景不在本保证范围内，需要跨进程
+# 安全时须改用文件锁（``fcntl``/``msvcrt``）或串行化写入方。
 _REF_REGISTRY_LOCK = threading.RLock()
 
 

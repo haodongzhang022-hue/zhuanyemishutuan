@@ -232,6 +232,8 @@
 - 严格并发矩阵（根外 + 根内布局，6 线程 × 250 轮 × 3 组）：误抛 **0**、
   静默悬空 **0**、登记丢失 **0**。
 - 全量 `pytest`：**202 passed**（+3 判别性用例，修复前基线确定性失败）。
+  > 计数为**当轮实测**，随后续提交递增；当前 head 口径见 `state-secretary/README.md`
+  > 与 `docs/design/state-secretary-index.md`（勿以本节历史计数为准）。
 - `compileall` OK；`pyflakes` 仅 1 处既有未用变量（`test_secretary_session.py:1035`，
   `main` 已存在，非本轮）。
 
