@@ -35,8 +35,15 @@ from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
 
-# 扫描界递归时跳过的重型/非数据目录（防 data_dir 指向工作区根时全树遍历，
-# 亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）
+# 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
+# 遍历，亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）。
+# 🔴 P0-1 修复：**不按裸目录名剪枝**——名单中的名字（build/dist/env/venv 等）
+# 完全可能被合法选作 data_dir，按名剪枝会让落在其中的真实交接卡不可见 → 共享卡
+# 被误删。故剪枝前先做「保护子树判定」+「形状判定」，见
+# ``SecretarySession._keep_scan_dir`` / ``_dir_holds_handoff_data``。
+# 名单目录"形状判定 + 有界遍历"的深度上界（相对名单目录自身；含文件层）
+_SKIP_DIR_PROBE_DEPTH = 3
+
 _SKIP_SCAN_DIRS = frozenset({
     "node_modules", "__pycache__", "venv", ".venv", "env",
     "dist", "build", "target", "site-packages", "vendor", "coverage",
@@ -300,6 +307,140 @@ class SecretarySession:
         # 归档/台账亦不含这些字段，故三者不会误入
         return '"id"' in raw
 
+    # ------------------------------------------------------------------
+    # 扫描剪枝（P0-1 修复：不按裸目录名判定）
+    # ------------------------------------------------------------------
+
+    def _protected_scan_dirs(self) -> List[str]:
+        """返回**永不剪枝**的保护子树绝对路径清单。
+
+        P0-1 根因：剪枝曾按**裸目录名**（``_SKIP_SCAN_DIRS``）判定，而名单中的
+        名字（``build``/``dist``/``env``/``venv``/``target``/``vendor``/
+        ``coverage`` 等）完全可能被合法选作 ``data_dir``——此时落在其中的真实
+        交接卡被整片跳过 → 引用不可见 → 共享 ``ho-*`` 卡被误删、存活引用静默
+        失效（实测 11/12 悬空）。故无论名字如何，**数据根本身及其结构性子目录
+        （state / handoffs / content / handoff-refs）所在子树永不剪枝**。
+        """
+        dirs = [
+            os.path.abspath(self._session_root),
+            os.path.abspath(self.state_manager.data_dir),
+            os.path.abspath(self.handoff_bus.data_dir),
+            os.path.abspath(self.archive.root_dir),
+        ]
+        for reg_dir in self.handoff_bus.ref_registry_dirs():
+            dirs.append(os.path.abspath(reg_dir))
+        # 去重保序
+        out: List[str] = []
+        for d in dirs:
+            if d not in out:
+                out.append(d)
+        return out
+
+    def _keep_scan_dir(self, path: str, name: str,
+                       protected_dirs: List[str],
+                       kept_skip_dirs: set) -> bool:
+        """判断递归扫描时是否**保留**该子目录（True=进入，False=剪枝）。
+
+        判定顺序：
+        1. 保护子树（或其祖先）：**永不剪枝**——即使名字命中名单；
+        2. 名字命中 ``_SKIP_SCAN_DIRS``（含 ``.venv`` 这类带点名字）：**先做
+           形状判定**（``_dir_holds_handoff_data``）——目录内实际存在交接卡
+           形状的 JSON 则保留（引用必须可见），否则剪枝（保持原性能收益：
+           真重型目录如 ``node_modules`` 仍被跳过）。被保留的名单目录记入
+           ``kept_skip_dirs``——其内引用按"仅指向本根真实状态卡"过滤
+           （见 ``_build_ho_reference_index``），从而既不误剪真实/遗留卡，
+           又不让伪 JSON 阻塞回收；
+        3. 其他隐藏目录（``.git`` 等）：剪枝；
+        4. 常规数据目录：保留。
+        """
+        abspath = os.path.abspath(path)
+        # 1) 保护子树及其祖先不剪枝
+        for p in protected_dirs:
+            if abspath == p or p.startswith(abspath + os.sep):
+                return True
+        # 2) 名单目录（含 `.venv` 这类"带点"名字）：形状判定后再定——
+        #    防"剪枝名单名承载真实/遗留交接卡"被误剪（P0-1，含 .venv）。
+        if name in _SKIP_SCAN_DIRS:
+            if self._dir_holds_handoff_data(path):
+                kept_skip_dirs.add(abspath)
+                return True
+            return False
+        # 3) 其他隐藏目录剪枝（.git 等）
+        if name.startswith("."):
+            return False
+        # 4) 常规目录保留
+        return True
+
+    def _exceeds_kept_skip_depth(self, dirpath: str, kept_skip_dirs: set) -> bool:
+        """``dirpath`` 是否已超出"保留的名单目录"子树的有界遍历深度。
+
+        防"名单目录内命中一张（伪）卡后，整棵 node_modules 被全树遍历"——
+        深度超过 ``_SKIP_DIR_PROBE_DEPTH`` 即止步（与形状判定同一上界）。
+        """
+        if not kept_skip_dirs:
+            return False
+        abspath = os.path.abspath(dirpath)
+        for r in kept_skip_dirs:
+            if abspath == r:
+                return False
+            if abspath.startswith(r + os.sep):
+                depth = len(abspath[len(r) + 1:].split(os.sep))
+                return depth >= _SKIP_DIR_PROBE_DEPTH
+        return False
+
+    @staticmethod
+    def _under_any(path: str, roots: set) -> bool:
+        """``path`` 是否等于或位于 ``roots`` 中任一目录之下。"""
+        abspath = os.path.abspath(path)
+        for r in roots:
+            if abspath == r or abspath.startswith(r + os.sep):
+                return True
+        return False
+
+    def _dir_holds_handoff_data(self, path: str,
+                                max_depth: int = _SKIP_DIR_PROBE_DEPTH,
+                                max_entries: int = 2000) -> bool:
+        """浅扫：该目录子树内是否存在交接卡形状的 JSON（有界深度/预算）。
+
+        用于 ``_SKIP_SCAN_DIRS`` 名单目录的剪枝前判定。**有界**（深度
+        ``max_depth``、访问条目 ``max_entries``）以免对真正的重型目录
+        （``node_modules`` 深层依赖树）做全树遍历而失去剪枝意义；命中即保留
+        该子树，交由常规递归扫描按形状校验精确收集引用。
+
+        残留边界：嵌套深度超过 ``max_depth`` 的卡仍不可见（见契约文档 §3）。
+        """
+        budget = [max_entries]
+
+        def _scan(d: str, depth: int) -> bool:
+            if depth > max_depth or budget[0] <= 0:
+                return False
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except OSError:
+                return False
+            dirs = []
+            for entry in entries:
+                if budget[0] <= 0:
+                    return False
+                budget[0] -= 1
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        if (entry.name.endswith(".json")
+                                and not entry.name.startswith(".")
+                                and self._maybe_handoff_card(entry.path)):
+                            return True
+                    elif entry.is_dir(follow_symlinks=False):
+                        dirs.append(entry.path)
+                except OSError:
+                    continue
+            for sub in dirs:
+                if _scan(sub, depth + 1):
+                    return True
+            return False
+
+        return _scan(path, 1)
+
     def _build_ho_reference_index(self) -> Dict[str, List[str]]:
         """一次扫描建立 ``state_card_id -> 存活引用者标签`` 索引。
 
@@ -327,29 +468,44 @@ class SecretarySession:
            同根、随卡回收，且记录 ``card_path``——仅当该交接卡仍在盘上时才计入，
            卡删除即引用失效。
 
-        剪枝：跳过隐藏目录（``.git`` 等）、跳过原文归档根（归档条目永不含
-        ``state_card_id``）、跳过 ``_SKIP_SCAN_DIRS`` 所列重型/非数据目录
-        （``node_modules``/``__pycache__``/``venv``/``.venv``/``env``/``dist``/
-        ``build``/``target``/``site-packages``/``vendor``/``coverage``——防
-        ``data_dir`` 指向工作区根时全树遍历，亦防其内无关 JSON 被误判为交接卡
-        引用而永久阻塞回收）。
+        剪枝（🔴 P0-1 修复：**不再按裸目录名判定**）：
+        - **保护子树永不剪枝**——会话数据根 / ``state`` / ``handoffs`` /
+          ``content`` / ``handoff-refs`` 及其祖先（``_protected_scan_dirs``）；
+        - 隐藏目录（``.git`` 等）剪枝；
+        - 原文归档根剪枝（归档条目永不含 ``state_card_id``）；
+        - 名字命中 ``_SKIP_SCAN_DIRS``（``node_modules``/``__pycache__``/
+          ``venv``/``env``/``dist``/``build``/``target``/``site-packages``/
+          ``vendor``/``coverage``）的目录**须先过形状判定**
+          （``_dir_holds_handoff_data``，有界浅扫：深度 ≤ 3、条目 ≤ 2000）——其内实际存在交接卡形状
+          JSON 则**不得剪枝**，否则落在该类名字下（含被合法选作 ``data_dir``）
+          的真实/遗留交接卡不可见 → 共享卡被误删（实测 11/12 悬空）。
+
+        **剪枝歧义名覆盖（P0-1）**：``build``/``dist``/``env``/``venv`` 等名字
+        完全可能被合法选作 ``data_dir``。修复后此类布局下的交接卡引用**可见**
+        （既包括 ``SecretarySession`` 注入的 ``handoffs/``，也包括独立
+        ``HandoffBus(data_dir=<root>/build)`` 的手写/遗留卡）；仅当目录内确无
+        交接卡形状 JSON 时才剪枝，保留原性能收益。
 
         形状校验（来源 2）：文件须同时含 ``state_card_id`` + ``source_unit`` +
         ``target_unit`` + ``id`` 才计入（交接卡必带 ``id``；StateCard 只有
         ``session_id``、归档/台账均无这些字段，故不会误入）。
 
-        **可见性保证范围（口径说明，非行为变更）**：上述引用可见性仅保证
-        **经 ``HandoffBus`` API（``create_handoff(auto_state_card=True)`` /
-        ``delete``）写入、且满足前置条件**的交接卡——它们恒带 ``id``。
-        前置条件（缺一不可）：① ``state_root`` 与会话数据根**同根**（否则卡
-        目录落在扫描界之外），**且** ② ``handoff-refs/<card_id>.ref`` 登记
-        **写入成功**（``_register_ref`` 对 ``OSError`` 静默吞、无重试无补偿；
-        登记失败且卡目录在根外时，本索引**亦不可见** → 会误删，属 🟡E 缺口）。
-        **手写/外部遗留**的交接卡若缺 ``id`` 字段、或落在 ``_SKIP_SCAN_DIRS``
-        所列目录内，则本索引不可见（既不阻塞回收、亦不被计入）——属已知
-        覆盖边界，如需覆盖请改走 ``HandoffBus`` API（是否收窄为「API 路径保证
-        + 前置条件」待总师裁定，已登记 Issue #8 跟踪；口径详见
-        ``docs/design/state-secretary-handoff-visibility.md``）。
+        **可见性保证范围（P0-1 / P1-1 修复后更新）**：
+
+        - **前置条件（原 🟡#1 收窄）**：经 ``HandoffBus`` API 写入的卡恒带
+          ``id``；其引用可见性要求 ① ``state_root`` 与会话数据根**同根**
+          （否则卡目录落在扫描界之外），**或** ② 登记写入成功。
+        - **剪枝名单歧义名（原 🟡A）已修复**：不再按裸目录名剪枝，名单目录内
+          实际存在交接卡即计入 → 手写/遗留卡落在 ``build``/``dist``/``env``
+          等目录下同样可见。
+        - **登记失败不再静默（原 🟡E / P1-1）已修复**：登记失败且为**唯一**
+          可见性路径（``data_dir`` 在 ``state_root`` 子树之外）→ 建卡
+          **fail-fast 回滚**；子树内由目录扫描兜底。故「API 写入路径保证」
+          在登记失败场景下亦成立，🟡E 缺口闭环。
+        - **仍属已知边界（非 API 路径）**：手写/外部遗留交接卡若**缺 ``id``
+          字段**（形状校验必含 ``id``，🟡B）则不可见。改走 ``HandoffBus`` API
+          即可覆盖；口径详见
+          ``docs/design/state-secretary-handoff-visibility.md``（Issue #8）。
 
         **保守方向（不变量优先）**：凡扫描界内**实际存在**的交接卡/登记一律
         计入引用，**不做**"排除自身认领卡"处理。调用方（``delete_session``）
@@ -377,6 +533,7 @@ class SecretarySession:
         archive_root = os.path.abspath(self.archive.root_dir)
         if not os.path.isdir(scan_root):
             return index
+        protected_dirs = self._protected_scan_dirs()
 
         def _add(scid, label: str) -> None:
             if not isinstance(scid, str) or not scid:
@@ -386,13 +543,24 @@ class SecretarySession:
                 bucket.append(label)
 
         prefix, suffix = ".session-", ".owned"
+        kept_skip_dirs: set = set()
         for dirpath, dirnames, filenames in os.walk(scan_root):
-            # 剪枝：隐藏目录（如 .git）、原文归档根（归档条目不含引用字段）、
-            # 重型非数据目录（node_modules/venv 等——全树遍历代价高，且其内
-            # 无关 JSON 可能被误判为交接卡引用而永久阻塞共享卡回收）
+            # 剪枝（P0-1 修复：**不按裸目录名判定**）：
+            #   - 保护子树（会话数据根 / state / handoffs / content / handoff-refs）
+            #     及其祖先永不剪枝；
+            #   - 隐藏目录（.git 等）剪枝；
+            #   - 名字命中 _SKIP_SCAN_DIRS 的目录**须先过形状判定**——其内
+            #     实际存在交接卡（手写/遗留/独立 data_dir 落在此类名字下）则
+            #     不得剪枝，否则引用不可见 → 共享卡被误删。
+            # 保留的名单目录子树**有界遍历**（与形状判定同深度上界，防"命中
+            # 一张卡后整棵 node_modules 被全树遍历"）：深度超上界即止步。
+            if self._exceeds_kept_skip_depth(dirpath, kept_skip_dirs):
+                dirnames[:] = []
+                continue
             dirnames[:] = [
                 d for d in dirnames
-                if not d.startswith(".") and d not in _SKIP_SCAN_DIRS
+                if self._keep_scan_dir(
+                    os.path.join(dirpath, d), d, protected_dirs, kept_skip_dirs)
             ]
             if os.path.abspath(dirpath) == archive_root:
                 dirnames[:] = []
@@ -434,11 +602,32 @@ class SecretarySession:
                 scid = data.get("state_card_id")
                 if not isinstance(scid, str) or not scid:
                     continue
+                # 名单目录（本应剪枝、因形状判定而保留）内的引用：仅当它指向
+                # **本根 state 目录下真实存在**的状态卡时才计入——既让真实/
+                # 遗留卡可见（P0-1），又不让重型目录内无关 JSON 的伪引用
+                # 永久阻塞共享卡回收（保留剪枝初衷）。
+                if (self._under_any(dirpath, kept_skip_dirs)
+                        and not os.path.exists(
+                            os.path.join(state_dir, f"{scid}.json"))):
+                    continue
                 _add(scid, f"handoff:{card_id}")
         # 来源 3：state 根级引用登记（覆盖交接卡目录在会话根之外的独立使用者）
-        reg_dir = self.handoff_bus.ref_registry_dir()
-        if reg_dir and os.path.isdir(reg_dir):
-            for fname in os.listdir(reg_dir):
+        #
+        # 🔴 P0-2 修复：``isdir → listdir`` 之间存在 TOCTOU 窗口（并发的
+        # ``HandoffBus.delete`` → ``_unregister_ref`` 会回收空登记目录）。
+        # 原实现让 ``listdir`` 的 ``FileNotFoundError`` 逃逸出
+        # ``delete_session``，中断于回收中途，留下 ho-*.json/.lock、归档、
+        # 台账残骸（实测注入 100%、自然并发 3/2160）。此处整段以
+        # ``try/except OSError`` 守卫：登记目录消失即视为"无登记引用"。
+        # 双通道（主 handoff-refs/ + 备 .handoff-refs/，🟡E 闭环）：任一生效即引用可见。
+        for reg_dir in self.handoff_bus.ref_registry_dirs():
+            ref_names: List[str] = []
+            try:
+                ref_names = os.listdir(reg_dir)
+            except OSError:
+                # 登记目录在 isdir 与 listdir 之间被并发回收 → 该通道无登记引用
+                ref_names = []
+            for fname in ref_names:
                 if not fname.endswith(".ref"):
                     continue
                 data = self._read_json_dict(os.path.join(reg_dir, fname))
@@ -574,9 +763,20 @@ class SecretarySession:
         #    共享 ho-* 卡（引用未清不得删：P2-①；顺序 🔴#1 / 引用源 🔴#2）
         #    不再传"自身卡排除"：自身交接卡已在上一步撤销；若撤销失败而残卡
         #    仍在磁盘，它即真实存活引用，须计入以守住"存活卡 → 状态卡存在"不变量。
-        reference_index = self._build_ho_reference_index()
-        for sid in ho_cards:
-            self._delete_ho_state_card_if_safe(sid, reference_index)
+        #
+        #    🔴 P0-2 修复（第二道防线）：扫描本身若因文件系统竞态抛 OSError，
+        #    一律**保守跳过回收**（宁可不删，绝不误删）——扫描不可用时无法
+        #    证明"引用已清"，不得据此删除共享卡；且异常不得中断后续归档/台账
+        #    回收（原实现异常逃逸 → delete_session 半途而废、留 ho-*.json/.lock、
+        #    归档、台账残骸）。
+        reference_index: Optional[Dict[str, List[str]]] = None
+        try:
+            reference_index = self._build_ho_reference_index()
+        except OSError:
+            reference_index = None
+        if reference_index is not None:
+            for sid in ho_cards:
+                self._delete_ho_state_card_if_safe(sid, reference_index)
         self._owned_state_card_ids.clear()
 
         # 5) 清理本会话的原文归档（并回收 <content>/<session>/ 空子目录）

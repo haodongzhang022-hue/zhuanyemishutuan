@@ -4,12 +4,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 from typing import List, Optional
 
 from .models import HandoffCard
+
+# card_id 白名单（🔴 P1-3）：仅允许字母/数字/下划线/短横线。
+# card_id 会参与 ``<data_dir>/<card_id>.json`` 与 ``<reg_dir>/<card_id>.ref``
+# 路径拼接，未校验时 ``"../state/VICTIM"`` 之类的输入构成**路径穿越删除面**
+# （可删 data_dir / handoff-refs 之外的任意文件，并可与 P0-1 连锁破坏不变量）。
+_CARD_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _is_valid_card_id(card_id: object) -> bool:
+    """card_id 是否为合法标识符（拒绝路径分隔符/相对路径/空串）。"""
+    return isinstance(card_id, str) and bool(_CARD_ID_PATTERN.match(card_id))
 
 
 class HandoffBus:
@@ -38,6 +50,13 @@ class HandoffBus:
     「本交接卡引用了哪张 ho-* 状态卡」。该登记与 ho-* 卡同根、随卡回收，
     使**交接卡目录与状态根不同树**的独立使用者也能被存活引用检查发现
     （仅靠扫描会话数据根无法覆盖该布局）。删除交接卡时同步注销登记。
+
+    **双通道登记（🟡E 闭环）**：登记同时写入**两个不同故障域**的目录——
+    主 ``<state_root>/handoff-refs/`` 与备 ``<state_root>/.handoff-refs/``。
+    单通道被同名文件占位 / 权限不足 / 单条 ``.ref`` 被外部删除时，另一通道
+    仍让引用可见，避免"根外卡引用双路径皆不可见 → 共享卡误删"。仅当**双通道
+    全部失败**且登记为该卡唯一可见性路径时，``create_handoff`` 才 fail-fast
+    回滚（不再有静默悬空引用）。
     """
 
     def __init__(self, data_dir: Optional[str] = None,
@@ -81,43 +100,90 @@ class HandoffBus:
     # ---- 引用登记（state 根级，供存活引用检查发现异目录使用者）----
 
     def ref_registry_dir(self) -> Optional[str]:
-        """引用登记目录 ``<state_root>/handoff-refs``；无 state_root 时 None。"""
+        """引用登记**主**目录 ``<state_root>/handoff-refs``；无 state_root 时 None。"""
         if not self.state_root:
             return None
         return os.path.join(self.state_root, "handoff-refs")
 
-    def _register_ref(self, card_id: str, state_card_id: str) -> None:
+    def ref_registry_dirs(self) -> List[str]:
+        """引用登记的**全部候选目录**（主 + 备，按优先级）。
+
+        P1-4 修复（🟡E 闭环）：登记为**双通道**——
+        1. 主：``<state_root>/handoff-refs/``（既有通道）；
+        2. 备：``<state_root>/.handoff-refs/``（隐藏目录，与主通道**不同故障域**）。
+
+        原实现单通道：主登记目录被同名普通文件占位 / 权限不足 / 外部删除单条
+        ``.ref`` 时，根外交接卡的引用**双路径皆不可见**（登记未落 + 目录扫描不可达）
+        → 会话侧误判"无引用"→ 误删共享卡（🟡E）。双通道后任一生效即引用可见，
+        且不再依赖 fail-fast 阻断建卡（fail-fast 退化为**双通道全失败**时的兜底）。
+        """
+        if not self.state_root:
+            return []
+        return [
+            os.path.join(self.state_root, "handoff-refs"),
+            os.path.join(self.state_root, ".handoff-refs"),
+        ]
+
+    def _registry_required(self) -> bool:
+        """登记是否为该交接卡引用的**唯一**可见性路径。
+
+        - 交接卡目录落在 ``state_root`` 子树**内**：会话侧扫描界（数据根递归）
+          以形状判定即可发现引用 → 登记失败不致命（另有目录扫描兜底）；
+        - 交接卡目录落在 ``state_root`` 子树**外**（独立使用者 ``data_dir``
+          在别处）：仅 ``<state_root>/handoff-refs/*.ref`` 能让引用可见 →
+          登记失败必须 **fail-fast**，否则产生静默悬空引用（P1-1）。
+        """
+        if not self.state_root:
+            return False
+        root = os.path.abspath(self.state_root)
+        data = os.path.abspath(self.data_dir)
+        return not (data == root or data.startswith(root + os.sep))
+
+    def _register_ref(self, card_id: str, state_card_id: str) -> bool:
         """登记一张交接卡对 ho-* 状态卡的引用（幂等、原子写）。
 
         记录 card_path 便于存活判定时核对"交接卡是否仍在"——卡被删除后
         登记即视为失效引用，可安全回收共享卡（无需依赖扫描其所在目录）。
+
+        **返回是否登记成功（P1-1 修复：不再静默吞 OSError）**：登记是
+        ``state_root`` 子树外交接卡的**唯一**可见性路径，静默失败会让会话侧
+        误判"无存活引用"而删共享卡 → 存活引用悬空。调用方
+        （``create_handoff``）据 ``_registry_required()`` 决定是否 fail-fast。
         """
-        reg_dir = self.ref_registry_dir()
-        if not reg_dir or not card_id or not state_card_id:
-            return
-        try:
-            os.makedirs(reg_dir, exist_ok=True)
-            path = os.path.join(reg_dir, f"{card_id}.ref")
-            fd, tmp_path = tempfile.mkstemp(dir=reg_dir, suffix=".tmp")
+        if not state_card_id:
+            return False
+        if not _is_valid_card_id(card_id):
+            return False  # 🔴 P1-3：非法 card_id 不参与路径拼接
+        dirs = self.ref_registry_dirs()
+        if not dirs:
+            return False
+        payload = {
+            "card_id": card_id,
+            "state_card_id": state_card_id,
+            "card_path": os.path.abspath(
+                os.path.join(self.data_dir, f"{card_id}.json")),
+        }
+        written = False
+        for reg_dir in dirs:
+            # 双通道：任一生效即引用可见（🟡E 闭环）。单通道失败不阻断另一通道。
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump({
-                        "card_id": card_id,
-                        "state_card_id": state_card_id,
-                        "card_path": os.path.abspath(
-                            os.path.join(self.data_dir, f"{card_id}.json")),
-                    }, f, ensure_ascii=False)
-                os.replace(tmp_path, path)
-            except Exception:
+                os.makedirs(reg_dir, exist_ok=True)
+                path = os.path.join(reg_dir, f"{card_id}.ref")
+                fd, tmp_path = tempfile.mkstemp(dir=reg_dir, suffix=".tmp")
                 try:
-                    os.unlink(tmp_path)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False)
+                    os.replace(tmp_path, path)
+                    written = True
                 except OSError:
-                    pass
-        except OSError:
-            # 登记失败不阻断交接卡本身。注意：目录扫描兜底**仅在交接卡目录
-            # 落在会话数据根之内**时成立；卡目录在根外时该引用双路径皆不可见
-            # （🟡E，见 docs/design/state-secretary-handoff-visibility.md）。
-            pass
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            except OSError:
+                continue
+        # 双通道全部失败：返回 False，由调用方按可见性唯一性决定是否 fail-fast
+        return written
 
     def _unregister_ref(self, card_id: str) -> None:
         """注销一张交接卡的引用登记（删除交接卡时同步调用）。
@@ -125,21 +191,22 @@ class HandoffBus:
         注销后若登记目录已空则回收该目录（与 delete_session「不留空目录
         残骸」的纪律一致）；下次登记会按需重建。
         """
-        reg_dir = self.ref_registry_dir()
-        if not reg_dir or not card_id:
+        if not _is_valid_card_id(card_id):
+            # 🔴 P1-3：非法 card_id 不得构成路径穿越删除面（如 "../handoff-refs/x"）
             return
-        try:
-            path = os.path.join(reg_dir, f"{card_id}.ref")
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
-        # 回收空登记目录（非空时 os.rmdir 抛 OSError，忽略即可）
-        try:
-            if os.path.isdir(reg_dir) and not os.listdir(reg_dir):
-                os.rmdir(reg_dir)
-        except OSError:
-            pass
+        for reg_dir in self.ref_registry_dirs():
+            try:
+                path = os.path.join(reg_dir, f"{card_id}.ref")
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            # 回收空登记目录（非空时 os.rmdir 抛 OSError，忽略即可）
+            try:
+                if os.path.isdir(reg_dir) and not os.listdir(reg_dir):
+                    os.rmdir(reg_dir)
+            except OSError:
+                pass
 
     def create_handoff(self, source_unit: str, target_unit: str,
                        intent: str, context: str = "",
@@ -154,6 +221,17 @@ class HandoffBus:
         调用**复用同一张卡**；该卡内的交接任务仅按标题去重，故**后续调用的
         ``context`` 不落卡**（后到者上下文静默丢弃）。需要各自上下文时请改用
         不同 ``intent``。
+
+        **引用登记（双通道，🟡E 闭环）**：``auto_state_card=True`` 时须登记
+        主 ``<state_root>/handoff-refs/<card_id>.ref`` **与**备
+        ``<state_root>/.handoff-refs/<card_id>.ref``（不同故障域）。判定：
+        - 任一通道写入成功 → 引用可见，建卡成功；
+        - **双通道全部失败**且 ``data_dir`` 在 ``state_root`` 子树**之外**
+          （登记为唯一可见性路径）→ 回滚该交接卡并抛 ``OSError``（fail-fast）；
+        - 双通道全失败但 ``data_dir`` 在子树**之内** → 目录扫描兜底，不抛。
+
+        ``card_id`` 须为 ``[A-Za-z0-9_-]+``（🔴 P1-3 白名单）；非法值不参与
+        路径拼接（防路径穿越删除面）。
         """
         with self._lock:
             # 用纳秒时间戳 + 自增序号保证同秒同源唯一（秒级时间戳碰撞会覆盖丢卡）
@@ -212,12 +290,33 @@ class HandoffBus:
             self._save(card)
             # 引用登记：与 ho-* 卡同根，供存活引用检查发现"交接卡目录与
             # 状态根不同树"的独立使用者（🔴#4）。
+            # P1-1 修复：登记失败不再静默——若登记是该卡的**唯一**可见性路径
+            # （data_dir 在 state_root 子树之外），回滚刚落盘的交接卡并抛
+            # OSError（fail-fast），避免"写入成功但引用静默悬空"。
             if card.state_card_id:
-                self._register_ref(card.id, card.state_card_id)
+                if (not self._register_ref(card.id, card.state_card_id)
+                        and self._registry_required()):
+                    # 双通道登记**全部失败**且登记为该卡唯一可见性路径 →
+                    # 回滚交接卡并 fail-fast（不产生"写入成功但引用静默悬空"）。
+                    try:
+                        os.remove(os.path.join(
+                            self.data_dir, f"{card.id}.json"))
+                    except OSError:
+                        pass
+                    raise OSError(
+                        "交接卡引用登记双通道均失败，且登记为其唯一可见性路径"
+                        f"（data_dir 在 state_root 子树之外）：card_id={card.id}；"
+                        "已回滚该交接卡以避免悬空引用")
             return card
 
     def get(self, card_id: str) -> Optional[HandoffCard]:
-        """按 ID 读取交接卡（线程安全）"""
+        """按 ID 读取交接卡（线程安全）。
+
+        🔴 P1-3：非法 card_id（含路径分隔符/相对路径）一律返回 ``None``，
+        不参与路径拼接。
+        """
+        if not _is_valid_card_id(card_id):
+            return None
         with self._lock:
             path = os.path.join(self.data_dir, f"{card_id}.json")
             if not os.path.exists(path):
@@ -253,6 +352,10 @@ class HandoffBus:
         删除后同步注销 state 根级引用登记（``handoff-refs/<card_id>.ref``），
         使该交接卡对共享 ho-* 状态卡的引用不再阻塞回收（🔴#4）。
         """
+        if not _is_valid_card_id(card_id):
+            # 🔴 P1-3：非法 card_id 不得删除 data_dir 之外的任意文件
+            # （如 "../state/VICTIM"）；也不注销登记（登记名同样受限）。
+            return False
         with self._lock:
             path = os.path.join(self.data_dir, f"{card_id}.json")
             existed = os.path.exists(path)

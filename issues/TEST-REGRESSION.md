@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **137 项通过**（123 + 🔴#4 复评回归 14）
+- 测试基线：全量 pytest **157 项通过**（123 + 🔴#4 复评回归 14 + 🔴 P0-1/P0-2 复评回归 20）
 
 ---
 
@@ -198,6 +198,7 @@
   易被误提交。补齐后与既有数据根子目录（state/ content/ handoffs/ handoff-refs/）
   忽略口径一致（`60b625d` 已同步「三子目录」措辞）。
 - **测试基线**：仍 **137 项**（🟡C 仅加强既有断言、未新增用例）；`compileall` 通过。
+  （**后续 🔴 修复 #J 后基线为 157 项**，见下节。）
 
 ### 🟡 修复 #I — 复评 `042e7e6` 三项结转项收口（PR #7 · 收口轮）
 > 评审对象 `042e7e6`。评审判定 🔴 清零、`merge` 放行，但如实指出 3 项**结转未收口**
@@ -252,8 +253,7 @@
 | ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | ✅ 已修复（#C + 复评 #D：顺序/引用源/类型守卫 + 复评 #E：扫描界提升到数据根 + state 根级引用登记，覆盖异交接目录/根外布局） |
 | ② | 独立 HandoffBus 未传 state_root 落 cwd 孤儿 | Issue #5 | ✅ 修复（本分支）：data_dir 显式时默认以父目录推导 state_root，ho-* 卡落 `<parent(data_dir)>/state`；未传 data_dir 保持历史退化兼容。回归测试见下（106 项全过） |
 | ③ | delete_card 返回值 docstring 语义漂移 | Issue #6 | ✅ 修复（本分支）：统一返回「状态卡是否存在」（.lock/.owner.json 伴生残留不影响返回值，幂等清理），delete_card/delete_session 两处 docstring 对齐。回归测试见下（115 项全过） |
-| ④ | 交接卡引用**可见性契约边界**（🟡A `_SKIP_SCAN_DIRS` 歧义名 / 🟡B 形状校验收紧必含 `id` / 🟡D 旧版根外卡升级路径 / 🟡E 登记写入失败 + 根外卡目录无兜底） | Issue #8 | ⏳ **待总师裁定**：现状仅保证 `HandoffBus` API 写入路径**且 `state_root` 与会话数据根同根、登记写入成功**（手写/遗留卡在歧义目录或缺 `id` 时不可见；登记失败 + 根外卡目录双路径皆不可见）；核心契约已冻结，口径详见 `docs/design/state-secretary-handoff-visibility.md` |
-
+| ④ | 交接卡引用**可见性契约边界**（🟡A `_SKIP_SCAN_DIRS` 歧义名 / 🟡B 形状校验收紧必含 `id` / 🟡D+🟡E 登记静默失败） | Issue #8 | ✅ **已修复（#J）**：🟡A 剪枝歧义名 → 保护子树 + 形状判定（探针 0/12 悬空）；🟡D/🟡E 登记静默失败 → 唯一可见性路径 fail-fast 回滚；⚠️ 仅剩 🟡B（形状校验必含 `id`）为已知边界（改走 API 即覆盖）。不再依赖总师裁定即可放行。口径详见 `docs/design/state-secretary-handoff-visibility.md` |
 > P2-② 新增回归测试：
 > - `test_standalone_handoff_explicit_data_dir_derives_state_root` — data_dir 显式 → ho-* 卡落父目录推导的 state/，无 cwd 孤儿
 > - `test_standalone_handoff_data_dir_is_state_root_directly` — data_dir 即根时推导父目录 state/，不自嵌套
@@ -267,6 +267,75 @@
 > - `test_delete_card_nothing_exists_returns_false` — 卡与残留均无 → False（幂等）
 > - `test_delete_card_idempotent_second_call_returns_false` — 二次删除返回 False
 > - `TestDeleteSessionReturnSemantics` — delete_session 有卡返 True；卡缺仅残留时返 False 且清理完全
+
+### 🔴 修复 #J — 复评 `60b625d` 打回项收口（PR #7 · P0-1/P0-2 + P1-1/P1-2 + 🟡）
+
+> 评审对象 head `60b625d`（复评 #3 维持打回）。评审判定 🔴 P0-1/P0-2 未修复、
+> 不放行；另指出 🟡 台账口径与实现不符（`data/content/` 未忽略）。本轮按
+> ①–⑤ 全部处置。
+
+**① 🔴 P0-1 剪枝误伤存活引用 — 已修复**
+- **根因**：`_build_ho_reference_index` 按**裸目录名**（`_SKIP_SCAN_DIRS`）整片
+  跳过子目录；名单名（`node_modules`/`venv`/`.venv`/`env`/`dist`/`build`/`target`/
+  `vendor`/`coverage` 等）可能被合法选作 `data_dir` → 其中真实/遗留交接卡不可见
+  → 共享 `ho-*` 卡被误删（评审实测悬空 **11/12**，`11dfdd9` 对照 1/12）。
+- **修复**：剪枝改为**形状判定 + 保护子树**（`_keep_scan_dir` / `_protected_scan_dirs`
+  / `_dir_holds_handoff_data`）：
+  1. 保护子树（数据根 / `state` / `handoffs` / `content` / `handoff-refs`）及其祖先
+     **永不剪枝**（即使名字命中名单）；
+  2. 名单目录（含 `.venv`）**先做形状判定**（有界浅扫：深度 ≤ 3、条目 ≤ 2000），
+     内有交接卡形状 JSON 则保留，否则剪枝（保留原性能收益）；
+  3. 被保留的名单目录记入 `kept_skip_dirs`，其内引用按"**仅指向本根真实状态卡**"
+     过滤 → 既让真实/遗留卡可见，又不让伪 JSON 永久阻塞回收。
+- **验证**：自写探针 12 个名单名目录 → **悬空 0/12**（修复前 11/12）。
+
+**② 🔴 P0-2 registry `isdir→listdir` TOCTOU 异常逃逸 — 已修复**
+- **根因**：`session.py` 来源 3 的 `os.listdir(reg_dir)` 无守卫；并发的
+  `HandoffBus.delete → _unregister_ref` 会回收空登记目录 → `FileNotFoundError`
+  逃逸出 `delete_session`，中断于回收中途（注入 100%；自然并发 3/2160）。
+- **修复**（两道防线）：
+  1. `listdir` 包 `try/except OSError`（目录消失 = 无登记引用）；
+  2. 扫描整体 `try/except OSError` → **保守跳过回收**（扫描不可用则无法证明
+     引用已清，宁可不删绝不误删），且异常**不得中断**后续归档/台账清理。
+- **验证**：注入式探针 → 异常 None、残留 `[]`；自然并发 6 进程 × 360 次
+  ×3 轮 = **0/2160**（修复前 3/2160）。
+
+**③ 🟡 P1-1 登记失败 fail-fast / P1-2 迁移前提文档化 / 🔴 P1-3 路径穿越 / 🟡E 双通道**
+- `HandoffBus._register_ref` 返回布尔；新增 `_registry_required()` 判定"登记是否
+  为该卡唯一可见性路径"（`data_dir` 在 `state_root` 子树之外）。
+- 唯一路径且登记失败 → **回滚交接卡并抛 `OSError`**（fail-fast，不产生悬空引用）；
+  子树内 → 目录扫描兜底，不阻断。
+- `state-secretary-handoff-visibility.md` 新增 §5「迁移前提」：旧版根外卡须补偿
+  登记（重走 API 或手写 `.ref`）方可被会话侧发现。
+- **🟡E 闭环（双通道登记）**：登记同时写主 `<state_root>/handoff-refs/` 与备
+  `<state_root>/.handoff-refs/`（不同故障域）。单通道被同名文件占位 / 权限不足 /
+  单条 `.ref` 被外部删除时另一通道仍让引用可见；仅双通道全失败且为唯一可见性路径时
+  fail-fast 回滚。`.gitignore` 补 `data/.handoff-refs/`。
+- **🔴 P1-3 `card_id` 路径穿越**：新增 `_is_valid_card_id`（`[A-Za-z0-9_-]+` 白名单），
+  `get`/`delete`/`_register_ref`/`_unregister_ref` 全部前置校验；台账 `handoff_ids`
+  注入经 `HandoffBus.delete` 亦被拦截，不再构成 `data_dir` 之外的删除面。
+
+**④ 🟡 台账/忽略口径收口**
+- `.gitignore` 补 `data/content/`（原文归档根）——原忽略清单为 `state/ bindings/
+  handoffs/ handoff-refs/`，缺 `content/`，默认路径运行后 `git status` 出现未跟踪
+  归档文件（评审+测试双方复现）。现为 `state/ content/ bindings/ handoffs/
+  handoff-refs/`，与「数据根子目录」口径一致。
+- `docs/design/state-secretary-handoff-visibility.md` §3「API 路径保证」口径更正：
+  P1-1 修复后该保证**无条件成立**（原文档承诺在登记静默失败时不成立）。
+
+**⑤ 回归测试（新增 20 项，全部在 `60b625d` 上失败 → 有判别力）**
+- `TestPruneNameDirVisibility`：11 项名单名目录参数化 + `test_standalone_bus_skip_named_dir_derived_state_root`（独立 bus + 未显式 state_root）（承载真实卡须可见）+
+  `test_skip_named_dir_without_real_card_still_pruned`（判别性对照：伪引用仍剪枝）+
+  `test_data_root_named_as_skip_dir_never_pruned`（保护子树）；
+- `TestRegistryListdirToctouGuard`：`test_registry_dir_removed_between_isdir_and_listdir`
+  （注入 TOCTOU）、`test_scan_failure_skips_reclaim_without_abort`（第二道防线）、
+  `test_concurrent_create_fold_delete_no_exception`（线程并发）；
+- `TestRegistryFailFast`：`_registry_required` 判定 + 唯一路径 fail-fast 回滚 +
+  子树内容忍登记失败（3 项）。
+- **测试基线**：137 → **157 项**（门面 55 → **75 项**）。
+- **架构·测试独立探针**（`tests/test_ho_ref_invariant_probes.py`，41 项）：
+  修复前 `11dfdd9` 上 40 项 `xfail`（P0-1 33 + P0-2 2 + P1-3 4 + 1 反向守卫失败）；
+  修复后 **40 项全部 XPASS**、反向守卫通过 → P0/P1 清零的可执行证据。
 
 ## 四、测试环境
 

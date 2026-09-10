@@ -966,6 +966,286 @@ class TestSharedHoCardScanPruning:
         sec_b.delete_session()
 
 
+class TestPruneNameDirVisibility:
+    """🔴 P0-1 复评回归（Issue #4 复评 #3 / head 60b625d 打回）：剪枝不得按
+    **裸目录名**判定。
+
+    原实现按 ``_SKIP_SCAN_DIRS`` 名单名整片跳过，而名单中的名字
+    （``build``/``dist``/``env``/``venv``/``.venv``/``target``/``vendor``/
+    ``coverage`` 等）完全可能被合法选作 ``data_dir``。此时落在其中的真实/
+    遗留交接卡不可见 → 共享 ``ho-*`` 卡被误删、存活引用静默失效（评审实测
+    悬空 11/12）。修复后：名单目录须先过形状判定；保护子树（数据根 /
+    state / handoffs / content / handoff-refs）永不剪枝。
+    """
+
+    @pytest.mark.parametrize(
+        "name", ["node_modules", "__pycache__", "venv", ".venv", "env",
+                 "dist", "build", "target", "site-packages", "vendor",
+                 "coverage"])
+    def test_skip_named_dir_holding_real_card_not_pruned(self, tmp_dir, name):
+        """剪枝名单名目录内承载**真实**交接卡（无 .ref 登记的遗留/手写卡）：
+        引用必须可见 → 秘书 delete_session 不得删共享卡（否则引用悬空）。"""
+        import json
+
+        sec = SecretarySession("pn-a", data_dir=tmp_dir)
+        ho = sec.create_handoff("team-a", "team-b", "名单目录意图", "ctx")
+        sid = ho.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        d = os.path.join(tmp_dir, name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "legacy-card.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "legacy-card", "source_unit": "team-a",
+                       "target_unit": "team-b", "intent": "名单目录意图",
+                       "state_card_id": sid, "status": "created"}, f)
+
+        sec.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            f"剪枝名单名目录 {name!r} 内的真实交接卡引用必须可见（不得误删共享卡）"
+
+    def test_skip_named_dir_without_real_card_still_pruned(self, tmp_dir):
+        """判别性对照：名单目录内**无**交接卡（伪 JSON 指向不存在的状态卡）
+        → 剪枝仍生效，伪引用不得阻塞共享卡回收（保留原性能收益与防误判）。"""
+        import json
+
+        nm = os.path.join(tmp_dir, "node_modules", "pkg")
+        os.makedirs(nm)
+        for i in range(20):
+            with open(os.path.join(nm, f"f{i}.json"), "w", encoding="utf-8") as f:
+                json.dump({"id": f"p{i}", "source_unit": "x", "target_unit": "y",
+                           "state_card_id": f"fake-{i}"}, f)
+
+        sec = SecretarySession("pn-b", data_dir=tmp_dir)
+        index = sec._build_ho_reference_index()
+        assert not any(k.startswith("fake-") for k in index), \
+            "名单目录内伪引用（指向不存在的状态卡）不得计入"
+        sec.delete_session()
+
+    def test_standalone_bus_skip_named_dir_derived_state_root(self, tmp_dir):
+        """独立 ``HandoffBus(data_dir=<root>/build)`` **未显式 state_root**
+        （由父目录推导）→ 落在名单名目录内的交接卡引用必须可见。
+
+        覆盖评审要求的两类组合：① 剪枝名单名承载真实卡；② 未显式 state_root
+        （P2-② 推导规则下 state_root 由 ``data_dir`` 父目录得到）。
+        """
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "build"))  # 无 state_root
+        assert bus.state_root == tmp_dir, "前置：state_root 应由父目录推导"
+        ho = bus.create_handoff("team-a", "team-b", "名单目录独立意图", "ctx",
+                                auto_state_card=True)
+
+        sec = SecretarySession("pn-d", data_dir=tmp_dir)
+        ho_sec = sec.create_handoff("team-a", "team-b", "名单目录独立意图", "ctx")
+        sid = ho_sec.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        sec.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "名单名目录内的独立使用者引用必须可见 → 共享卡不得被误删"
+
+    def test_data_root_named_as_skip_dir_never_pruned(self, tmp_dir):
+        """data_dir **本身**取名单名（如 build/）：保护子树永不剪枝——
+        其内交接卡引用必须可见。"""
+        root = os.path.join(tmp_dir, "build")
+        os.makedirs(root)
+        sec = SecretarySession("pn-c", data_dir=root)
+        ho = sec.create_handoff("team-a", "team-b", "数据根名单名意图", "ctx")
+        sid = ho.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        other = SecretarySession("pn-c2", data_dir=root)
+        index = other._build_ho_reference_index()
+        assert f"handoff:{ho.id}" in index.get(sid, []), \
+            "data_dir 为名单名时，其内交接卡引用必须可见（保护子树）"
+
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "自身引用撤销后无他引 → 共享卡应正常回收（保护子树下扫描正常，无孤儿）"
+        other.delete_session()
+
+
+class TestRegistryListdirToctouGuard:
+    """🔴 P0-2 复评回归：``isdir → listdir`` TOCTOU 异常不得逃逸。
+
+    并发的 ``HandoffBus.delete`` → ``_unregister_ref`` 会回收空登记目录，
+    使 ``_build_ho_reference_index`` 来源 3 的 ``os.listdir`` 抛
+    ``FileNotFoundError``。原实现让异常逃逸出 ``delete_session`` → 中断于
+    回收中途，留 ho-*.json/.lock、归档、台账残骸（评审注入 100% 复现）。
+    """
+
+    def test_registry_dir_removed_between_isdir_and_listdir(self, tmp_dir,
+                                                            monkeypatch):
+        """注入：``isdir(reg_dir)`` 返回 True 后、``listdir`` 前删目录 →
+        delete_session 不得抛异常，且回收完整（无 ho-*/.lock/归档/台账残骸）。"""
+        sec = SecretarySession("tg-a", data_dir=tmp_dir)
+        ho = sec.create_handoff("ua", "ub", "注入意图", "ctx")
+        sid = ho.state_card_id
+        sec.fold("归档段落一\n归档段落二")
+        state_dir = sec.state_manager.data_dir
+        ho_dir = sec.handoff_bus.data_dir
+        reg_dir = sec.handoff_bus.ref_registry_dir()
+        assert os.path.isdir(reg_dir), "前置：登记目录存在"
+
+        real_listdir = os.listdir
+
+        def flaky_listdir(path="."):
+            # 模拟 isdir 判定后、listdir 前该目录被并发回收（TOCTOU 窗口）
+            if os.path.abspath(str(path)) == os.path.abspath(reg_dir):
+                shutil.rmtree(reg_dir, ignore_errors=True)
+                raise FileNotFoundError(2, "No such file or directory",
+                                        str(path))
+            return real_listdir(path)
+
+        monkeypatch.setattr(os, "listdir", flaky_listdir)
+        ret = sec.delete_session()  # 旧实现此处抛 FileNotFoundError
+        monkeypatch.undo()
+
+        assert ret is True
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "注入竞态下共享 ho-* 卡仍须被回收（无残骸）"
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.lock")), \
+            "ho-* 卡的 .lock 不得残留"
+        assert not os.path.exists(os.path.join(state_dir, "tg-a.json"))
+        assert not os.path.exists(os.path.join(ho_dir, ".session-tg-a.owned")), \
+            "归属台账不得残留"
+        content = os.path.join(tmp_dir, "content", "tg-a")
+        assert not os.path.isdir(content), "归档会话目录不得残留"
+
+    def test_scan_failure_skips_reclaim_without_abort(self, tmp_dir,
+                                                      monkeypatch):
+        """第二道防线：扫描本身抛 OSError → 保守跳过共享卡回收（不误删），
+        但后续归档/台账清理不得中断（delete_session 全路径不半途而废）。"""
+        sec = SecretarySession("tg-b", data_dir=tmp_dir)
+        ho = sec.create_handoff("ua", "ub", "扫描失败意图", "ctx")
+        sid = ho.state_card_id
+        sec.fold("段落一\n段落二")
+        state_dir = sec.state_manager.data_dir
+        ho_dir = sec.handoff_bus.data_dir
+
+        def boom(self, *a, **k):
+            raise OSError("simulated scan failure")
+
+        monkeypatch.setattr(SecretarySession, "_build_ho_reference_index", boom)
+        ret = sec.delete_session()
+        monkeypatch.undo()
+
+        assert ret is True
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "扫描不可用 → 无法证明引用已清 → 保守不删共享卡（宁可不删）"
+        assert not os.path.exists(os.path.join(state_dir, "tg-b.json")), \
+            "本会话状态卡仍须回收"
+        assert not os.path.exists(os.path.join(ho_dir, ".session-tg-b.owned")), \
+            "台账不得残留（异常不得中断后续清理）"
+        assert not os.path.isdir(os.path.join(tmp_dir, "content", "tg-b")), \
+            "归档不得残留"
+
+    def test_concurrent_create_fold_delete_no_exception(self, tmp_dir):
+        """自然并发（线程 × 多轮 create/fold/delete 同根）：delete_session
+        不得因 registry 目录并发回收而抛异常（原实现实测 3/2160）。"""
+        import threading
+
+        errors = []
+
+        def _run(tag):
+            try:
+                for i in range(12):
+                    s = SecretarySession(f"cc-{tag}-{i}", data_dir=tmp_dir)
+                    s.fold("并发段落一\n并发段落二")
+                    s.create_handoff("ua", "ub", "并发同意图", f"ctx{i}")
+                    s.delete_session()
+            except BaseException as exc:  # noqa: BLE001 - 测试记录后断言
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_run, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == [], f"并发 create/fold/delete 不应抛异常: {errors}"
+
+
+class TestRegistryFailFast:
+    """🟡 P1-1 复评修复：登记失败不得静默（唯一可见性路径时 fail-fast）。"""
+
+    def test_registry_required_only_when_outside_state_root(self, tmp_dir):
+        from secretary.handoff import HandoffBus
+
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root)
+        outside = HandoffBus(data_dir=os.path.join(tmp_dir, "elsewhere"),
+                             state_root=root)
+        inside = HandoffBus(data_dir=os.path.join(root, "handoffs"),
+                            state_root=root)
+        assert outside._registry_required() is True, \
+            "data_dir 在 state_root 子树之外 → 登记为唯一可见性路径"
+        assert inside._registry_required() is False, \
+            "data_dir 在 state_root 子树内 → 目录扫描兜底，登记非唯一路径"
+
+    def test_registry_dual_channel_backup_survives_primary_blocked(self, tmp_dir):
+        """🟡E 闭环（双通道）：主登记目录被同名普通文件占位 → **备通道**
+        ``.handoff-refs/`` 生效 → 建卡不失败，且根外引用仍可见。"""
+        from secretary.handoff import HandoffBus
+
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root)
+        elsewhere = os.path.join(tmp_dir, "elsewhere")
+        with open(os.path.join(root, "handoff-refs"), "w", encoding="utf-8") as f:
+            f.write("occupied")  # 主通道不可用
+
+        bus = HandoffBus(data_dir=elsewhere, state_root=root)
+        ho = bus.create_handoff("ua", "ub", "双通道意图", "ctx",
+                                auto_state_card=True)
+        assert os.path.isfile(os.path.join(
+            root, ".handoff-refs", f"{ho.id}.ref")), "备通道登记应写入"
+
+        sec = SecretarySession("dc-a", data_dir=root)
+        index = sec._build_ho_reference_index()
+        assert f"handoff:{ho.id}" in index.get(ho.state_card_id, []), \
+            "主通道被占位时，备通道登记须让根外引用仍可见（🟡E 闭环）"
+
+    def test_registry_failure_fail_fast_when_only_path(self, tmp_dir):
+        """**双通道全部失败**（主 + 备登记目录均被同名普通文件占位）+
+        data_dir 在 state_root 之外 → 建卡 fail-fast（抛 OSError）且回滚交接卡，
+        不产生"写入成功但引用静默悬空"的卡。"""
+        from secretary.handoff import HandoffBus
+
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root)
+        elsewhere = os.path.join(tmp_dir, "elsewhere")
+        # 两条通道均以普通文件占位 → makedirs 必抛 FileExistsError(OSError)
+        for name in ("handoff-refs", ".handoff-refs"):
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write("occupied")
+
+        bus = HandoffBus(data_dir=elsewhere, state_root=root)
+        with pytest.raises(OSError):
+            bus.create_handoff("ua", "ub", "唯一可见性意图", "ctx",
+                               auto_state_card=True)
+        leftover = ([f for f in os.listdir(elsewhere) if f.endswith(".json")]
+                    if os.path.isdir(elsewhere) else [])
+        assert leftover == [], "fail-fast 应回滚刚落盘的交接卡（不留悬空引用）"
+
+    def test_registry_failure_tolerated_when_dir_scan_covers(self, tmp_dir):
+        """registry 被占位但 data_dir 在 state_root 子树内 → 目录扫描兜底，
+        建卡不失败，且引用仍可见（登记失败不致命）。"""
+        from secretary.handoff import HandoffBus
+
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root)
+        with open(os.path.join(root, "handoff-refs"), "w", encoding="utf-8") as f:
+            f.write("occupied")
+
+        bus = HandoffBus(data_dir=os.path.join(root, "handoffs"),
+                         state_root=root)
+        ho = bus.create_handoff("ua", "ub", "目录兜底意图", "ctx",
+                                auto_state_card=True)
+        sec = SecretarySession("ff-a", data_dir=root)
+        index = sec._build_ho_reference_index()
+        assert f"handoff:{ho.id}" in index.get(ho.state_card_id, []), \
+            "登记失败但目录扫描可达 → 引用仍须可见"
+
+
 class TestSharedHoCardStateRootRegistry:
     """🔴#4：state 根级引用登记——覆盖"交接卡目录在会话数据根之外"的布局，
     且登记随卡回收、stale 登记不得永久阻塞共享卡回收。"""
