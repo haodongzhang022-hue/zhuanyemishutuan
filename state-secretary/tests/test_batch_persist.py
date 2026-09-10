@@ -3,7 +3,7 @@
 覆盖：
 - FlushQueue 批量合并：多次登记同一资源只写最后一次（增量取最终态）
 - SecretaryTree/StateManager 延迟落盘：defer() 上下文内多次变更只触发一轮落盘
-- 修复回归：HandoffBus 复用稳定 StateCard 时交接任务不重复堆积
+- 修复回归：HandoffBus 复用稳定 StateCard 时交接任务不重复堆积，且后到者 context 静默丢弃（🟡4 断言固化）
 - 修复回归：submit_chain_up 断链(level_skipped)记录可由 CLI 展示逻辑安全消费(不抛 KeyError)
 """
 import os
@@ -108,15 +108,18 @@ def test_state_manager_deferred_batch():
 # ==== 修复回归：HandoffBus 重复交接不堆积 ====
 
 def test_handoff_same_state_card_no_dup_task():
-    """复用同一稳定 StateCard 时，交接任务不重复堆积"""
+    """复用同一稳定 StateCard 时，交接任务不重复堆积，
+    且**后到者 context 静默丢弃**（共享卡既定语义，🟡4 断言固化）。"""
+    import json
+
     from secretary.handoff import HandoffBus
     with tempfile.TemporaryDirectory() as tmpdir:
         # 独立 HandoffBus 显式 data_dir 时，ho-* 状态卡收敛到
         # <parent(data_dir)>/state（此处即 <tmpdir>/state），无需 chdir。
         bus = HandoffBus(data_dir=os.path.join(tmpdir, "handoffs"))
-        c1 = bus.create_handoff("ua", "ub", "同意图", "c1",
+        c1 = bus.create_handoff("ua", "ub", "同意图", "首到者上下文",
                                 auto_state_card=True)
-        c2 = bus.create_handoff("ua", "ub", "同意图", "c2",
+        c2 = bus.create_handoff("ua", "ub", "同意图", "后到者上下文",
                                 auto_state_card=True)
         assert c2.state_card_id == c1.state_card_id  # 复用同一会话卡
         # ho-* 状态卡随 data_dir 父目录推导的 state_root 落盘
@@ -126,6 +129,22 @@ def test_handoff_same_state_card_no_dup_task():
         titles = [t.title for t in card.tasks]
         assert len(card.tasks) == 1, f"重复 add_task 未去重: {titles}"
         assert titles[0].startswith("交接:")
+
+        # 🟡4 断言固化：共享卡只按标题去重，后到者 context 不落卡。
+        # 判别性：若实现改为"追加 context"或"为后到者另建任务"，
+        # 首到者摘要断言与全量序列化断言都会失败。
+        assert card.tasks[0].summary == "首到者上下文", \
+            f"首到者 context 应落卡，实际 {card.tasks[0].summary!r}"
+        blob = json.dumps(card.to_dict(), ensure_ascii=False)
+        assert "后到者上下文" not in blob, \
+            "后到者 context 不得落共享卡（静默丢弃语义）"
+        # 重开会话读回仍一致（语义随卡落盘持久化，而非仅内存态）
+        card2 = StateManager(
+            data_dir=os.path.join(bus.state_root, "state")
+        ).get_card(c1.state_card_id)
+        assert len(card2.tasks) == 1
+        assert "后到者上下文" not in json.dumps(
+            card2.to_dict(), ensure_ascii=False)
 
 
 # ==== 修复回归：submit_chain_up 断链记录可安全展示 ====

@@ -61,7 +61,7 @@ zhuanyemishutuan/            # 通用层
 
 ## 4. 落地状态
 
-1. ✅ schema/fold/org 最小可运行代码 + 测试（137 项通过，门面 54 项（数据生命周期/评审回归））
+1. ✅ schema/fold/org 最小可运行代码 + 测试（137 项通过，门面 55 项（数据生命周期/评审回归））
 1. ✅ SecretarySession 会话门面：L3 会话秘书统一入口（state+fold+context+handoff 整合）
 2. ✅ cache 稳定前缀策略（context/assembler.py 三层装配）
 3. ✅ poc/benchmark 可运行

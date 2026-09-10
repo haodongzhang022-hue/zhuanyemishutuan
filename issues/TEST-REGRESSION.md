@@ -155,6 +155,27 @@
 > - 🟡3 `_scan_ho_referencing_sessions` 补 `.. deprecated::` 标注（#E 遗漏）。
 > - 测试计数同步 README/设计文档 → **137**。
 
+### 🟡 修复 #G — 复评 #E 遗留收口（Issue #4 复评：🟡4 未落地 + 计数 55 + 文档漂移）
+> 评审对象 `570c7ee`。评审确认 🔴 清零、放行，但指出 2 项 🟡 需下一提交收口。
+- **🟡4 未落地且留痕不实**：上一轮声明「在 `test_batch_persist` 加断言固化后到者
+  上下文未落卡」，但 `test_batch_persist.py` 实际 **0 行改动**，全仓亦无该断言
+  （仅 `SecretarySession.create_handoff` / `HandoffBus.create_handoff` 两处
+  docstring）。**本轮真实落地**：在 `test_handoff_same_state_card_no_dup_task`
+  补 3 处判别性断言——
+  1. 首到者 `context` 落卡（`card.tasks[0].summary == "首到者上下文"`）；
+  2. 全量序列化（`json.dumps(card.to_dict())`）**不含**后到者 context 文本；
+  3. 重开会话（新 `StateManager` 实例）读回仍一致（语义随卡落盘持久化）。
+  - **判别力**：把实现改为「后到者另建任务」或「追加后到者 context」→ 断言 2
+    失败；改为「首到者 context 不落卡」→ 断言 1 失败。非恒真。
+- **门面计数 54 → 55**：门面文件 `tests/test_secretary_session.py` 实收 **55** 项
+  （137 = 82 + 55）。已同步 `state-secretary/README.md`、`docs/design/
+  state-secretary-index.md`、`docs/design/state-secretary-module.md`。
+- **🟢 文档漂移**：`_build_ho_reference_index` docstring 剪枝行补 `_SKIP_SCAN_DIRS`
+  全量清单 + 形状校验四字段口径 + **可见性保证范围**（仅覆盖 `HandoffBus` API
+  写入路径；手写/外部遗留卡缺 `id` 或落剪枝目录时不可见——属已知覆盖边界，
+  是否收窄为 API 路径保证待总师裁定）。
+- **测试基线**：仍 **137 项**（仅加强既有断言、未新增用例）；`compileall` 通过。
+
 ## 三、可复现缺陷记录（P2 待办）
 
 评审/测试接力中发现、**非阻塞合并**的 P2 边界问题，已建 Issue 跟踪。

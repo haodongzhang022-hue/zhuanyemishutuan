@@ -326,7 +326,24 @@ class SecretarySession:
            同根、随卡回收，且记录 ``card_path``——仅当该交接卡仍在盘上时才计入，
            卡删除即引用失效。
 
-        剪枝：跳过隐藏目录、跳过原文归档根（归档条目永不含 ``state_card_id``）。
+        剪枝：跳过隐藏目录（``.git`` 等）、跳过原文归档根（归档条目永不含
+        ``state_card_id``）、跳过 ``_SKIP_SCAN_DIRS`` 所列重型/非数据目录
+        （``node_modules``/``__pycache__``/``venv``/``.venv``/``env``/``dist``/
+        ``build``/``target``/``site-packages``/``vendor``/``coverage``——防
+        ``data_dir`` 指向工作区根时全树遍历，亦防其内无关 JSON 被误判为交接卡
+        引用而永久阻塞回收）。
+
+        形状校验（来源 2）：文件须同时含 ``state_card_id`` + ``source_unit`` +
+        ``target_unit`` + ``id`` 才计入（交接卡必带 ``id``；StateCard 只有
+        ``session_id``、归档/台账均无这些字段，故不会误入）。
+
+        **可见性保证范围（口径说明，非行为变更）**：上述引用可见性仅保证
+        **经 ``HandoffBus`` API（``create_handoff(auto_state_card=True)`` /
+        ``delete``）写入**的交接卡——它们恒带 ``id``、恒落登记或落在扫描界内。
+        **手写/外部遗留**的交接卡若缺 ``id`` 字段、或落在 ``_SKIP_SCAN_DIRS``
+        所列目录内，则本索引不可见（既不阻塞回收、亦不被计入）——属已知
+        覆盖边界，如需覆盖请改走 ``HandoffBus`` API（是否收窄为 API 路径保证
+        待总师裁定）。
 
         **保守方向（不变量优先）**：凡扫描界内**实际存在**的交接卡/登记一律
         计入引用，**不做**"排除自身认领卡"处理。调用方（``delete_session``）
