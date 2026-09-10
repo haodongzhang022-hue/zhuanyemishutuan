@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Set, Any
 
 from ..state import (
     StateManager, StateCard, TaskRecord,
@@ -266,20 +266,59 @@ class SecretarySession:
             return None
         return data if isinstance(data, dict) else None
 
+    @staticmethod
+    def _maybe_handoff_card(path: str) -> bool:
+        """廉价预筛：仅当文件文本同时出现 ``state_card_id`` 与
+        ``source_unit``/``target_unit`` 字段名时才值得 ``json.loads``。
+
+        🔴#4 修复后扫描界提升到会话数据根，根下同时存在大量 StateCard
+        （``state/*.json``，其字段名是 ``session_id``、**不含**
+        ``state_card_id``）。预筛令这些文件只做一次文本包含检查、不做 JSON
+        解析，保持删除路径的近线性开销。
+
+        全文读取（不截断）：``HandoffCard`` 的 ``state_card_id`` 字段排在
+        ``context`` 之后，截断读取会在 context 很大时漏判，故必须读全文。
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except (OSError, ValueError):
+            return False
+        if '"state_card_id"' not in raw:
+            return False
+        return '"source_unit"' in raw or '"target_unit"' in raw
+
     def _build_ho_reference_index(
         self,
-        exclude_handoff_ids: Optional[set] = None,
+        exclude_handoff_ids: Optional[Set[str]] = None,
     ) -> Dict[str, List[str]]:
         """一次扫描建立 ``state_card_id -> 存活引用者标签`` 索引。
 
+        **扫描界 = 本会话数据根 ``self._session_root``（递归）**，而非仅本会话
+        ``handoff_bus.data_dir``（🔴#4 修复）。原因：删除目标 ho-* 卡落在
+        **共享 state 目录**（``<root>/state``），而独立 ``HandoffBus`` 使用者的
+        交接卡目录可为其任意 ``data_dir``（如 ``<root>/queue``）。若只扫本会话
+        ``handoffs/``，异目录交接卡的 ``state_card_id`` 不被计入 → 秘书
+        ``delete_session()`` 误删共享卡、存活交接卡引用静默失效。故扫描界提升到
+        会话数据根，递归收集根下任意子目录的交接卡与归属台账。
+
         存活引用来源 = **并集**（🔴#2 修复：不再只认归属台账）：
 
-        1. 同数据根下**其他存活会话**的归属台账
-           ``handoffs/.session-<id>.owned``：仅当该会话自身 StateCard
-           （``state/<id>.json``）仍存在（尚未 ``delete_session``）时计入；
-        2. 同数据根下**未删除交接卡** ``handoffs/*.json``（非隐藏文件）的
+        1. 数据根下**其他存活会话**的归属台账 ``.session-<id>.owned``：仅当该
+           会话自身 StateCard（``state/<id>.json``）仍存在（尚未 ``delete_session``）
+           时计入；
+        2. 数据根下**未删除交接卡**（非隐藏 ``*.json``，且具交接卡形状：含
+           ``state_card_id`` 与 ``source_unit``/``target_unit``，经廉价预筛）的
            ``state_card_id`` 字段——覆盖不经 ``SecretarySession`` 门面、
-           因而**不落归属台账**的独立 ``HandoffBus(data_dir=…)`` 使用者。
+           因而**不落归属台账**、且**目录可与本会话不同**的独立
+           ``HandoffBus(data_dir=…)`` 使用者；
+        3. **state 根级引用登记** ``<state_root>/handoff-refs/*.ref``：交接卡
+           目录可完全落在会话数据根**之外**（如 ``data_dir=/else/queue`` 且
+           ``state_root=<root>``），此时来源 2 的目录扫描不可达。登记与 ho-* 卡
+           同根、随卡回收，且记录 ``card_path``——仅当该交接卡仍在盘上时才计入，
+           卡删除即引用失效。
+
+        剪枝：跳过隐藏目录、跳过原文归档根（归档条目永不含 ``state_card_id``）。
 
         引用者标签：会话引用记会话 ID；交接卡引用记 ``handoff:<card_id>``，
         两类语义可区分。本会话自身台账/交接卡不计入——调用方
@@ -293,9 +332,10 @@ class SecretarySession:
                 失败的卡，避免自身残卡被误判为"他人的存活引用"）。
         """
         index: Dict[str, List[str]] = {}
-        state_dir = self.state_manager.data_dir
-        ho_dir = self.handoff_bus.data_dir
-        if not os.path.isdir(ho_dir):
+        state_dir = os.path.abspath(self.state_manager.data_dir)
+        scan_root = os.path.abspath(self._session_root)
+        archive_root = os.path.abspath(self.archive.root_dir)
+        if not os.path.isdir(scan_root):
             return index
 
         def _add(scid, label: str) -> None:
@@ -308,38 +348,74 @@ class SecretarySession:
         own_handoff_ids = set(self._owned_handoff_ids)
         own_handoff_ids |= set(exclude_handoff_ids or ())
         prefix, suffix = ".session-", ".owned"
-        for fname in os.listdir(ho_dir):
-            path = os.path.join(ho_dir, fname)
-            if not os.path.isfile(path):
+        for dirpath, dirnames, filenames in os.walk(scan_root):
+            # 剪枝：隐藏目录（如 .git）与原文归档根（归档条目不含引用字段）
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            if os.path.abspath(dirpath) == archive_root:
+                dirnames[:] = []
                 continue
-            # 来源 1：其他会话归属台账（隐藏文件，后缀刻意非 .json）
-            if fname.startswith(prefix) and fname.endswith(suffix):
-                other_sid = fname[len(prefix):-len(suffix)]
-                if not other_sid or other_sid == self.session_id:
+            for fname in filenames:
+                path = os.path.join(dirpath, fname)
+                if not os.path.isfile(path):
                     continue
-                # 会话自身已删除 → 其台账引用失效，不阻塞共享卡回收
-                if not os.path.exists(
-                        os.path.join(state_dir, f"{other_sid}.json")):
+                # 来源 1：其他会话归属台账（隐藏文件，后缀刻意非 .json）
+                if fname.startswith(prefix) and fname.endswith(suffix):
+                    other_sid = fname[len(prefix):-len(suffix)]
+                    if not other_sid or other_sid == self.session_id:
+                        continue
+                    # 会话自身已删除 → 其台账引用失效，不阻塞共享卡回收
+                    if not os.path.exists(
+                            os.path.join(state_dir, f"{other_sid}.json")):
+                        continue
+                    data = self._read_json_dict(path)
+                    if data is None:
+                        continue  # 🔴#3：非对象/损坏台账视为空台账
+                    sids = data.get("state_card_ids")
+                    if not isinstance(sids, list):
+                        continue
+                    for scid in sids:
+                        _add(scid, other_sid)
+                    continue
+                # 来源 2：未删除交接卡（非隐藏 .json）
+                if fname.startswith(".") or not fname.endswith(".json"):
+                    continue
+                card_id = fname[:-5]
+                if card_id in own_handoff_ids:
+                    continue  # 本会话自身引用，不计入
+                # 预筛 + 形状校验：仅"交接卡"（含 state_card_id 且具
+                # source_unit/target_unit）计入，避免把 StateCard / 租约文件
+                # 等误判为引用者，也不为其做无谓 JSON 解析。
+                if not self._maybe_handoff_card(path):
                     continue
                 data = self._read_json_dict(path)
                 if data is None:
-                    continue  # 🔴#3：非对象/损坏台账视为空台账
-                sids = data.get("state_card_ids")
-                if not isinstance(sids, list):
                     continue
-                for scid in sids:
-                    _add(scid, other_sid)
-                continue
-            # 来源 2：未删除交接卡（非隐藏 .json）
-            if fname.startswith(".") or not fname.endswith(".json"):
-                continue
-            card_id = fname[:-5]
-            if card_id in own_handoff_ids:
-                continue  # 本会话自身引用，不计入
-            data = self._read_json_dict(path)
-            if data is None:
-                continue
-            _add(data.get("state_card_id"), f"handoff:{card_id}")
+                scid = data.get("state_card_id")
+                if not isinstance(scid, str) or not scid:
+                    continue
+                _add(scid, f"handoff:{card_id}")
+        # 来源 3：state 根级引用登记（覆盖交接卡目录在会话根之外的独立使用者）
+        reg_dir = self.handoff_bus.ref_registry_dir()
+        if reg_dir and os.path.isdir(reg_dir):
+            for fname in os.listdir(reg_dir):
+                if not fname.endswith(".ref"):
+                    continue
+                data = self._read_json_dict(os.path.join(reg_dir, fname))
+                if data is None:
+                    continue
+                card_id = data.get("card_id")
+                if not isinstance(card_id, str) or not card_id:
+                    continue
+                if card_id in own_handoff_ids:
+                    continue  # 本会话自身引用，不计入
+                scid = data.get("state_card_id")
+                if not isinstance(scid, str) or not scid:
+                    continue
+                # 卡已删除 → 登记失效（stale），不计入，避免永久阻塞回收
+                card_path = data.get("card_path")
+                if not isinstance(card_path, str) or not os.path.exists(card_path):
+                    continue
+                _add(scid, f"handoff:{card_id}")
         return index
 
     def _ho_has_live_references(
@@ -707,7 +783,16 @@ class SecretarySession:
         intent: str,
         context: str = "",
     ) -> HandoffCard:
-        """创建一张交接卡（跨单元协作），自动关联本会话 StateCard。"""
+        """创建一张交接卡（跨单元协作），自动关联本会话 StateCard。
+
+        **共享卡语义后果（显式约定，🟡#3）**：ho-* 状态卡 ID =
+        ``hash(source_unit, target_unit, intent)``——同源/同目标/同意图的多个
+        会话**共享同一张 ho-* 卡**。共享卡的交接任务只按标题去重，因此**后到者
+        传入的 ``context`` 不会写入该卡**（仅首到者的 context 落卡），后到者
+        上下文**静默丢弃**。这是"共享卡"设计的既定语义（避免同一交接任务在卡内
+        重复堆积）；需要保留各自上下文的场景请使用不同 ``intent``（→ 不同卡），
+        或把上下文写入自己的任务卡/原文归档。
+        """
         hc = self.handoff_bus.create_handoff(
             source_unit=source_unit,
             target_unit=target_unit,

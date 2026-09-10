@@ -108,7 +108,7 @@ state-secretary/
 │       └── session/             # 会话门面层（L3 秘书统一入口）
 │           ├── __init__.py
 │           └── session.py       # SecretarySession（推荐使用）
-├── tests/                       # 102 项测试（门面 28 项，含数据生命周期/评审回归 12 项）
+├── tests/                       # 133 项测试（门面 51 项，含数据生命周期/评审回归）
 ├── poc/                         # POC 脚本 + benchmark
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC

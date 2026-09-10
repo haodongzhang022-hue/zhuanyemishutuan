@@ -748,20 +748,54 @@ class TestSharedHoCardConcurrentReclaim:
         assert leaks == 0, f"{rounds} 轮并发删除泄漏 {leaks} 次，应为 0"
 
 
+def _standalone_layout(tmp_dir, layout):
+    """按布局构造「独立 HandoffBus 使用者 + 会话共享同一 ho-* 卡」的场景。
+
+    返回 ``(bus, session_data_root)``。四类布局均属受支持路径：
+
+    - ``colocated``：独立 bus 与会话同用 ``<root>/handoffs``（原覆盖）；
+    - ``queue``：独立 bus 落 ``<root>/queue``，``state_root`` 由父目录推导
+      → 与会话共享 state 根（P2-② 推导规则，Issue #4 原始描述路径）；
+    - ``explicit_state_root``：独立 bus 显式 ``state_root=<root>``；
+    - ``out_of_root``：交接卡目录完全在会话数据根**之外**，仅共享 state 根
+      （仅靠目录扫描不可达，须由 state 根级引用登记覆盖）。
+    """
+    from secretary.handoff import HandoffBus
+
+    if layout == "colocated":
+        return HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs")), tmp_dir
+    if layout == "queue":
+        return HandoffBus(data_dir=os.path.join(tmp_dir, "queue")), tmp_dir
+    if layout == "explicit_state_root":
+        return HandoffBus(
+            data_dir=os.path.join(tmp_dir, "queue"), state_root=tmp_dir), tmp_dir
+    if layout == "out_of_root":
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root, exist_ok=True)
+        return HandoffBus(
+            data_dir=os.path.join(tmp_dir, "elsewhere"), state_root=root), root
+    raise AssertionError(f"未知布局: {layout}")
+
+
 class TestSharedHoCardIndependentBusReference:
-    """🔴#2：独立 HandoffBus 使用者（不落台账）的引用须被计入存活引用源。"""
+    """🔴#2 / 🔴#4：独立 HandoffBus 使用者（不落台账）的引用须被计入存活引用源。
 
-    def test_standalone_bus_reference_blocks_shared_ho_delete(self, tmp_dir):
-        """独立 HandoffBus 与秘书会话共享同源/同目标/同意图 ho-* 卡：
+    参数化覆盖四类布局——异交接目录（``queue/``、显式 ``state_root``、会话根
+    之外）此前漏检，导致秘书 ``delete_session()`` 误删共享卡、存活交接卡引用
+    静默失效（🔴#4）。
+    """
+
+    @pytest.mark.parametrize(
+        "layout", ["colocated", "queue", "explicit_state_root", "out_of_root"])
+    def test_standalone_bus_reference_blocks_shared_ho_delete(
+            self, tmp_dir, layout):
+        """独立 HandoffBus 与秘书会话共享同一 ho-* 卡：
         秘书 delete_session 后共享卡须保留（独立使用者仍引用）。"""
-        from secretary.handoff import HandoffBus
-
-        # 独立使用者：不经 SecretarySession，故不落归属台账
-        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"))
+        bus, root = _standalone_layout(tmp_dir, layout)
         ho_std = bus.create_handoff(
             "team-x", "team-y", "同一意图", "独立上下文", auto_state_card=True)
 
-        sec = SecretarySession("ind-a", data_dir=tmp_dir)
+        sec = SecretarySession("ind-a", data_dir=root)
         ho_sec = sec.create_handoff("team-x", "team-y", "同一意图", "秘书上下文")
         assert ho_std.state_card_id == ho_sec.state_card_id, \
             "前置：同源/同目标/同意图应共享同一 ho-* 卡"
@@ -780,14 +814,15 @@ class TestSharedHoCardIndependentBusReference:
         assert not os.path.exists(
             os.path.join(sec.handoff_bus.data_dir, ".session-ind-a.owned"))
 
-    def test_standalone_reference_released_then_card_reclaimed(self, tmp_dir):
+    @pytest.mark.parametrize(
+        "layout", ["colocated", "queue", "explicit_state_root", "out_of_root"])
+    def test_standalone_reference_released_then_card_reclaimed(
+            self, tmp_dir, layout):
         """独立使用者删除自己的交接卡后引用清空，共享卡可被回收（无孤儿）。"""
-        from secretary.handoff import HandoffBus
-
-        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"))
+        bus, root = _standalone_layout(tmp_dir, layout)
         ho_std = bus.create_handoff(
             "team-x", "team-y", "释放意图", "独立上下文", auto_state_card=True)
-        sec = SecretarySession("ind-b", data_dir=tmp_dir)
+        sec = SecretarySession("ind-b", data_dir=root)
         ho_sec = sec.create_handoff("team-x", "team-y", "释放意图", "秘书上下文")
         sid = ho_sec.state_card_id
         state_dir = sec.state_manager.data_dir
@@ -800,7 +835,7 @@ class TestSharedHoCardIndependentBusReference:
         bus.delete(ho_std.id)
 
         # 最后一个秘书侧引用者（新会话实例）回收共享卡
-        reclaim = SecretarySession("ind-b2", data_dir=tmp_dir)
+        reclaim = SecretarySession("ind-b2", data_dir=root)
         index = reclaim._build_ho_reference_index()
         assert not index.get(sid), \
             "独立交接卡删除后不应再有存活引用"
@@ -808,6 +843,74 @@ class TestSharedHoCardIndependentBusReference:
         assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
             "引用清空后共享卡应可回收"
         reclaim.delete_session()
+
+
+class TestSharedHoCardStateRootRegistry:
+    """🔴#4：state 根级引用登记——覆盖"交接卡目录在会话数据根之外"的布局，
+    且登记随卡回收、stale 登记不得永久阻塞共享卡回收。"""
+
+    def test_registry_entry_created_and_removed_with_card(self, tmp_dir):
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "queue"),
+                         state_root=tmp_dir)
+        ho = bus.create_handoff("ua", "ub", "登记意图", "ctx",
+                                auto_state_card=True)
+        reg = os.path.join(tmp_dir, "handoff-refs", f"{ho.id}.ref")
+        assert os.path.exists(reg), "auto_state_card 应登记 state 根级引用"
+        bus.delete(ho.id)
+        assert not os.path.exists(reg), "删除交接卡应同步注销引用登记"
+
+    def test_stale_registry_does_not_block_reclaim(self, tmp_dir):
+        """交接卡在盘外被移除（未经 HandoffBus.delete）→ 登记视为失效，
+        不得永久阻塞共享 ho-* 卡回收。"""
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "queue"),
+                         state_root=tmp_dir)
+        ho = bus.create_handoff("ua", "ub", "失效登记意图", "ctx",
+                                auto_state_card=True)
+        sec = SecretarySession("stale-1", data_dir=tmp_dir)
+        ho_sec = sec.create_handoff("ua", "ub", "失效登记意图", "ctx")
+        sid = ho_sec.state_card_id
+        state_dir = sec.state_manager.data_dir
+        # 盘外移除交接卡本体，保留 .ref（模拟异常退出/外部删除）
+        os.remove(os.path.join(bus.data_dir, f"{ho.id}.json"))
+
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "失效登记不得阻塞共享卡回收"
+
+    def test_registry_dir_no_empty_residue_after_delete(self, tmp_dir):
+        """会话自身交接卡删除后，其引用登记与空登记目录一并回收（不留残骸）。"""
+        sec = SecretarySession("reg-res-1", data_dir=tmp_dir)
+        sec.create_handoff("ua", "ub", "残骸意图", "ctx")
+        reg_dir = os.path.join(tmp_dir, "handoff-refs")
+        assert os.path.isdir(reg_dir) and os.listdir(reg_dir), \
+            "前置：建卡后应有引用登记"
+
+        sec.delete_session()
+        assert not os.path.exists(reg_dir), "空登记目录不应残留"
+
+    def test_registry_reference_blocks_delete_when_dir_out_of_root(self, tmp_dir):
+        """交接卡目录在会话数据根之外：目录扫描不可达，仅登记可见 →
+        仍须阻止误删共享卡。"""
+        from secretary.handoff import HandoffBus
+
+        root = os.path.join(tmp_dir, "sess-root")
+        os.makedirs(root)
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "elsewhere"),
+                         state_root=root)
+        ho = bus.create_handoff("ua", "ub", "根外意图", "ctx",
+                                auto_state_card=True)
+        sec = SecretarySession("oor-1", data_dir=root)
+        ho_sec = sec.create_handoff("ua", "ub", "根外意图", "ctx")
+        sid = ho_sec.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        sec.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "根外独立使用者的引用应经登记被计入 → 共享卡不得被删"
 
 
 class TestLedgerMalformedRobustness:
@@ -865,9 +968,11 @@ class TestLedgerMalformedRobustness:
                        "state_card_ids": 42}, f)
 
         sec = SecretarySession("weird", data_dir=tmp_dir)
-        assert sec._owned_handoffs() == []
+        assert sec._owned_handoffs() == [], "字段类型不符应视为空台账"
+        # 判别性断言：非法台账不得产生任何存活引用（旧断言恒真、无判别力）
         index = sec._build_ho_reference_index()
-        assert index == {} or all(v for v in index.values())
+        assert index.get("not-a-list") is None
+        assert index.get("42") is None
         sec.delete_session()
 
     def test_reference_index_single_scan_multi_card(self, tmp_dir):
