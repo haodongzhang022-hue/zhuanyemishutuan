@@ -1656,3 +1656,354 @@ class TestRegistryRmdirWindowDeterministic:
         assert any(os.path.exists(os.path.join(root, d, f"{card.id}.ref"))
                    for d in ("handoff-refs", ".handoff-refs")), \
             "窗口内他线程 rmdir 不得使登记丢失（登记/注销须跨实例互斥）"
+
+
+# ------------------------------------------------------------------
+# 🔴A 复评回归：保留根多重重叠 → 深度截断必须与集合迭代顺序无关
+# ------------------------------------------------------------------
+
+class _OrderedRoots:
+    """以**指定顺序**迭代保留根的替身（模拟 ``set`` 的不同迭代顺序）。
+
+    ``kept_skip_dirs`` 是 ``set``，其迭代顺序随 ``PYTHONHASHSEED`` 变化。原
+    ``_exceeds_kept_skip_depth`` 取「首个前缀命中即 return」→ 结果随迭代顺序
+    漂移。本替身让同一组根以两种顺序注入，从而在**单进程内确定性**复现该
+    顺序依赖（不依赖解释器哈希种子）。
+    """
+
+    def __init__(self, order):
+        self._order = list(order)
+
+    def __iter__(self):
+        return iter(self._order)
+
+    def __bool__(self):
+        return bool(self._order)
+
+
+class TestKeptSkipDepthOrderIndependence:
+    """🔴A（评审复评 head ``7300b22``）：``kept_skip_dirs`` 多根重叠时取
+    「最小深度」，不得取"首个前缀命中"。
+
+    根因：``<root>/build`` 与 ``<root>/build/dist`` 双双因形状判定入列后，
+    ``<root>/build/dist/x/y`` 落在两根之下；原实现取集合迭代顺序的首个前缀
+    → 深度 3（外层，截断）或 2（内层，放行）→ 不变量随 ``PYTHONHASHSEED``
+    非确定性破坏（实测 10 seed 中 6 破坏）。
+    """
+
+    def _roots(self, tmp_dir):
+        outer = os.path.join(tmp_dir, "build")
+        inner = os.path.join(tmp_dir, "build", "dist")
+        return outer, inner
+
+    def test_overlapping_roots_order_independent_not_exceeding(self, tmp_dir):
+        """两根重叠、最小深度 2（< 上界 3）→ 两顺序均**不得**截断。"""
+        sec = SecretarySession("kd-a", data_dir=tmp_dir)
+        outer, inner = self._roots(tmp_dir)
+        target = os.path.join(inner, "x", "y")
+        r1 = sec._exceeds_kept_skip_depth(target, _OrderedRoots([outer, inner]))
+        r2 = sec._exceeds_kept_skip_depth(target, _OrderedRoots([inner, outer]))
+        assert r1 == r2, (
+            f"深度截断随保留根迭代顺序变化（🔴A 回归）：外层先={r1} 内层先={r2}")
+        assert r1 is False, (
+            "最小深度 2 < _SKIP_DIR_PROBE_DEPTH → 不得截断（原实现取外层前缀"
+            "→ 深度 3 → 误截断 → 卡不可见 → 共享卡被误删）")
+        sec.delete_session()
+
+    def test_overlapping_roots_order_independent_exceeding(self, tmp_dir):
+        """两根重叠、最小深度 3（≥ 上界）→ 两顺序均**须**截断（有界遍历仍生效）。"""
+        sec = SecretarySession("kd-b", data_dir=tmp_dir)
+        outer, inner = self._roots(tmp_dir)
+        target = os.path.join(inner, "a", "b", "c")
+        r1 = sec._exceeds_kept_skip_depth(target, _OrderedRoots([outer, inner]))
+        r2 = sec._exceeds_kept_skip_depth(target, _OrderedRoots([inner, outer]))
+        assert r1 == r2 is True, (
+            f"最小深度 3 ≥ 上界 → 两顺序均须截断（r1={r1}, r2={r2}）")
+        sec.delete_session()
+
+    def test_single_root_depth_semantics_unchanged(self, tmp_dir):
+        """单根（无重叠）深度语义与上界一致（防修 🔴A 时改坏原判定）。"""
+        sec = SecretarySession("kd-c", data_dir=tmp_dir)
+        root = os.path.join(tmp_dir, "build")
+        assert sec._exceeds_kept_skip_depth(root, _OrderedRoots([root])) is False
+        assert sec._exceeds_kept_skip_depth(
+            os.path.join(root, "a", "b"), _OrderedRoots([root])) is False
+        assert sec._exceeds_kept_skip_depth(
+            os.path.join(root, "a", "b", "c"), _OrderedRoots([root])) is True
+        sec.delete_session()
+
+    def test_nested_kept_roots_invariant_holds_end_to_end(self, tmp_dir):
+        """判别性端到端：嵌套保留根（``build/decoy.json`` 使 ``build`` 入列、
+        受害者卡在 ``build/dist/x/y`` 使 ``build/dist`` 入列）+ 双通道 ``.ref``
+        删除 → 硬断言不变量「存活交接卡 → 其状态卡必须存在」保持。"""
+        import json
+
+        os.makedirs(os.path.join(tmp_dir, "build"), exist_ok=True)
+        with open(os.path.join(tmp_dir, "build", "decoy.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"id": "decoy", "source_unit": "x", "target_unit": "y",
+                       "state_card_id": "ho-nonexistent"}, f)
+        base = os.path.join(tmp_dir, "build", "dist", "x", "y")
+        os.makedirs(base, exist_ok=True)
+        bus = HandoffBus(data_dir=base, state_root=tmp_dir)
+        victim = bus.create_handoff("ua", "ub", "嵌套保留根意图", "ctx",
+                                    auto_state_card=True)
+        for name in ("handoff-refs", ".handoff-refs"):
+            ref = os.path.join(tmp_dir, name, f"{victim.id}.ref")
+            if os.path.isfile(ref):
+                os.remove(ref)   # 模拟旧版遗留 / 外部删除
+
+        sec = SecretarySession("kd-d", data_dir=tmp_dir)
+        own = sec.create_handoff("ua", "ub", "嵌套保留根意图", "ctx")
+        assert own.state_card_id == victim.state_card_id, \
+            "前置：同源/同目标/同意图须共享同一 ho-* 卡"
+        sec.delete_session()
+
+        card_alive = os.path.exists(
+            os.path.join(bus.data_dir, f"{victim.id}.json"))
+        ho_alive = os.path.exists(os.path.join(
+            tmp_dir, "state", f"{victim.state_card_id}.json"))
+        assert card_alive, "前置：受害者交接卡须在盘上"
+        assert ho_alive, (
+            f"🔴A 回归：嵌套保留根下存活交接卡引用须可见 → 共享 ho-* 卡不得"
+            f"被误删（card_alive={card_alive}, ho_alive={ho_alive}）")
+
+    def test_nested_kept_roots_invariant_across_hash_seeds(self, tmp_dir):
+        """多 seed 断言（评审要求「固定路径 + 多 seed」）：以子进程逐一设置
+        ``PYTHONHASHSEED``，同一固定布局下不变量须**恒**保持（原实现在 10
+        seed 中 6 破坏）。"""
+        import subprocess
+        import sys
+
+        script = (
+            "import json, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from secretary.handoff import HandoffBus\n"
+            "from secretary.session import SecretarySession\n"
+            "root = sys.argv[2]\n"
+            "os.makedirs(os.path.join(root, 'build'), exist_ok=True)\n"
+            "json.dump({'id':'decoy','source_unit':'x','target_unit':'y',"
+            "'state_card_id':'ho-nonexistent'},"
+            " open(os.path.join(root,'build','decoy.json'),'w'))\n"
+            "base = os.path.join(root,'build','dist','x','y')\n"
+            "os.makedirs(base, exist_ok=True)\n"
+            "bus = HandoffBus(data_dir=base, state_root=root)\n"
+            "v = bus.create_handoff('ua','ub','intent','ctx',"
+            "auto_state_card=True)\n"
+            "for n in ('handoff-refs','.handoff-refs'):\n"
+            "    p = os.path.join(root, n, v.id + '.ref')\n"
+            "    os.path.isfile(p) and os.remove(p)\n"
+            "sec = SecretarySession('kd-e', data_dir=root)\n"
+            "sec.create_handoff('ua','ub','intent','ctx')\n"
+            "sec.delete_session()\n"
+            "print(int(os.path.exists("
+            "os.path.join(root,'state', v.state_card_id + '.json'))))\n"
+        )
+        src = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "src"))
+        for seed in ("0", "1", "2", "5"):
+            root = os.path.join(tmp_dir, f"seed-{seed}")
+            os.makedirs(root, exist_ok=True)
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            out = subprocess.run(
+                [sys.executable, "-c", script, src, root],
+                capture_output=True, text=True, env=env, timeout=120)
+            assert out.returncode == 0, (
+                f"seed={seed} 子进程失败：{out.stderr[-800:]}")
+            assert out.stdout.strip() == "1", (
+                f"seed={seed} 不变量破坏（共享 ho-* 卡被误删）："
+                f"stdout={out.stdout!r}")
+
+
+# ------------------------------------------------------------------
+# 🔴B 复评回归：隐藏目录不得按裸名剪枝（根内隐藏 data_dir）
+# ------------------------------------------------------------------
+
+HIDDEN_DATA_DIR_NAMES = [".staging", ".cache", ".data", ".build"]
+HIDDEN_TRIGGERS = ("legacy_no_registry", "registry_failed",
+                   "ref_externally_removed")
+
+
+class TestHiddenDirVisibility:
+    """🔴B（评审复评 head ``7300b22``）：隐藏目录原为 ``if name.startswith(".")``
+    **裸名直接剪枝**，与名单目录"按裸名判定"同根因。根内隐藏 ``data_dir``
+    （``.staging``/``.cache``/``.data``/``.build``）+ 双通道登记不可用时，其内
+    真实卡不可见 → 共享 ``ho-*`` 卡被误删（实测 4/4 破坏）。
+
+    修复后与名单目录同一口径（形状判定后再剪）；``.git`` 等真无关目录仍被剪枝。
+    """
+
+    def _case(self, root, dirname, trigger):
+        base = os.path.join(root, dirname)
+        os.makedirs(base, exist_ok=True)
+        if trigger == "registry_failed":
+            # 占位主通道（备通道仍可用）；触发面由 trigger 决定
+            with open(os.path.join(root, "handoff-refs"), "w",
+                      encoding="utf-8") as f:
+                f.write("x")
+        bus = HandoffBus(data_dir=base, state_root=root)
+        victim = bus.create_handoff("ua", "ub", "隐藏名意图", "ctx",
+                                    auto_state_card=True)
+        if trigger in ("legacy_no_registry", "ref_externally_removed"):
+            for name in ("handoff-refs", ".handoff-refs"):
+                ref = os.path.join(root, name, f"{victim.id}.ref")
+                if os.path.isfile(ref):
+                    os.remove(ref)
+        sec = SecretarySession("hd-a", data_dir=root)
+        own = sec.create_handoff("ua", "ub", "隐藏名意图", "ctx")
+        assert own.state_card_id == victim.state_card_id, \
+            "前置：须共享同一 ho-* 卡"
+        sec.delete_session()
+        card_alive = os.path.exists(
+            os.path.join(bus.data_dir, f"{victim.id}.json"))
+        ho_alive = os.path.exists(os.path.join(
+            root, "state", f"{victim.state_card_id}.json"))
+        assert card_alive, "前置：受害者交接卡须在盘上"
+        assert ho_alive, (
+            f"🔴B 回归：根内隐藏 data_dir {dirname!r}/{trigger} 下存活交接卡"
+            f"引用须可见 → 共享卡不得被误删"
+            f"（card_alive={card_alive}, ho_alive={ho_alive}）")
+
+    @pytest.mark.parametrize("dirname", HIDDEN_DATA_DIR_NAMES)
+    @pytest.mark.parametrize("trigger", HIDDEN_TRIGGERS)
+    def test_hidden_named_data_dir_keeps_live_reference(
+            self, tmp_dir, dirname, trigger):
+        self._case(tmp_dir, dirname, trigger)
+
+    def test_non_hidden_named_data_dir_control(self, tmp_dir):
+        """判别对照（须通过）：非隐藏普通名 ``queue`` 不受影响。"""
+        self._case(tmp_dir, "queue", "legacy_no_registry")
+
+    def test_irrelevant_hidden_dir_still_pruned(self, tmp_dir):
+        """剪枝收益不退化（🔴B 验收口径）：``.git`` 等真无关隐藏目录内**无**
+        交接卡形状 JSON 时仍被剪枝——其内伪引用不得计入索引。"""
+        import json
+
+        git = os.path.join(tmp_dir, ".git", "objects")
+        os.makedirs(git, exist_ok=True)
+        for i in range(20):
+            with open(os.path.join(git, f"f{i}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"id": f"p{i}", "source_unit": "x",
+                           "target_unit": "y",
+                           "state_card_id": f"fake-{i}"}, f)
+        sec = SecretarySession("hd-b", data_dir=tmp_dir)
+        index = sec._build_ho_reference_index()
+        assert not any(k.startswith("fake-") for k in index), \
+            "无交接卡形状 JSON 的隐藏目录须仍被剪枝（伪引用不得计入）"
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 🟡E 边界锁定：浅扫条目预算耗尽（已知边界，非缺陷）
+# ------------------------------------------------------------------
+
+class TestScanBudgetBoundary:
+    """🟡E：形状判定为**有界**浅扫（深度 ≤ 3、条目 ≤ 2000）。条目预算耗尽
+    后判定 False → 该子树内真实卡不可见（已知边界，见契约文档 §3/§4）。
+    本类以**确定性**口径锁定该边界：预算为 0 必不可见、预算充足必可见。"""
+
+    def test_budget_zero_yields_false(self, tmp_dir):
+        import json
+
+        d = os.path.join(tmp_dir, "node_modules")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "card.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "c", "source_unit": "x", "target_unit": "y",
+                       "state_card_id": "ho-x"}, f)
+        sec = SecretarySession("bd-a", data_dir=tmp_dir)
+        assert sec._dir_holds_handoff_data(d, max_entries=2000) is True, \
+            "前置：预算充足时须命中真实卡"
+        assert sec._dir_holds_handoff_data(d, max_entries=0) is False, \
+            "条目预算耗尽 → 判定 False → 不可见（已知边界，🟡E 文档化）"
+        sec.delete_session()
+
+    def test_budget_covers_all_entries_yields_true(self, tmp_dir):
+        """预算 ≥ 条目总数 → 全量访问 → 必命中（预算语义为「访问条目上限」）。"""
+        import json
+
+        d = os.path.join(tmp_dir, "node_modules")
+        os.makedirs(d, exist_ok=True)
+        for i in range(20):
+            with open(os.path.join(d, f"junk{i}.json"), "w",
+                      encoding="utf-8") as f:
+                f.write("{}")
+        with open(os.path.join(d, "card.json"), "w", encoding="utf-8") as f:
+            json.dump({"id": "c", "source_unit": "x", "target_unit": "y",
+                       "state_card_id": "ho-x"}, f)
+        sec = SecretarySession("bd-b", data_dir=tmp_dir)
+        assert sec._dir_holds_handoff_data(d, max_entries=1000) is True
+        sec.delete_session()
+
+    def test_large_junk_tree_scan_is_bounded_no_exception(self, tmp_dir):
+        """规模边界：2500 个兄弟目录（> 默认预算）时扫描仍**有界完成**、
+        不抛异常、不退化（预算耗尽即止步）。"""
+        import time
+
+        nm = os.path.join(tmp_dir, "node_modules")
+        for i in range(2500):
+            os.makedirs(os.path.join(nm, f"pkg{i}"), exist_ok=True)
+        sec = SecretarySession("bd-c", data_dir=tmp_dir)
+        start = time.time()
+        index = sec._build_ho_reference_index()
+        elapsed = time.time() - start
+        assert isinstance(index, dict)
+        assert elapsed < 10.0, f"扫描须有界（实测 {elapsed:.2f}s）"
+        sec.delete_session()
+
+
+# ------------------------------------------------------------------
+# 🟡C 边界锁定：fail-fast 回滚后 ho-* 关联卡为已知残骸
+# ------------------------------------------------------------------
+
+class TestFailFastRollbackBoundary:
+    """🟡C：双通道登记全失败 + 根外布局 → ``create_handoff`` fail-fast 回滚
+    **交接卡**；但此前已建的 ``ho-*`` 关联卡（``state/``）**不在回滚面内**
+    → 留盘残骸，且无台账/引用可达 → 后续 ``delete_session`` 不回收。
+
+    定级 🟡（反向资源泄漏，不破坏不变量；且该 ho-* 卡可能是**既有共享卡**
+    ——hash 复用，回滚前须判"是否本次新建"，属行为变更）。本轮**范围冻结**
+    （总师 §7.1），故**不**改行为，仅以确定性用例锁定该已知边界 + 文档声明。
+    """
+
+    def test_fail_fast_rolls_back_handoff_card(self, tmp_dir):
+        root = os.path.join(tmp_dir, "root")
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(outside, exist_ok=True)
+        for name in ("handoff-refs", ".handoff-refs"):
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        bus = HandoffBus(data_dir=outside, state_root=root)
+        with pytest.raises(OSError):
+            bus.create_handoff("ua", "ub", "fail-fast 意图", "ctx",
+                               auto_state_card=True)
+        assert os.listdir(outside) == [], \
+            "fail-fast 须回滚交接卡本体（不产生悬空引用）"
+
+    def test_fail_fast_leaves_ho_card_known_boundary(self, tmp_dir):
+        """已知边界锁定：fail-fast 后 ``state/`` 的 ``ho-*`` 卡 + ``.lock``
+        仍在盘上，且后续 ``delete_session`` 不回收（无台账、无引用）。
+        该断言若失败 → 行为已变（如 🟡C 被修复），须同步更新契约文档。"""
+        root = os.path.join(tmp_dir, "root")
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(outside, exist_ok=True)
+        for name in ("handoff-refs", ".handoff-refs"):
+            with open(os.path.join(root, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        bus = HandoffBus(data_dir=outside, state_root=root)
+        with pytest.raises(OSError):
+            bus.create_handoff("ua", "ub", "边界意图", "ctx",
+                               auto_state_card=True)
+
+        state_dir = os.path.join(root, "state")
+        leftovers = [n for n in os.listdir(state_dir)
+                     if n.startswith("ho-")]
+        assert leftovers, "已知边界：fail-fast 后 ho-* 关联卡残骸留盘（🟡C）"
+
+        SecretarySession("ff-a", data_dir=root).delete_session()
+        still = [n for n in os.listdir(state_dir) if n.startswith("ho-")]
+        assert still, (
+            "已知边界：残骸无台账/无引用可达 → 后续 delete_session 不回收"
+            "（🟡C，契约文档 §4 已声明）")

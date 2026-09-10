@@ -343,50 +343,69 @@ class SecretarySession:
 
         判定顺序：
         1. 保护子树（或其祖先）：**永不剪枝**——即使名字命中名单；
-        2. 名字命中 ``_SKIP_SCAN_DIRS``（含 ``.venv`` 这类带点名字）：**先做
+        2. 名字命中 ``_SKIP_SCAN_DIRS``（``build``/``node_modules``/``.venv``
+           等）**或为隐藏目录**（``.staging``/``.cache``/``.git`` 等）：**先做
            形状判定**（``_dir_holds_handoff_data``）——目录内实际存在交接卡
            形状的 JSON 则保留（引用必须可见），否则剪枝（保持原性能收益：
-           真重型目录如 ``node_modules`` 仍被跳过）。被保留的名单目录记入
-           ``kept_skip_dirs``——其内引用按"仅指向本根真实状态卡"过滤
-           （见 ``_build_ho_reference_index``），从而既不误剪真实/遗留卡，
-           又不让伪 JSON 阻塞回收；
-        3. 其他隐藏目录（``.git`` 等）：剪枝；
-        4. 常规数据目录：保留。
+           真重型目录如 ``node_modules``、真无关目录如 ``.git`` 仍被跳过）。
+           被保留的目录记入 ``kept_skip_dirs``——其内引用按"仅指向本根真实
+           状态卡"过滤（见 ``_build_ho_reference_index``），从而既不误剪
+           真实/遗留卡，又不让伪 JSON 阻塞回收；
+        3. 常规数据目录：保留。
+
+        🔴B 复评修复：隐藏目录原为**裸名直接剪枝**（``if name.startswith(".")``），
+        与名单目录"按裸名判定"同根因——根内隐藏 ``data_dir``（``.staging``/
+        ``.cache``/``.data``/``.build`` 等）内的真实卡不可见 → 共享卡被误删。
+        现与名单目录同一口径（形状判定后再剪），不再按裸名判定。
         """
         abspath = os.path.abspath(path)
         # 1) 保护子树及其祖先不剪枝
         for p in protected_dirs:
             if abspath == p or p.startswith(abspath + os.sep):
                 return True
-        # 2) 名单目录（含 `.venv` 这类"带点"名字）：形状判定后再定——
-        #    防"剪枝名单名承载真实/遗留交接卡"被误剪（P0-1，含 .venv）。
-        if name in _SKIP_SCAN_DIRS:
+        # 2) 名单目录（`build`/`node_modules`/`.venv` 等）**与全部隐藏目录**
+        #    （`.staging`/`.cache`/`.git` 等）：同一「形状判定后再剪」口径。
+        #    防"剪枝名 / 裸点前缀名承载真实/遗留交接卡"被误剪（P0-1；🔴B 复评：
+        #    原实现对隐藏目录**直接按裸名剪枝**，同根因未清——根内隐藏 data_dir
+        #    + 双通道登记不可用时，其内真实卡不可见 → 共享卡被误删、不变量破坏）。
+        #    `.git` 等真无关目录仍被剪枝（形状判定有界且经廉价预筛，无交接卡
+        #    形状 JSON 即剪），保留原性能收益。
+        if name in _SKIP_SCAN_DIRS or name.startswith("."):
             if self._dir_holds_handoff_data(path):
                 kept_skip_dirs.add(abspath)
                 return True
             return False
-        # 3) 其他隐藏目录剪枝（.git 等）
-        if name.startswith("."):
-            return False
-        # 4) 常规目录保留
+        # 3) 常规目录保留
         return True
 
     def _exceeds_kept_skip_depth(self, dirpath: str, kept_skip_dirs: set) -> bool:
         """``dirpath`` 是否已超出"保留的名单目录"子树的有界遍历深度。
 
-        防"名单目录内命中一张（伪）卡后，整棵 node_modules 被全树遍历"——
-        深度超过 ``_SKIP_DIR_PROBE_DEPTH`` 即止步（与形状判定同一上界）。
+        防"保留目录内命中一张（伪）卡后，整棵 node_modules / 隐藏树被全树
+        遍历"——深度超过 ``_SKIP_DIR_PROBE_DEPTH`` 即止步（与形状判定同一上界）。
+
+        **多根重叠（🔴A 复评修复）**：``dirpath`` 可同时落在多个保留根之下
+        （嵌套名单目录/隐藏目录各自入列），此时取**最小深度**判定——不得
+        取"首个前缀命中"（set 迭代顺序随哈希变化 → 非确定性破坏不变量）。
         """
         if not kept_skip_dirs:
             return False
         abspath = os.path.abspath(dirpath)
+        # 🔴A 复评修复：`kept_skip_dirs` 为 set，原实现「首个前缀命中即 return」
+        # 取的是**集合迭代顺序**的第一个前缀，而非最近根 → 当 `dirpath` 同时
+        # 落在多个保留根之下（如 `<root>/build` 与 `<root>/build/dist` 双双
+        # 因形状判定入列）时，深度上界判定随路径哈希（`PYTHONHASHSEED`）变化
+        # → 同一布局时而截断、时而放行 → 不变量「存活交接卡 → 其状态卡必须
+        # 存在」非确定性破坏。改为取**所有匹配根的最小深度**，去除顺序依赖。
+        best = None
         for r in kept_skip_dirs:
             if abspath == r:
                 return False
             if abspath.startswith(r + os.sep):
                 depth = len(abspath[len(r) + 1:].split(os.sep))
-                return depth >= _SKIP_DIR_PROBE_DEPTH
-        return False
+                if best is None or depth < best:
+                    best = depth
+        return best is not None and best >= _SKIP_DIR_PROBE_DEPTH
 
     @staticmethod
     def _under_any(path: str, roots: set) -> bool:

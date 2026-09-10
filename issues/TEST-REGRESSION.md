@@ -8,8 +8,10 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **237 项全部通过**（门面 90 项 + 独立探针 65 项；
-  底层模块回归 8 + 15 + 19 + 20 + 12 + 8）
+- 测试基线：全量 pytest **261 项全部通过**（门面 **114 项** = 90 + 24 复评第 5 轮判别性
+  回归，独立探针 65 项；底层模块回归 8 + 15 + 19 + 20 + 12 + 8）。历史口径：
+  `28ca7f6` 228（门面 88）/ `60e32ec` 230（门面 90）/ `bca4193` 237（门面 90）→
+  本轮 **261**（门面 114）。
 
 ---
 
@@ -613,3 +615,46 @@
   全量 237 passed；`compileall` OK。
 - 🟡 结转 3 项（🟡-1 / 🟡-3 / 🟡-5）：均 baseline 既有面或迁移面，**不阻断合并**，
   建议随 Issue #8 排期。
+
+---
+
+## 九、Issue #4 复评第 5 轮 · 🔴A / 🔴B 定点修复（head `7300b22` 打回）
+
+> 评审（架构·评审）在 `7300b22` 增量复评判 **不通过**（核心不变量在根内布局仍可破坏、
+> 且随 `PYTHONHASHSEED` 变化）。本角色按点定修法修复，遵守总师 §7.1 范围冻结
+> （不重构、不引新机制）。契约文档 §8 同步。
+
+### 🔴A 保留根多重重叠 → 深度截断顺序相关（`session.py::_exceeds_kept_skip_depth`）
+- **问题**：`kept_skip_dirs` 为 `set`，原实现「首个前缀命中即 `return`」取**集合迭代
+  顺序**的首个前缀而非最近根 → 嵌套保留根下深度上界判定随路径哈希漂移。
+- **修复**：取**所有匹配根的最小深度**（`abspath == r` 仍立即返 `False`）。
+- **怎么测**：固定布局（`<root>/build/decoy.json` 使 `build`/`build/dist` 双双入列 +
+  受害者卡 `<root>/build/dist/x/y` + 双通道 `.ref` 删除）× 多 seed →
+  不变量须**恒**保持（修复前 10 seed 中 6 破坏）。
+- **回归测试**：`TestKeptSkipDepthOrderIndependence`（5 项，修复前 3 项 FAIL）。
+
+### 🔴B 隐藏目录按裸名剪枝（`session.py::_keep_scan_dir`）
+- **问题**：隐藏目录走 `if name.startswith("."): return False`（**纯裸名剪枝**），
+  与名单目录"按裸名判定"同根因 → 根内隐藏 `data_dir`（`.staging`/`.cache`/`.data`/
+  `.build`）+ 双通道登记不可用时，其内真实卡不可见 → 共享卡被误删（实测 4/4 破坏）。
+- **修复**：隐藏目录并入名单分支，同一 `_dir_holds_handoff_data` 有界判定后再剪。
+- **怎么测**：4 隐藏名 × 3 触发（`legacy_no_registry` / `registry_failed` /
+  `ref_externally_removed`）+ 对照 `queue` + `.git` 剪枝收益 → 0 破坏、伪引用 0。
+- **回归测试**：`TestHiddenDirVisibility`（14 项，修复前 8 项 FAIL）。
+
+### 🟡C / 🟡D / 🟡E 口径更正（随本轮）
+- **🟡C fail-fast 回滚面**：**已知边界、声明不改行为**（范围冻结）——回滚交接卡本体，
+  已建 `ho-*` 卡留盘残骸、无台账可达 → 后续 `delete_session` 不回收。理由：该卡可能为
+  **既有共享卡**（hash 复用），回滚前须判"是否本次新建"（行为变更）。
+  回归：`TestFailFastRollbackBoundary`（2 项）锁定边界。
+- **🟡D 口径过度声明**：撤回「API 路径引用恒可见**无条件成立**」→ 改为**带边界表述**；
+  §5「根内卡无需迁移」补前置（深度 < 3 且条目预算未耗尽）。
+- **🟡E 条目预算**：§3/§4 补「`max_entries=2000` 耗尽 → 不可见」+「`os.scandir` 顺序
+  参与预算消耗、天然不确定」。回归：`TestScanBudgetBoundary`（3 项）。
+
+### 自测
+- 全量 `pytest -q`：**261 passed**（门面 114、独立探针 65）；`compileall` OK；
+  `flake8 --max-line-length=100`（两改动文件）**0 告警**。
+- 独立探针（本角色自写）：10-seed 矩阵 **0/10 破坏**；隐藏名 4×3 **0/12 破坏**；
+  剪枝收益不退化（`.git`/`node_modules`/`.venv` 伪引用 0、2000 目录索引 1.2ms）。
+
