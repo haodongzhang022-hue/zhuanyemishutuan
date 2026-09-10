@@ -227,76 +227,162 @@ class SecretarySession:
             raise
 
     def _load_ledger(self) -> None:
-        """会话实例启动时读取本会话归属台账，恢复跨实例所有权。"""
+        """会话实例启动时读取本会话归属台账，恢复跨实例所有权。
+
+        🔴#3 类型守卫：台账文件可能是**合法 JSON 但顶层非对象**（如 ``["x"]``）
+        或字段类型不符（``handoff_ids`` 非数组）。此类文件一律视为**空台账**，
+        不得因 ``data.get`` 触发裸 ``AttributeError`` 中断 ``delete_session``。
+        """
         path = self._ledger_path()
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
             return
-        for hid in data.get("handoff_ids", []) or []:
-            if hid not in self._owned_handoff_ids:
+        if not isinstance(data, dict):
+            # 非对象 JSON（数组/字符串/数字/布尔/null）→ 视为空台账，不崩
+            return
+        handoff_ids = data.get("handoff_ids")
+        for hid in handoff_ids if isinstance(handoff_ids, list) else []:
+            if isinstance(hid, str) and hid not in self._owned_handoff_ids:
                 self._owned_handoff_ids.append(hid)
-        for sid in data.get("state_card_ids", []) or []:
-            self._own_state_card(sid)
+        state_card_ids = data.get("state_card_ids")
+        for sid in state_card_ids if isinstance(state_card_ids, list) else []:
+            if isinstance(sid, str):
+                self._own_state_card(sid)
 
     def _owned_handoffs(self) -> List[str]:
         """汇总本会话需要清理的交接卡 ID（内存清单 ∪ 台账权威清单）。"""
         self._load_ledger()
         return list(self._owned_handoff_ids)
 
-    def _scan_ho_referencing_sessions(self, state_card_id: str) -> List[str]:
-        """扫描同数据根下的其他会话台账，找出仍"存活引用"该 ho-* 卡的会话。
+    @staticmethod
+    def _read_json_dict(path: str) -> Optional[dict]:
+        """读取 JSON 文件，仅当顶层为**对象**时返回，否则 None（🔴#3 守卫）。"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
-        存活引用判定（两个条件同时满足）：
-        1. 该会话台账 ``.session-<id>.owned`` 的 state_card_ids 含本 ho-* 卡 ID；
-        2. 该会话自身的 StateCard（``<state>/<id>.json``）仍存在——即该会话
-           尚未 delete_session，仍可能经交接卡读取这张共享 ho-* 卡。
+    def _build_ho_reference_index(
+        self,
+        exclude_handoff_ids: Optional[set] = None,
+    ) -> Dict[str, List[str]]:
+        """一次扫描建立 ``state_card_id -> 存活引用者标签`` 索引。
 
-        共享 ho-* 卡 ID = hash(source,target,intent)，同源/同目标/同意图的多个
-        会话共享同一张卡。因此删除前须确认没有其他存活会话仍引用它，否则会
-        造成另一会话的引用失效（P2-① 跨会话误删根因）。
+        存活引用来源 = **并集**（🔴#2 修复：不再只认归属台账）：
+
+        1. 同数据根下**其他存活会话**的归属台账
+           ``handoffs/.session-<id>.owned``：仅当该会话自身 StateCard
+           （``state/<id>.json``）仍存在（尚未 ``delete_session``）时计入；
+        2. 同数据根下**未删除交接卡** ``handoffs/*.json``（非隐藏文件）的
+           ``state_card_id`` 字段——覆盖不经 ``SecretarySession`` 门面、
+           因而**不落归属台账**的独立 ``HandoffBus(data_dir=…)`` 使用者。
+
+        引用者标签：会话引用记会话 ID；交接卡引用记 ``handoff:<card_id>``，
+        两类语义可区分。本会话自身台账/交接卡不计入——调用方
+        （``delete_session``）须**先撤销自身引用**再取本索引（🔴#1）。
+
+        一次遍历同时建立全量索引，删除路径不再"每张卡各扫一遍目录"，
+        复杂度由 O(卡数 × 台账数) 降为 O(台账数 + 卡数)。
+
+        Args:
+            exclude_handoff_ids: 额外排除的交接卡 ID（如本会话已认领但删除
+                失败的卡，避免自身残卡被误判为"他人的存活引用"）。
         """
-        referrers: List[str] = []
+        index: Dict[str, List[str]] = {}
         state_dir = self.state_manager.data_dir
         ho_dir = self.handoff_bus.data_dir
         if not os.path.isdir(ho_dir):
-            return referrers
-        prefix, suffix = ".session-", ".owned"
-        for f in os.listdir(ho_dir):
-            if not (f.startswith(prefix) and f.endswith(suffix)):
-                continue
-            other_sid = f[len(prefix):-len(suffix)]
-            if not other_sid or other_sid == self.session_id:
-                continue
-            # 会话自身已删除 → 其台账引用视为失效，不阻塞共享卡回收
-            if not os.path.exists(os.path.join(state_dir, f"{other_sid}.json")):
-                continue
-            try:
-                with open(os.path.join(ho_dir, f), "r",
-                          encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except (OSError, ValueError):
-                continue
-            if state_card_id in (data.get("state_card_ids") or []):
-                referrers.append(other_sid)
-        return referrers
+            return index
 
-    def _delete_ho_state_card_if_safe(self, state_card_id: str) -> bool:
+        def _add(scid, label: str) -> None:
+            if not isinstance(scid, str) or not scid:
+                return
+            bucket = index.setdefault(scid, [])
+            if label not in bucket:
+                bucket.append(label)
+
+        own_handoff_ids = set(self._owned_handoff_ids)
+        own_handoff_ids |= set(exclude_handoff_ids or ())
+        prefix, suffix = ".session-", ".owned"
+        for fname in os.listdir(ho_dir):
+            path = os.path.join(ho_dir, fname)
+            if not os.path.isfile(path):
+                continue
+            # 来源 1：其他会话归属台账（隐藏文件，后缀刻意非 .json）
+            if fname.startswith(prefix) and fname.endswith(suffix):
+                other_sid = fname[len(prefix):-len(suffix)]
+                if not other_sid or other_sid == self.session_id:
+                    continue
+                # 会话自身已删除 → 其台账引用失效，不阻塞共享卡回收
+                if not os.path.exists(
+                        os.path.join(state_dir, f"{other_sid}.json")):
+                    continue
+                data = self._read_json_dict(path)
+                if data is None:
+                    continue  # 🔴#3：非对象/损坏台账视为空台账
+                sids = data.get("state_card_ids")
+                if not isinstance(sids, list):
+                    continue
+                for scid in sids:
+                    _add(scid, other_sid)
+                continue
+            # 来源 2：未删除交接卡（非隐藏 .json）
+            if fname.startswith(".") or not fname.endswith(".json"):
+                continue
+            card_id = fname[:-5]
+            if card_id in own_handoff_ids:
+                continue  # 本会话自身引用，不计入
+            data = self._read_json_dict(path)
+            if data is None:
+                continue
+            _add(data.get("state_card_id"), f"handoff:{card_id}")
+        return index
+
+    def _ho_has_live_references(
+        self,
+        state_card_id: str,
+        reference_index: Optional[Dict[str, List[str]]] = None,
+    ) -> bool:
+        """共享 ho-* 卡是否仍被其他存活引用者引用（引用未清 → 不得删）。"""
+        if not state_card_id:
+            return False
+        index = (reference_index if reference_index is not None
+                 else self._build_ho_reference_index())
+        return bool(index.get(state_card_id))
+
+    def _scan_ho_referencing_sessions(self, state_card_id: str) -> List[str]:
+        """兼容包装：返回仍存活引用该 ho-* 卡的引用者标签列表。
+
+        标签语义与 ``_build_ho_reference_index`` 一致——会话引用为会话 ID，
+        交接卡引用为 ``handoff:<card_id>``（两类可区分）。空列表 = 引用已清、
+        可回收；调用方须**先撤销自身引用**再取（🔴#1）。
+        """
+        return list(self._build_ho_reference_index().get(state_card_id, []))
+
+    def _delete_ho_state_card_if_safe(
+        self,
+        state_card_id: str,
+        reference_index: Optional[Dict[str, List[str]]] = None,
+    ) -> bool:
         """删除一张 ho-* StateCard，删除前执行"存活引用检查"。
 
-        共享 ho-* 卡被同数据根下同源/同目标/同意图的多个会话共同引用。
-        只有确认**没有其他存活会话**仍引用它（引用已清）才允许物理删除；
-        引用未清不得删——否则另一会话持有的引用会失效（P2-①）。
+        🔴#1 前提：调用方须**先撤销本会话自身引用**（本会话交接卡 + 归属台账
+        + 本会话状态卡）再调用本方法；🔴#2 引用源为「其他存活会话台账 ∪
+        未删除交接卡 state_card_id」。仅当索引中无任何存活引用者（引用已清）
+        才物理删除；引用未清不得删——否则另一会话持有的引用会失效（P2-①）。
         """
         if not state_card_id:
             return False
-        if self._scan_ho_referencing_sessions(state_card_id):
-            # 仍有其他存活会话引用该共享卡 → 保留，供其继续使用
+        if self._ho_has_live_references(state_card_id, reference_index):
+            # 仍有其他存活引用者引用该共享卡 → 保留，供其继续使用
             return False
         try:
             return self.state_manager.delete_card(state_card_id)
-        except Exception:
+        except (OSError, ValueError):
             return False
 
     # ------------------------------------------------------------------
@@ -314,6 +400,17 @@ class SecretarySession:
         不残留 .lock / .owner.json / 空目录 / 跨实例交接卡 / 交接自动关联的
         孤儿状态卡。
 
+        **删除顺序（🔴#1 修复）**：先**撤销本会话自身引用**（本会话交接卡 →
+        本会话状态卡 → 归属台账），**再**判定共享 ho-* 卡的存活引用并回收。
+        原顺序（先判定、后撤销）在并发/交错删除下，两个引用者都会在各自判定
+        时看到对方"仍存活"而双双跳过删除，使共享卡连同 ``.lock`` 成为无人
+        回收的孤儿（TOCTOU）。前置撤销后，任一次判定都发生在自身引用清空
+        之后——若某次判定仍看到他人引用，则对方撤销必然更晚、其判定必然更晚，
+        由最后撤销者完成回收，不存在双跳过。
+
+        **引用源（🔴#2 修复）**：存活引用 = 其他存活会话归属台账 ∪ 未删除
+        交接卡的 ``state_card_id``（覆盖不落台账的独立 ``HandoffBus`` 使用者）。
+
         **返回值语义（P2-③ 统一）**：返回「清理前本会话状态卡是否存在」，
         与 ``StateManager.delete_card`` 完全一致——
         - 状态卡存在 → 已删除，返回 ``True``（清理完成）；
@@ -321,30 +418,26 @@ class SecretarySession:
           清理全部伴生残留，但返回 ``False``（本会话已不存在）。
         返回值不代表"清理是否发生"，只代表"清理前会话是否仍存在"。
         """
-        # 1) 清理本会话"创建/认领过"的交接卡——含上一实例创建、本实例据台账
-        #    恢复认领的卡（跨实例不留残余）
-        for hid in self._owned_handoffs():
+        # 0) 先快照待回收清单（后续清空前取用）。注意 _owned_handoffs() 会
+        #    顺带 _load_ledger() 补齐跨实例台账，须先调用再快照 ho-* 卡清单。
+        owned_handoffs = list(self._owned_handoffs())
+        ho_cards = list(self._owned_state_card_ids)
+
+        # 1) 撤销自身引用之一：删除本会话"创建/认领过"的交接卡——含上一实例
+        #    创建、本实例据台账恢复认领的卡（跨实例不留残余）
+        for hid in owned_handoffs:
             try:
                 self.handoff_bus.delete(hid)
-            except Exception:
+            except OSError:
                 pass
         self._owned_handoff_ids.clear()
 
-        # 2) 清理交接卡自动关联的 ho-* StateCard（随 data_dir/state 收敛，随卡
-        #    删除连带 .lock 一并回收）。ho-* 卡 ID = hash(source,target,intent)，
-        #    同源/同目标/同意图的多个会话共享同一张卡——删除前先做"存活引用
-        #    检查"：仍有其他存活会话引用时不得删（P2-① 共享卡跨会话误删根因）。
-        for sid in list(self._owned_state_card_ids):
-            self._delete_ho_state_card_if_safe(sid)
-        self._owned_state_card_ids.clear()
-
-        # 3) 清理本会话状态卡（连带 .lock / .owner.json 伴生残留）。
-        #    ok = delete_card 返回"清理前状态卡是否存在"，即本 delete_session
-        #    的返回值（本会话是否曾被建立）。状态卡缺失但伴生残留时 delete_card
-        #    仍会幂等清理残留、返回 False。
+        # 2) 撤销自身引用之二：清理本会话状态卡（连带 .lock / .owner.json
+        #    伴生残留）。**须在存活判定之前完成**（🔴#1）。ok = delete_card
+        #    返回"清理前状态卡是否存在"，即本 delete_session 的返回值。
         ok = self.state_manager.delete_card(self.session_id)
 
-        # 4) 删除本会话归属台账（台账本身也是本会话数据的一部分）
+        # 3) 撤销自身引用之三：删除本会话归属台账（台账亦属本会话数据）
         try:
             ledger_path = self._ledger_path()
             if os.path.exists(ledger_path):
@@ -352,10 +445,18 @@ class SecretarySession:
         except OSError:
             pass
 
+        # 4) 自身引用已全部撤销 → 一次扫描建立存活引用索引，回收已无引用的
+        #    共享 ho-* 卡（引用未清不得删：P2-①；顺序 🔴#1 / 引用源 🔴#2）
+        reference_index = self._build_ho_reference_index(
+            exclude_handoff_ids=set(owned_handoffs))
+        for sid in ho_cards:
+            self._delete_ho_state_card_if_safe(sid, reference_index)
+        self._owned_state_card_ids.clear()
+
         # 5) 清理本会话的原文归档（并回收 <content>/<session>/ 空子目录）
         try:
             self.archive.delete_session(self.session_id)
-        except Exception:
+        except (OSError, ValueError):
             pass
         return ok
 

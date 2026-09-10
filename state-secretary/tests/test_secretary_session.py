@@ -658,3 +658,232 @@ class TestDeleteSessionReturnSemantics:
         assert not os.path.exists(lock_path), ".lock 残留应被一并清理"
         assert not os.path.exists(owner_path), ".owner.json 残留应被一并清理"
         assert sec.get_card() is None
+
+
+# ------------------------------------------------------------------
+# P2-① 复评回归（Issue #4 / b0ac532 打回）：🔴#1–#3
+# 🔴#1 判定与撤销自身引用顺序颠倒 → 并发下双跳过 → 共享卡孤儿（TOCTOU）
+# 🔴#2 引用来源仅认台账 → 独立 HandoffBus 使用者的引用对扫描不可见
+# 🔴#3 台账非 dict（如数组）→ 裸 AttributeError 中断 delete_session 并留残留
+# ------------------------------------------------------------------
+
+class TestSharedHoCardConcurrentReclaim:
+    """🔴#1：撤销自身引用须前置到存活判定之前，并发/交错删除不留孤儿。"""
+
+    @staticmethod
+    def _barrier_aligned_round(tmp_root):
+        """把两次存活判定用屏障对齐，令"判定先于撤销"的旧顺序必然双跳过。
+
+        返回 (共享 ho-* 卡 ID, 状态卡目录, 删除线程异常列表)。
+        """
+        import threading
+
+        sec_a = SecretarySession("cc-a", data_dir=tmp_root)
+        ho_a = sec_a.create_handoff("team-x", "team-y", "并发同意图", "A ctx")
+        sec_b = SecretarySession("cc-b", data_dir=tmp_root)
+        ho_b = sec_b.create_handoff("team-x", "team-y", "并发同意图", "B ctx")
+        assert ho_a.state_card_id == ho_b.state_card_id, "前置：应共享同一 ho-* 卡"
+
+        state_dir = sec_a.state_manager.data_dir
+        barrier = threading.Barrier(2, timeout=5)
+        # 版本无关：新实现走一次扫描索引，旧实现走逐卡扫描包装——两者都在
+        # "判定存活引用"的时机被屏障对齐，旧顺序下必然双跳过（TOCTOU）。
+        hook = ("_build_ho_reference_index"
+                if hasattr(SecretarySession, "_build_ho_reference_index")
+                else "_scan_ho_referencing_sessions")
+        original = getattr(SecretarySession, hook)
+
+        def aligned(self, *args, **kwargs):
+            result = original(self, *args, **kwargs)
+            # 两次判定在此对齐：旧顺序下双方各自仍看到对方存活 → 双跳过
+            try:
+                barrier.wait()
+            except Exception:
+                pass
+            return result
+
+        setattr(SecretarySession, hook, aligned)
+        errors = []
+
+        def _run(sec):
+            try:
+                sec.delete_session()
+            except Exception as exc:  # noqa: BLE001 - 测试记录后断言
+                errors.append(exc)
+
+        t1 = threading.Thread(target=_run, args=(sec_a,))
+        t2 = threading.Thread(target=_run, args=(sec_b,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        setattr(SecretarySession, hook, original)
+        return ho_a.state_card_id, state_dir, errors
+
+    def test_barrier_aligned_concurrent_delete_no_orphan(self, tmp_dir):
+        """屏障对齐的并发删除：共享 ho-* 卡 + .lock 必须被最后撤销者回收。"""
+        sid, state_dir, errors = self._barrier_aligned_round(tmp_dir)
+        assert errors == [], f"并发删除不应抛异常: {errors}"
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "并发删除后共享 ho-* 卡不应成为无人回收的孤儿"
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.lock")), \
+            "共享 ho-* 卡的 .lock 不应残留"
+        assert not os.path.exists(
+            os.path.join(state_dir, f"{sid}.owner.json")), \
+            "共享 ho-* 卡的 .owner.json 不应残留"
+        assert not os.path.exists(os.path.join(state_dir, "cc-a.json"))
+        assert not os.path.exists(os.path.join(state_dir, "cc-b.json"))
+
+    def test_repeated_concurrent_delete_no_leak(self, tmp_dir):
+        """多轮屏障对齐并发删除，泄漏计数必须为 0（原实现 27/30 泄漏）。"""
+        leaks = 0
+        rounds = 12
+        for i in range(rounds):
+            root = os.path.join(tmp_dir, f"round-{i}")
+            os.makedirs(root)
+            sid, state_dir, errors = self._barrier_aligned_round(root)
+            assert errors == [], f"第 {i} 轮并发删除抛异常: {errors}"
+            if os.path.exists(os.path.join(state_dir, f"{sid}.json")):
+                leaks += 1
+        assert leaks == 0, f"{rounds} 轮并发删除泄漏 {leaks} 次，应为 0"
+
+
+class TestSharedHoCardIndependentBusReference:
+    """🔴#2：独立 HandoffBus 使用者（不落台账）的引用须被计入存活引用源。"""
+
+    def test_standalone_bus_reference_blocks_shared_ho_delete(self, tmp_dir):
+        """独立 HandoffBus 与秘书会话共享同源/同目标/同意图 ho-* 卡：
+        秘书 delete_session 后共享卡须保留（独立使用者仍引用）。"""
+        from secretary.handoff import HandoffBus
+
+        # 独立使用者：不经 SecretarySession，故不落归属台账
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"))
+        ho_std = bus.create_handoff(
+            "team-x", "team-y", "同一意图", "独立上下文", auto_state_card=True)
+
+        sec = SecretarySession("ind-a", data_dir=tmp_dir)
+        ho_sec = sec.create_handoff("team-x", "team-y", "同一意图", "秘书上下文")
+        assert ho_std.state_card_id == ho_sec.state_card_id, \
+            "前置：同源/同目标/同意图应共享同一 ho-* 卡"
+        sid = ho_sec.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        sec.delete_session()
+
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "独立 HandoffBus 使用者仍引用 → 共享卡不得被删（引用失效）"
+        assert os.path.exists(
+            os.path.join(bus.data_dir, f"{ho_std.id}.json")), \
+            "独立使用者的交接卡不得被秘书删除"
+        # 秘书自身数据已清
+        assert not os.path.exists(os.path.join(state_dir, "ind-a.json"))
+        assert not os.path.exists(
+            os.path.join(sec.handoff_bus.data_dir, ".session-ind-a.owned"))
+
+    def test_standalone_reference_released_then_card_reclaimed(self, tmp_dir):
+        """独立使用者删除自己的交接卡后引用清空，共享卡可被回收（无孤儿）。"""
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"))
+        ho_std = bus.create_handoff(
+            "team-x", "team-y", "释放意图", "独立上下文", auto_state_card=True)
+        sec = SecretarySession("ind-b", data_dir=tmp_dir)
+        ho_sec = sec.create_handoff("team-x", "team-y", "释放意图", "秘书上下文")
+        sid = ho_sec.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        sec.delete_session()
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "前置：独立引用未清，共享卡保留"
+
+        # 独立使用者删除自己的交接卡 → 引用清空
+        bus.delete(ho_std.id)
+
+        # 最后一个秘书侧引用者（新会话实例）回收共享卡
+        reclaim = SecretarySession("ind-b2", data_dir=tmp_dir)
+        index = reclaim._build_ho_reference_index()
+        assert not index.get(sid), \
+            "独立交接卡删除后不应再有存活引用"
+        assert reclaim._delete_ho_state_card_if_safe(sid, index) is True
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "引用清空后共享卡应可回收"
+        reclaim.delete_session()
+
+
+class TestLedgerMalformedRobustness:
+    """🔴#3：台账非 dict（合法 JSON 但非对象）不得中断 delete_session 或构造。"""
+
+    def test_other_session_malformed_ledger_does_not_break_delete(self, tmp_dir):
+        """同根其他会话台账为数组：delete_session 不抛裸异常且回收完全。"""
+        import json
+
+        SecretarySession("bad", data_dir=tmp_dir)  # 存活会话（有状态卡）
+        sec = SecretarySession("mal-a", data_dir=tmp_dir)
+        ho_dir = sec.handoff_bus.data_dir
+        state_dir = sec.state_manager.data_dir
+        with open(os.path.join(ho_dir, ".session-bad.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump(["x"], f)  # 合法 JSON、非对象
+
+        ho = sec.create_handoff("t-a", "t-b", "非法台账意图", "ctx")
+        ret = sec.delete_session()  # 旧实现此处抛 AttributeError
+
+        assert ret is True, "状态卡存在时应返回 True"
+        assert not os.path.exists(os.path.join(state_dir, "mal-a.json")), \
+            "本会话状态卡须回收"
+        assert not os.path.exists(
+            os.path.join(ho_dir, ".session-mal-a.owned")), "本会话台账须回收"
+        assert not os.path.exists(
+            os.path.join(state_dir, f"{ho.state_card_id}.json")), \
+            "无存活引用的 ho-* 卡须回收（不得因非法台账中断而残留）"
+
+    def test_own_malformed_ledger_constructor_and_delete_robust(self, tmp_dir):
+        """本会话自身台账为数组：构造不崩、delete_session 幂等清理完全。"""
+        import json
+
+        ho_dir = os.path.join(tmp_dir, "handoffs")
+        os.makedirs(ho_dir, exist_ok=True)
+        with open(os.path.join(ho_dir, ".session-crash.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump(["y"], f)  # 旧实现在 _load_ledger 抛 AttributeError
+
+        sec = SecretarySession("crash", data_dir=tmp_dir)  # 不抛异常
+        assert sec._owned_handoffs() == [], "非法台账应视为空台账"
+        state_dir = sec.state_manager.data_dir
+        sec.delete_session()
+        assert not os.path.exists(os.path.join(state_dir, "crash.json"))
+
+    def test_malformed_field_types_treated_as_empty(self, tmp_dir):
+        """handoff_ids/state_card_ids 字段类型不符（字符串/数字）视为空，不崩。"""
+        import json
+
+        ho_dir = os.path.join(tmp_dir, "handoffs")
+        os.makedirs(ho_dir, exist_ok=True)
+        with open(os.path.join(ho_dir, ".session-weird.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"handoff_ids": "not-a-list",
+                       "state_card_ids": 42}, f)
+
+        sec = SecretarySession("weird", data_dir=tmp_dir)
+        assert sec._owned_handoffs() == []
+        index = sec._build_ho_reference_index()
+        assert index == {} or all(v for v in index.values())
+        sec.delete_session()
+
+    def test_reference_index_single_scan_multi_card(self, tmp_dir):
+        """一次扫描建立 state_card_id → 引用者集合索引（O(台账+卡) 而非逐卡扫）。"""
+        sec_a = SecretarySession("idx-a", data_dir=tmp_dir)
+        ho_a = sec_a.create_handoff("s-a", "t-a", "意图A", "ctx")
+        sec_b = SecretarySession("idx-b", data_dir=tmp_dir)
+        ho_b = sec_b.create_handoff("s-b", "t-b", "意图B", "ctx")
+
+        sec_c = SecretarySession("idx-c", data_dir=tmp_dir)
+        index = sec_c._build_ho_reference_index()
+        # 索引同时覆盖两张卡，且标签为会话 ID / handoff:<id> 两类语义
+        assert ho_a.state_card_id in index
+        assert ho_b.state_card_id in index
+        assert "idx-a" in index[ho_a.state_card_id]
+        assert f"handoff:{ho_a.id}" in index[ho_a.state_card_id]
+        sec_c.delete_session()
+        sec_a.delete_session()
+        sec_b.delete_session()
