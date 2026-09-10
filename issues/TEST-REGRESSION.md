@@ -54,6 +54,7 @@
 ### 🟡 修复 #5 — 数据根分裂
 - **问题**：归档/交接默认落 `<cwd>/data/…`，出现双 `data` 嵌套，随 cwd 漂移。
 - **修复**：`data_dir` 统一收敛 `state/ content/ handoffs/` 三子目录，消除双嵌套。
+  （后续 🔴#4 新增 state 根级引用登记 `handoff-refs/`，数据根子目录增至 4 个。）
 - **怎么测**：显式传 `data_dir=…/state` 时，归档落 `…/state/content`、交接落 `…/state/handoffs`，无 cwd 孤儿、无双 `data`。
 - **回归测试**：`TestDataRootAndCleanup.test_single_data_root` / `test_data_root_has_no_double_data`
 
@@ -197,6 +198,22 @@
   易被误提交。补齐后与既有三子目录忽略口径一致。
 - **测试基线**：仍 **137 项**（🟡C 仅加强既有断言、未新增用例）；`compileall` 通过。
 
+### 🟡 修复 #I — 复评 `042e7e6` 三项结转项收口（PR #7 · 收口轮）
+> 评审对象 `042e7e6`。评审判定 🔴 清零、`merge` 放行，但如实指出 3 项**结转未收口**
+> （非本轮 diff、非阻塞）：🟡C 措辞（`bb9df61` 已收口）、`.gitignore`（`bb9df61` 已收口）、
+> `handoff.py` 模块注释「三子目录」未含 `handoff-refs/`；另有 🟡A/🟡B/🟡D 契约边界待总师裁定。
+- **`handoff.py` 模块注释同步**（`handoff.py:29/51`）：原写「SecretarySession **三子目录**
+  （state/ content/ handoffs/）」，未含 🔴#4 引入的 `handoff-refs/` 登记目录 → 更正为
+  「数据根**四子目录**（state/ content/ handoffs/ handoff-refs/）」；
+  `SecretarySession.__init__` docstring 的 `data_dir` 说明同步补「交接引用登记」。
+  **行为零变更**（纯注释/docstring）。
+- **契约文档落地**：新增 `docs/design/state-secretary-handoff-visibility.md`——冻结核心契约
+  （扫描界 / 引用源并集 / 登记生命周期 / 自身残卡不变量 / 回收语义），并把 🟡A（剪枝歧义名）/
+  🟡B（形状校验收紧必含 `id`）/ 🟡D（旧版根外卡升级路径）的**待裁定口径 + 两选项**成文，
+  供总师裁定；`_build_ho_reference_index` docstring 指向该文档。
+- **🟡A/🟡B/🟡D 登记后续 Issue**：**Issue #8**（P2-④ 交接卡引用可见性契约边界）。
+- **测试基线**：仍 **137 项**（本轮零新增用例，仅注释/文档）；`compileall` 通过。
+
 ## 三、可复现缺陷记录（P2 待办）
 
 评审/测试接力中发现、**非阻塞合并**的 P2 边界问题，已建 Issue 跟踪。
@@ -206,6 +223,7 @@
 | ① | 共享 ho-* 卡跨会话误删，另一会话引用失效 | Issue #4 | ✅ 已修复（#C + 复评 #D：顺序/引用源/类型守卫 + 复评 #E：扫描界提升到数据根 + state 根级引用登记，覆盖异交接目录/根外布局） |
 | ② | 独立 HandoffBus 未传 state_root 落 cwd 孤儿 | Issue #5 | ✅ 修复（本分支）：data_dir 显式时默认以父目录推导 state_root，ho-* 卡落 `<parent(data_dir)>/state`；未传 data_dir 保持历史退化兼容。回归测试见下（106 项全过） |
 | ③ | delete_card 返回值 docstring 语义漂移 | Issue #6 | ✅ 修复（本分支）：统一返回「状态卡是否存在」（.lock/.owner.json 伴生残留不影响返回值，幂等清理），delete_card/delete_session 两处 docstring 对齐。回归测试见下（115 项全过） |
+| ④ | 交接卡引用**可见性契约边界**（`_SKIP_SCAN_DIRS` 歧义名 / 形状校验收紧必含 `id` / 旧版根外卡升级路径） | Issue #8 | ⏳ **待总师裁定**：现状仅保证 `HandoffBus` API 写入路径（手写/遗留卡在歧义目录或缺 `id` 时不可见）；核心契约已冻结，口径详见 `docs/design/state-secretary-handoff-visibility.md` |
 
 > P2-② 新增回归测试：
 > - `test_standalone_handoff_explicit_data_dir_derives_state_root` — data_dir 显式 → ho-* 卡落父目录推导的 state/，无 cwd 孤儿

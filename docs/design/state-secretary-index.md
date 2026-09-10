@@ -14,6 +14,7 @@
 | `state-secretary-cache.md` | 缓存命中保障 + 稳定前缀 + 丢弃时机机制 |
 | `state-secretary-poc.md` | POC 验证方案（token 消耗与缓存命中 A/B） |
 | `state-secretary-module.md` | 落库新增独立模块划分建议（Q5） |
+| `state-secretary-handoff-visibility.md` | 交接卡引用可见性契约边界（草案 · 待总师裁定，Issue #8） |
 
 ## 2. 对 SKILL.state 论文的三层改进对照
 
@@ -60,6 +61,13 @@
 | cache.md | `state-secretary/src/secretary/context/assembler.py` |
 | poc.md | `state-secretary/poc/state_m9_benchmark.py` |
 | org.md + schema.md + cache.md | `state-secretary/src/secretary/session/session.py` — SecretarySession 门面 |
+
+## 5.1 契约边界（待裁定）
+
+交接卡引用的**可见性保证范围**（是否收窄为「仅保证 `HandoffBus` API 写入路径」）
+为 🟡 级契约边界，已登记 **Issue #8**，口径详见
+`state-secretary-handoff-visibility.md`。核心契约（扫描界 / 引用源并集 / 登记生命周期 /
+自身残卡不变量 / 回收语义）已冻结，不随该裁定变更。
 
 ## 6. 后续待开发项
 

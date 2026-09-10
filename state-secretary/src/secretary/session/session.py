@@ -95,7 +95,8 @@ class SecretarySession:
             unit_id: 所属行业单元
             role_name: 秘书角色名（默认 "secretary"）
             data_dir: 会话数据根目录（默认 <cwd>/data）。同一会话的状态卡、
-                原文归档、交接卡均收敛在此根之下派生（state/ content/ handoffs/）。
+                原文归档、交接卡、交接引用登记均收敛在此根之下派生
+                （state/ content/ handoffs/ handoff-refs/）。
             archive_root: 原文归档根目录（默认 <data_dir>/content）。
             static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
         """
@@ -343,7 +344,8 @@ class SecretarySession:
         **手写/外部遗留**的交接卡若缺 ``id`` 字段、或落在 ``_SKIP_SCAN_DIRS``
         所列目录内，则本索引不可见（既不阻塞回收、亦不被计入）——属已知
         覆盖边界，如需覆盖请改走 ``HandoffBus`` API（是否收窄为 API 路径保证
-        待总师裁定）。
+        待总师裁定，已登记 Issue #8 跟踪；口径详见
+        ``docs/design/state-secretary-handoff-visibility.md``）。
 
         **保守方向（不变量优先）**：凡扫描界内**实际存在**的交接卡/登记一律
         计入引用，**不做**"排除自身认领卡"处理。调用方（``delete_session``）
