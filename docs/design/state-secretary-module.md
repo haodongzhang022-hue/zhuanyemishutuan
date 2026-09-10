@@ -39,7 +39,7 @@ zhuanyemishutuan/            # 通用层
     │       └── session/     # 会话门面层（L3 秘书统一入口）
     │           ├── __init__.py
     │           └── session.py         # SecretarySession
-    ├── tests/               # 230 项 pytest 测试（全部通过）
+    ├── tests/               # 237 项 pytest 测试（全部通过）
     └── poc/                 # POC 脚本 + benchmark
         ├── m1_router.sh             # 单单元路由
         ├── m2_router_composite.sh   # 复合路由
@@ -61,7 +61,7 @@ zhuanyemishutuan/            # 通用层
 
 ## 4. 落地状态
 
-1. ✅ schema/fold/org 最小可运行代码 + 测试（230 项通过，门面 90 项（数据生命周期/评审回归））
+1. ✅ schema/fold/org 最小可运行代码 + 测试（237 项通过，门面 90 项 + 独立探针 65 项（数据生命周期/评审回归））
 1. ✅ SecretarySession 会话门面：L3 会话秘书统一入口（state+fold+context+handoff 整合）
 2. ✅ cache 稳定前缀策略（context/assembler.py 三层装配）
 3. ✅ poc/benchmark 可运行

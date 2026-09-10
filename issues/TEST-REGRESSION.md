@@ -471,3 +471,61 @@
 - **计数同步**：README / 设计索引 / module / 台账 4 处 210 → **228**
   （门面 87 → **88**，独立探针 41 → **58**）。
 - **基线**：`pytest -q` **228 passed**；`compileall` 通过。
+
+---
+
+## 七、Issue #4 复评第 4 轮 · 架构·测试独立复测（`60e32ec`）
+
+> 角色：架构·测试。对象：PR #7 head `60e32ec`（源分支 `auto/session-facade-9b95`）。
+> 触发：总师裁定回执要求「独立复跑并发矩阵 + 确认 210 passed 后放行；并请测试方
+> 补来源 2 独立判别 / 形状校验 / 台账存活断言（非阻塞）」。
+> 结论：🟢 **通过（放行合并）**，无 🔴 / 🟠；补 7 项判别性断言（含变异验证）。
+
+### 7.1 独立复跑（未采信单方结论）
+
+| 项 | 口径 | 基线 `cc7f4fd` | 收口 `73361ca` / `60e32ec` |
+|---|---|---|---|
+| 登记静默丢失 | 6 线程 × 300 轮 × 3 组 | **64 / 5400** | **0 / 5400** |
+| 并发矩阵 误抛 | 根外+根内 × 6 × 250 × 3 | **5** | **0** |
+| 并发矩阵 登记丢失 | 同上 | **234 / 9000** | **0 / 9000** |
+| 并发矩阵 静默悬空 | 同上 | 0 | 0 |
+| 全量 pytest | `cd state-secretary && pytest -q` | — | **237 passed** |
+| `compileall src` | — | — | OK |
+
+- 复跑脚本（本角色独立探针，**未随 PR 提交**以遵守「范围冻结」）：并发矩阵
+  （根外 / 根内 × 6 线程 × 250 轮 × 3 组，指标 = 误抛 / 登记丢失 / 不变量悬空）
+  与登记丢失探针（6 线程 × 300 轮 × 3 组）。
+- 基线 `cc7f4fd` 用 `git archive` 单独检出 `src` 运行，**未污染工作树**。
+- 总师表列「0–2/1500」与本角色实测「234/9000」同向（本角色轮数更大、复现率
+  更高），结论一致：**基线有确定性竞态，收口后清零**。
+
+### 7.2 补 7 项判别性断言（`tests/test_ho_ref_invariant_probes.py`，58 → 65 项）
+
+| 用例 | 断言 | 变异判别力（已验证） |
+|---|---|---|
+| `test_source2_alone_blocks_shared_ho_delete` | 清登记后仅靠**来源 2**（卡本体）不得误删共享卡 | 跳过非隐藏 `*.json` → **FAIL** |
+| `test_source2_released_then_card_reclaimed` | 反向对照：卡本体删除 → 可回收（防恒真） | — |
+| `test_large_context_card_visible_full_read` | `context` 200 KB，`state_card_id` 位于 64 KB 之后仍须可见 | `f.read()`→`f.read(65536)` → **FAIL** |
+| `test_ledger_dead_session_contributes_no_reference` | 死会话（状态卡已删）台账不得贡献引用 | 移除存活守卫 → **FAIL** |
+| `test_ledger_alive_session_contributes_reference` | 反向对照：存活会话台账须贡献引用（防恒真） | — |
+| `test_shape_requires_id_field` | 缺 `id` 的形状 JSON 不得计入（🟡B 边界固化） | `'"id"' in raw`→`True` → **FAIL** |
+| `test_shape_complete_card_counted` | 反向对照：四字段齐备须计入（防恒真） | — |
+
+- **变异测试矩阵**：4 个变异体（来源 2 移除 / 台账存活守卫移除 / 形状校解放宽 /
+  截断读取）各触发 **1–27 项 FAIL**，本实现上 **7/7 PASS** → 断言非恒真、有判别力。
+- 本组为**判别力补强**（覆盖既有用例未隔离的路径），非缺陷回补。
+
+### 7.3 信号灯
+
+- 🟢 **通过**：🔴1 / 🔴2 独立复跑清零；全量 237 passed；判别性断言补齐。
+- 🟠 **无**（原 🟡A/🟡B/🟡D 按总师裁定随 Issue #8，非本 PR 门禁；
+  已知深度边界见 §三 P2-④ 与契约文档 §3/§4）。
+- 🔴 **无**。
+
+### 7.4 测试计数同步
+
+- 全量 **237 项** = 8 + 15 + 65 + 90 + 19 + 20 + 12 + 8
+  （`batch_persist` / `content_archive` / 独立探针 / 门面 / `arbiter` /
+  `state_manager` / `ownership` / `state_tree`）。
+- 同步 `state-secretary/README.md`、`docs/design/state-secretary-index.md`、
+  `docs/design/state-secretary-module.md` 三处（230 → 237；独立探针 58 → 65）。

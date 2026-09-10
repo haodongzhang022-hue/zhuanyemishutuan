@@ -402,3 +402,185 @@ class TestScanGuardRegression:
         assert set(PRUNE_DIRS) == set(_IMPL_SKIP_SCAN_DIRS), (
             f"剪枝名单漂移：探针 {sorted(PRUNE_DIRS)} vs 实现 "
             f"{sorted(_IMPL_SKIP_SCAN_DIRS)}")
+
+
+# ----------------------------------------------------------------------
+# 判别力补强（架构·测试，Issue #4 复评第 4 轮 · 总师裁定回转要求）：
+# 「来源 2 独立判别 / 形状校验 / 台账存活」断言 + 截断读取。
+#
+# 既有用例多用「秘书门面建卡」（同时落台账 + 登记），来源 1/3 会掩盖来源 2
+# 是否真的生效；台账存活校验亦无独立判别。本组把每个来源**隔离为唯一可见
+# 路径**，并配反向对照证明断言非恒真。
+#
+# 四项断言均经**变异测试**验证判别力（每项 docstring 注明变异体）：
+# 在对应实现被"顺手删掉/放宽"的变异体上必然 FAIL，在本实现上 PASS。
+# ----------------------------------------------------------------------
+
+class TestReferenceSourceDiscriminative:
+    """来源 2（交接卡本体）与台账存活校验的**独立判别**。"""
+
+    def test_source2_alone_blocks_shared_ho_delete(self, roots):
+        """来源 2 独立可见：清掉 state 根级登记（来源 3）后，仅靠数据根下
+        未删除交接卡的 ``state_card_id`` 亦不得误删共享卡。
+
+        变异判别力：注入「跳过非隐藏 ``*.json``」（来源 2 失效）→ 本断言 FAIL。
+        """
+        root, _ = roots
+        bus = HandoffBus(data_dir=os.path.join(root, "queue"))  # state_root 推导=root
+        std = bus.create_handoff("src2-x", "src2-y", "来源2独立意图", "ctx",
+                                 auto_state_card=True)
+        # 清掉来源 3（主 + 备登记通道），使来源 2 成为唯一可见路径
+        for rd in (os.path.join(root, "handoff-refs"),
+                   os.path.join(root, ".handoff-refs")):
+            ref = os.path.join(rd, f"{std.id}.ref")
+            if os.path.exists(ref):
+                os.remove(ref)
+
+        sec = SecretarySession("src2-a", data_dir=root)
+        own = sec.create_handoff("src2-x", "src2-y", "来源2独立意图", "秘书ctx")
+        assert own.state_card_id == std.state_card_id, \
+            "前置：同源/同目标/同意图共享同一 ho-* 卡"
+        sid = own.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        sec.delete_session()
+
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "来源 2（数据根下未删除交接卡）应独立可见 → 共享卡不得被删"
+        assert os.path.exists(os.path.join(bus.data_dir, f"{std.id}.json")), \
+            "独立使用者的交接卡不得被秘书删除"
+
+    def test_source2_released_then_card_reclaimed(self, roots):
+        """反向对照（防恒真）：来源 2 的交接卡本体删除后引用清空 → 共享卡可回收。
+
+        与上一用例构成判别对：若索引对任何输入都"保留共享卡"，本断言 FAIL。
+        """
+        root, _ = roots
+        bus = HandoffBus(data_dir=os.path.join(root, "queue"))
+        std = bus.create_handoff("src2b-x", "src2b-y", "来源2回收意图", "ctx",
+                                 auto_state_card=True)
+        sec = SecretarySession("src2-b", data_dir=root)
+        own = sec.create_handoff("src2b-x", "src2b-y", "来源2回收意图", "秘书ctx")
+        sid = own.state_card_id
+        state_dir = sec.state_manager.data_dir
+
+        bus.delete(std.id)          # 卡本体 + 登记一并清 → 引用清空
+        sec.delete_session()
+
+        assert not os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "引用清空后共享卡应可回收（无孤儿）"
+
+    def test_large_context_card_visible_full_read(self, roots):
+        """截断读取判别：``context`` 远大于常见读缓冲（200 KB）时，
+        ``state_card_id`` 排在 context 之后——若实现截断读取（如
+        ``f.read(65536)``）则引用不可见 → 共享卡误删。
+
+        变异判别力：把 ``_maybe_handoff_card`` 的 ``raw = f.read()`` 改为
+        ``f.read(65536)`` → 本断言 FAIL（已验证）。
+        """
+        root, _ = roots
+        bus = HandoffBus(data_dir=os.path.join(root, "queue"))
+        std = bus.create_handoff("tr-x", "tr-y", "截断意图", "A" * 200000,
+                                 auto_state_card=True)
+        card_path = os.path.join(bus.data_dir, f"{std.id}.json")
+        with open(card_path, encoding="utf-8") as f:
+            raw = f.read()
+        assert raw.index('"state_card_id"') > 65536, \
+            "前置：state_card_id 须位于 64 KB 读缓冲之后（否则本断言无判别力）"
+        for rd in (os.path.join(root, "handoff-refs"),
+                   os.path.join(root, ".handoff-refs")):
+            ref = os.path.join(rd, f"{std.id}.ref")
+            if os.path.exists(ref):
+                os.remove(ref)
+
+        sec = SecretarySession("tr-a", data_dir=root)
+        own = sec.create_handoff("tr-x", "tr-y", "截断意图", "秘书ctx")
+        sid = own.state_card_id
+        state_dir = sec.state_manager.data_dir
+        sec.delete_session()
+
+        assert os.path.exists(os.path.join(state_dir, f"{sid}.json")), \
+            "大 context 交接卡须经**全文读取**可见 → 共享卡不得被删"
+
+    def test_ledger_dead_session_contributes_no_reference(self, roots):
+        """台账**存活校验**：归属台账对应的会话状态卡已不存在（会话已删）
+        → 其 ``state_card_ids`` 不得贡献引用（否则永久阻塞共享卡回收）。
+
+        变异判别力：移除 ``_build_ho_reference_index`` 中「该会话状态卡仍
+        存在」守卫 → 本断言 FAIL（已验证）。
+        """
+        root, _ = roots
+        sec = SecretarySession("live-b", data_dir=root)
+        ho = sec.create_handoff("liver-x", "liver-y", "台账存活意图", "ctx")
+        sid = ho.state_card_id
+        # 构造"死会话"台账：state/<dead>.json 不存在
+        with open(os.path.join(root, "handoffs", ".session-dead.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"session_id": "dead", "handoff_ids": [],
+                       "state_card_ids": [sid]}, f)
+
+        index = sec._build_ho_reference_index()
+        assert "dead" not in index.get(sid, []), \
+            "已删除会话的台账不得贡献存活引用标签"
+
+        sec.delete_session()
+        assert not os.path.exists(
+            os.path.join(root, "state", f"{sid}.json")), \
+            "死会话台账不得永久阻塞共享卡回收"
+
+    def test_ledger_alive_session_contributes_reference(self, roots):
+        """反向对照（防恒真）：台账对应会话**仍存活**（状态卡存在）时必须
+        贡献引用——与上一用例构成判别对。
+
+        变异判别力：若把台账来源整体删除（只认交接卡），本断言 FAIL。
+        """
+        root, _ = roots
+        sec_alive = SecretarySession("alive", data_dir=root)  # 先建状态卡
+        sec = SecretarySession("live-c", data_dir=root)
+        ho = sec.create_handoff("livec-x", "livec-y", "台账存活意图2", "ctx")
+        sid = ho.state_card_id
+        with open(os.path.join(root, "handoffs", ".session-alive.owned"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"session_id": "alive", "handoff_ids": [],
+                       "state_card_ids": [sid]}, f)
+
+        index = sec._build_ho_reference_index()
+        assert "alive" in index.get(sid, []), \
+            "存活会话台账须贡献引用（否则断言无判别力）"
+        sec.delete_session()
+        sec_alive.delete_session()
+
+    def test_shape_requires_id_field(self, roots):
+        """形状校验（🟡B 边界固化）：含 ``state_card_id`` + ``source_unit`` +
+        ``target_unit`` 但**缺 ``id``** 的 JSON 不得被计入引用。
+
+        变异判别力：把 ``_maybe_handoff_card`` 的 ``return '"id"' in raw``
+        放宽为 ``return True`` → 本断言 FAIL（已验证）。
+        """
+        root, _ = roots
+        sec = SecretarySession("shape-a", data_dir=root)
+        os.makedirs(os.path.join(root, "misc"), exist_ok=True)
+        with open(os.path.join(root, "misc", "pseudo.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"source_unit": "a", "target_unit": "b",
+                       "state_card_id": "ho-pseudo"}, f)
+
+        index = sec._build_ho_reference_index()
+        assert "ho-pseudo" not in index, \
+            "缺 id 的 JSON 不得被误判为交接卡引用（形状校验收紧口径）"
+        sec.delete_session()
+
+    def test_shape_complete_card_counted(self, roots):
+        """反向对照（防恒真）：含四字段的交接卡形状 JSON 必须计入。"""
+        root, _ = roots
+        sec = SecretarySession("shape-b", data_dir=root)
+        os.makedirs(os.path.join(root, "misc"), exist_ok=True)
+        with open(os.path.join(root, "misc", "real.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"id": "misc-real", "source_unit": "a",
+                       "target_unit": "b", "state_card_id": "ho-real"}, f)
+
+        index = sec._build_ho_reference_index()
+        assert "handoff:real" in index.get("ho-real", []), \
+            "形状完整的交接卡引用必须计入（否则断言无判别力）"
+        sec.delete_session()
