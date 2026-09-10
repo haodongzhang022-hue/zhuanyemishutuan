@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **207 项全部通过**（门面 84 项 + 独立探针 41 项）
+- 测试基线：全量 pytest **210 项全部通过**（门面 87 项 + 独立探针 41 项）
 
 ---
 
@@ -341,13 +341,29 @@
   `test_concurrent_create_fold_delete_no_exception`（线程并发）；
 - `TestRegistryFailFast`：`_registry_required` 判定 + 唯一路径 fail-fast 回滚 +
   子树内容忍登记失败（3 项）。
-- **测试基线**：137 → **207 项全部通过**（门面 **84 项**，独立探针 41 项；
-  本角色 P1-3 补充 +8）。
+- **测试基线**：137 → **210 项全部通过**（门面 **87 项**，独立探针 41 项；
+  含本角色 P1-3 写入面补充 +8 与总师 🔴1 竞态收口 +3）。
 - **架构·测试独立探针**（`tests/test_ho_ref_invariant_probes.py`，41 项）：
   修复前（`60b625d`）**40 项 FAIL**（P0-1 33 + P0-2 2 + P1-3 4 + 反向守卫 1），
   修复后 **41 项全部 PASS** → P0/P1 清零的可执行证据。
   **xfail 标注已移除**（原 `xfail(strict=False)` 修复后虽显示 XPASS，但日后回归会
   静默转为 xfail 而不报失败 → 门禁失效）；改为硬断言后任何回归直接 FAIL。
+
+### 🟡 修复 #M — 评审 P2-5 归因更正 + 静态告警清零（收口轮）
+> 评审复评 `60b625d` 指出台账对静态告警的**归因不实**，要求更正归因。
+
+- **归因更正（评审 P2-5）**：`handoff.py` E303、`session.py` F841（`task`）
+  **均非本 PR 新增**——基线 `de5eae8` / `60b625d` 同型（行号随改动漂移，同口径
+  下基线 5 条告警）；本 PR 真正新增的静态告警**仅**
+  `test_secretary_session.py` 的 E741（`l`）。此前台账未区分二者，现更正。
+- **本轮清零（顺手收口，行为零变更）**：五处全部修掉——
+  - `handoff.py` E303（`_save` 后多空行）；
+  - `session.py` F841（`fold()` 内未使用的 `task` 赋值 → 改为直接调用）；
+  - `test_secretary_session.py` E741（`for l in labels` → `lbl`）；
+  - `test_secretary_session.py` E303/E302（类间空行）；
+  - `test_secretary_session.py` F841（未用 `ho` 变量）。
+- **核验**：本 PR 四个改动文件 `flake8 --max-line-length=100` **0 告警**
+  （基线同口径 5 条）。
 
 ## 四、测试环境
 

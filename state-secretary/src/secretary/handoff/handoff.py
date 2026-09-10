@@ -416,7 +416,6 @@ class HandoffBus:
                 "created_at": card.created_at,
             }, f, ensure_ascii=False, indent=2)
 
-
     def validate_card(self, card: HandoffCard) -> dict:
         """执行 M5 × M9 完整度校验（标准字段检查）"""
         return card.completeness_check()

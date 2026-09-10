@@ -906,7 +906,7 @@ class SecretarySession:
             content_ref = refs[i] if i < len(refs) else None
 
             # 添加到 StateManager 管理的现有 card
-            task = card.add_task(
+            card.add_task(
                 title=seg.split("\n")[0][:80],
                 objective=meta.get("objective", self.objective),
                 summary=seg[:200] + ("..." if len(seg) > 200 else ""),

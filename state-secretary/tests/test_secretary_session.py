@@ -438,8 +438,6 @@ class TestDataRootAndCleanup:
             not f.endswith(".json") for f in os.listdir(sec.handoff_bus.data_dir))
 
 
-
-
 # ------------------------------------------------------------------
 # 评审回归：数据根收敛到交接关联卡（🔴 #A）+ delete_session 无残留（🔴 #B）
 # ------------------------------------------------------------------
@@ -960,7 +958,7 @@ class TestSharedHoCardScanPruning:
         index = sec_b._build_ho_reference_index()
         # StateCard 无 source_unit/target_unit → 不应贡献 handoff: 标签
         for labels in index.values():
-            assert not any(l.startswith("handoff:sp-b") for l in labels), \
+            assert not any(lbl.startswith("handoff:sp-b") for lbl in labels), \
                 "StateCard JSON 不得被误判为交接卡"
         assert f"handoff:{ho.id}" in index.get(ho.state_card_id, []), \
             "真实交接卡引用仍应被计入（判别性）"
@@ -1034,8 +1032,8 @@ class TestPruneNameDirVisibility:
 
         bus = HandoffBus(data_dir=os.path.join(tmp_dir, "build"))  # 无 state_root
         assert bus.state_root == tmp_dir, "前置：state_root 应由父目录推导"
-        ho = bus.create_handoff("team-a", "team-b", "名单目录独立意图", "ctx",
-                                auto_state_card=True)
+        bus.create_handoff("team-a", "team-b", "名单目录独立意图", "ctx",
+                           auto_state_card=True)
 
         sec = SecretarySession("pn-d", data_dir=tmp_dir)
         ho_sec = sec.create_handoff("team-a", "team-b", "名单目录独立意图", "ctx")
