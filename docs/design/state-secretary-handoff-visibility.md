@@ -6,6 +6,8 @@
 > 状态：**已更新（🔴 P0-1 / P0-2 / P1-1 / P1-3 修复后）**。核心契约已冻结（见 §2）。
 > §3 的 🟡A（剪枝歧义名）/ 🟡D+🟡E（登记静默失败，**双通道登记**闭环）**已修复**；
 > 仅剩 🟡B（形状校验必含 `id`）为已知边界，**不再依赖总师裁定即可放行**。
+> **迁移前提**见 §5：含 🔴 P1-3 单元名白名单**新增**后的存量非 ASCII 单元名卡
+> （须重建/改名，§5 第 4 条）。
 
 ## 1. 背景
 
@@ -42,7 +44,7 @@
 | 🟡D 旧版根外卡无 `.ref` 登记 | 登记静默失败（`except OSError: pass`）→ 会话侧误判"无引用" | ✅ **已修复**：登记失败不再静默——登记为该卡**唯一**可见性路径（`data_dir` 在 `state_root` 子树外）时 **fail-fast** 回滚建卡；子树内则由目录扫描兜底（见下 🟡E） |
 | 🟡E 登记写入失败 + 根外卡目录 → 无兜底 | 登记静默吞 + 卡目录在根外 → 引用双路径皆不可见 → 误删（纯 API 路径反例） | ✅ **已修复**（与 🟡D 同族）：**双通道登记**（主 `handoff-refs/` + 备 `.handoff-refs/`，不同故障域）任一生效即引用可见；仅**双通道全失败**且登记为唯一可见性路径时 `_registry_required()` 触发 fail-fast 回滚 |
 | 🔴 P1-3 `card_id` 路径穿越 | 未校验 `card_id` → `.ref` / `.json` 路径穿越删除面，可与 P0-1 连锁 | ✅ **已修复**：`card_id` 须匹配 `[A-Za-z0-9_-]+`（`_is_valid_card_id`），`get`/`delete`/`_register_ref`/`_unregister_ref` 全部前置校验；台账 `handoff_ids` 经 `HandoffBus.delete` 亦被拦截 |
-| 🔴 P1-3 补充 单元名路径穿越 | `card_id` 由 `source_unit`/`target_unit` 拼接，但 `create_handoff` 未校验单元名 → `create_handoff("../state/X",…)` 把卡写到 `data_dir` **之外**（路径穿越**写入**面，门面同样可达） | ✅ **已修复**：`create_handoff` 对 `source_unit`/`target_unit` 做同一白名单校验（非法抛 `ValueError`）；`_save` 纵深防御（非法 `card.id` 拒绝落盘） |
+| 🔴 P1-3 补充 单元名路径穿越 | `card_id` 由 `source_unit`/`target_unit` 拼接，但 `create_handoff` 未校验单元名 → `create_handoff("../state/X",…)` 把卡写到 `data_dir` **之外**（路径穿越**写入**面，门面同样可达） | ✅ **已修复**：`create_handoff` 对 `source_unit`/`target_unit` 做同一白名单校验（非法抛 `ValueError`）；`_save` 纵深防御（非法 `card.id` 拒绝落盘）。**迁移前提**：白名单为**新增**约束，存量非 ASCII 单元名卡须重建/改名（§5 第 4 条） |
 
 ### 剪枝规则（P0-1 修复后）
 
@@ -149,6 +151,14 @@
      `{"card_id":…, "state_card_id":…, "card_path":<绝对路径>}`。
 3. **不变量**：迁移期间若共享 `ho-*` 卡被误删，其根外引用会悬空——建议在迁移
    完成前**冻结**跨根交接卡的删除操作（或先执行补偿登记再删除）。
+4. **存量非 ASCII 单元名卡**（🔴 P1-3 单元名白名单为**新增前提**）：`source_unit`/
+   `target_unit` 白名单 `[A-Za-z0-9_-]+` 为**本 PR 新增**约束。旧版（≤ `6a2e713`）
+   经 `create_handoff("单元","目标")` 产出的**存量卡**其 `card_id` 含非 ASCII →
+   白名单后 `get`→`None`、`delete`→`False`，**无法经 API 清理**，须**重建或改名**：
+   - 重命名 `card_id`（去非 ASCII）并同步改写卡内 `id`；或
+   - 改走 `HandoffBus` API 以合规单元名重建该卡（旧卡手工删文件回收）。
+   **不变量仍成立**：形状扫描仍计入其引用、共享 `ho-*` 卡保留（不误删）；该面属
+   **迁移面**（存量数据），非本 PR 新增缺陷。
 
 **判定口径**：`HandoffBus._registry_required()` 即"该卡是否属根外、登记是否为
 唯一可见性路径"的实现判据。
