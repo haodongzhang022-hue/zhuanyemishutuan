@@ -195,7 +195,7 @@
   文档口径一致。
 - **`.gitignore` 补 `data/handoff-refs/`**：`HandoffBus(auto_state_card=True)`
   的 state 根级引用登记目录此前未被忽略（`data/state/`、`data/handoffs/` 已忽略），
-  易被误提交。补齐后与既有三子目录忽略口径一致。
+  易被误提交。补齐后与既有数据根子目录（state/ content/ handoffs/）忽略口径一致。
 - **测试基线**：仍 **137 项**（🟡C 仅加强既有断言、未新增用例）；`compileall` 通过。
 
 ### 🟡 修复 #I — 复评 `042e7e6` 三项结转项收口（PR #7 · 收口轮）
