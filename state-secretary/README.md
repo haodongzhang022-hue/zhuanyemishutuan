@@ -26,6 +26,7 @@
 | 上下文装配 | `ContextAssembler` — 三层物理隔离 + 稳定前缀 | cache.md |
 | POC benchmark | `poc/state_m9_benchmark.py` — token/命中 A/B | poc.md |
 | 会话统一门面 | `SecretarySession` — L3 会话秘书完整驱动（状态+折叠+装配+交接） | org.md |
+| 循环熔断 | `LoopGuard` — 轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒 | loop-guard.md |
 
 ## 快速开始
 
@@ -71,7 +72,15 @@ sec.fold("需求澄清：Q1 四层秘书定义…", meta={"objective": "澄清"}
 
 ctx = sec.get_compact_context()        # 压缩上下文（驱动下一轮）
 nav = sec.get_navigation()             # 任务导航视图
-summary = sec.summarize_for_upstream() # 向上级提交汇总态
+summary = sec.summarize_for_upstream() # 向上级提交汇总态（含循环预算快照）
+
+# 循环熔断：轮次预算 + 非必要修复最多 1 次 + 静默交接不唤醒
+from secretary.loop import LoopAction
+d = sec.review_round(blocking=0, advisory=2)   # 仅 🟡 → fix_last（仅此一次唤醒）
+d = sec.review_round(blocking=0, advisory=1)   # 再报 🟡 → fuse（不唤醒）
+if d.action == LoopAction.FUSE.value:
+    sec.silent_handoff("秘书·评审", "秘书·开发", "循环熔断交接")  # wake=False
+sec.resume_loop(by="人工", reason="确认收口")    # 恢复预算须人工留痕
 
 # 三层上下文装配（缓存键 = layer_a 哈希）
 result = sec.assemble_context(user_text="查询进度")
@@ -105,10 +114,13 @@ state-secretary/
 │       ├── handoff/             # 交接总线（M5）
 │       │   ├── models.py        # HandoffCard
 │       │   └── handoff.py       # HandoffBus
-│       └── session/             # 会话门面层（L3 秘书统一入口）
+│       ├── session/             # 会话门面层（L3 秘书统一入口）
+│       │   ├── __init__.py
+│       │   └── session.py       # SecretarySession（推荐使用）
+│       └── loop/                # 循环熔断守卫（Issue #14）
 │           ├── __init__.py
-│           └── session.py       # SecretarySession（推荐使用）
-├── tests/                       # 308 项测试（门面 148 + 独立探针 65 + 验收矩阵 13，含评审回归）
+│           └── loop_guard.py    # LoopGuard
+├── tests/                       # 370 项测试（门面 148 + 独立探针 65 + 验收矩阵 13 + 循环熔断 62，含评审回归）
 ├── poc/                         # POC 脚本 + benchmark
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC

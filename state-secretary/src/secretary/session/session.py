@@ -34,6 +34,12 @@ from ..state.content_archive import ContentArchive
 from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
+from ..loop import LoopDecision, LoopGuard
+from ..loop.loop_guard import (
+    DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
+    DEFAULT_MAX_ROUNDS,
+    DEFAULT_MAX_STALL_REPEATS,
+)
 
 # 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
 # 遍历，亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）。
@@ -80,6 +86,11 @@ class _StateCardProxy:
 class SecretarySession:
     """会话秘书门面：一个 L3 会话秘书的完整接口。
 
+    **循环熔断（Issue #14）**：每个会话秘书附带一只 ``LoopGuard``，以
+    「轮次预算 + 非必要修复最多 1 次 + 静默交接」三道闸控制评审/修复往返；
+    熔断后 ``create_handoff`` 拒绝唤醒式交接（须走 ``silent_handoff``），
+    且预算状态跨实例持久化——换 agent 不复活循环。
+
     用法：
         sec = SecretarySession("issue-42")
         # 新建任务
@@ -103,6 +114,11 @@ class SecretarySession:
         data_dir: Optional[str] = None,
         archive_root: Optional[str] = None,
         static_prefix: Optional[str] = None,
+        loop_dir: Optional[str] = None,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
+        max_advisory_fix_rounds: int = DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
+        max_total_rounds: Optional[int] = None,
+        max_stall_repeats: int = DEFAULT_MAX_STALL_REPEATS,
     ):
         """初始化一个会话秘书。
 
@@ -116,6 +132,12 @@ class SecretarySession:
                 （state/ content/ handoffs/ handoff-refs/）。
             archive_root: 原文归档根目录（默认 <data_dir>/content）。
             static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
+            loop_dir: 循环熔断状态目录（默认 ``<数据根>/loop``）。
+            max_rounds: 门禁（🔴）修复轮次上界，默认 3。
+            max_advisory_fix_rounds: 非必要（🟡）修复轮次上界，默认 1。
+            max_total_rounds: 修复总轮次硬上界，默认
+                ``max_rounds + max_advisory_fix_rounds + 1``。
+            max_stall_repeats: 同一整改项指纹连续出现上界（默认 2）→ 停滞熔断。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -153,6 +175,16 @@ class SecretarySession:
             ) if static_prefix else None,
         )
         self.handoff_bus = HandoffBus(data_dir=ho_dir, state_root=self._session_root)
+        # 循环熔断守卫（Issue #14）：状态落 <数据根>/loop/<session_id>.json，
+        # 与会话数据同根，随 delete_session 一并回收。
+        self.loop_guard = LoopGuard(
+            session_id=session_id,
+            data_dir=loop_dir or os.path.join(self._session_root, "loop"),
+            max_rounds=max_rounds,
+            max_advisory_fix_rounds=max_advisory_fix_rounds,
+            max_total_rounds=max_total_rounds,
+            max_stall_repeats=max_stall_repeats,
+        )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
         # 持久化记录为准，实例内存清单仅为会话内缓存镜像。
@@ -826,6 +858,12 @@ class SecretarySession:
             self.archive.delete_session(self.session_id)
         except (OSError, ValueError):
             pass
+        # 6) 清理本会话循环熔断状态（Issue #14）：会话生命周期结束时不留
+        #    预算文件，避免同一 session_id 复用时带上陈旧熔断/轮次计数。
+        try:
+            self.loop_guard.delete_state()
+        except OSError:
+            pass
         return ok
 
     # ------------------------------------------------------------------
@@ -1052,7 +1090,12 @@ class SecretarySession:
                 "task_count": 0,
                 "tasks": [],
             }
-        return card.summarize_for_upstream()
+        summary = card.summarize_for_upstream()
+        # 循环预算随汇总上行（Issue #14）：上级/审计据 ``wake_allowed`` 判定
+        # 「是否还可能被自动唤醒继续修」，无需回读会话本地状态。
+        summary["loop"] = self.loop_guard.status()
+        summary["wake_allowed"] = self.loop_guard.should_wake_next()
+        return summary
 
     def set_upstream(self, upstream_session: str) -> bool:
         """设置上级秘书引用"""
@@ -1074,6 +1117,7 @@ class SecretarySession:
         target_unit: str,
         intent: str,
         context: str = "",
+        wake: bool = True,
     ) -> HandoffCard:
         """创建一张交接卡（跨单元协作），自动关联本会话 StateCard。
 
@@ -1084,18 +1128,129 @@ class SecretarySession:
         上下文**静默丢弃**。这是"共享卡"设计的既定语义（避免同一交接任务在卡内
         重复堆积）；需要保留各自上下文的场景请使用不同 ``intent``（→ 不同卡），
         或把上下文写入自己的任务卡/原文归档。
+
+        **唤醒闸门（Issue #14）**：本会话已**熔断**时 ``wake=True`` 被拒绝
+        （``RuntimeError``）——熔断语义就是"不再唤醒下一轮"，自动/误写的唤醒式
+        交接会复活循环。熔断后须用 ``silent_handoff()``（``wake=False``）。
         """
+        if wake and self.loop_guard.is_fused():
+            raise RuntimeError(
+                f"会话 {self.session_id} 已熔断"
+                f"（{self.loop_guard.status()['fused_reason']}）："
+                "禁止唤醒式交接（wake=True），请改用 silent_handoff()。")
         hc = self.handoff_bus.create_handoff(
             source_unit=source_unit,
             target_unit=target_unit,
             intent=intent,
             context=context,
             auto_state_card=True,
+            wake=wake,
+            fuse_reason=(self.loop_guard.status()["fused_reason"] if not wake else ""),
         )
         if hc and hc.id:
             # 认领本交接卡 + 其关联 ho-* StateCard（落盘归属台账，跨实例可清）
             self._record_ownership(hc.id, hc.state_card_id)
         return hc
+
+    # ------------------------------------------------------------------
+    # 循环熔断（Issue #14：轮次预算 + 非必要修复最多 1 次 + 静默交接）
+    # ------------------------------------------------------------------
+
+    def review_round(self, blocking: int = 0, advisory: int = 0,
+                     note: str = "", signature: str = "") -> LoopDecision:
+        """登记一轮评审/复评结果，返回本轮处置与是否允许唤醒下一轮。
+
+        Args:
+            blocking: 🔴/门禁必修项数
+            advisory: 🟡/非门禁（无必要）项数
+            note: 留痕说明（如打回方、修复摘要）
+            signature: 本轮整改项**指纹**（如打回项集合的稳定摘要）。与上一轮
+                相同且达 ``max_stall_repeats`` → 判**停滞循环**直接熔断
+                （"感知循环"：同一问题反复报，不必等轮次预算耗尽）
+
+        Returns:
+            ``LoopDecision``：``action`` ∈ ``clear``（无需修复、不唤醒）/
+            ``fix``（门禁，预算内）/ ``fix_last``（非必要，最多 1 次）/
+            ``fuse``（熔断，不唤醒）；``fused_now=True`` 表示本次刚熔断，
+            调用方据此只建**一次**静默交接卡。
+        """
+        return self.loop_guard.register_round(
+            blocking=blocking, advisory=advisory, note=note,
+            signature=signature)
+
+    @staticmethod
+    def review_signature(items) -> str:
+        """由整改项清单生成稳定指纹（供 ``review_round(signature=…)`` 使用）。
+
+        排序 + 归一化空白后哈希 → 同一批问题换顺序/换空白再报也判为**停滞**。
+        """
+        return LoopGuard.signature_of(items)
+
+    def preview_round(self, blocking: int = 0, advisory: int = 0,
+                      signature: str = "") -> LoopDecision:
+        """预览下一轮处置（**纯函数**：不消耗预算、不落盘）。"""
+        return self.loop_guard.preview(
+            blocking=blocking, advisory=advisory, signature=signature)
+
+    def loop_status(self) -> dict:
+        """循环预算与熔断态快照。"""
+        return self.loop_guard.status()
+
+    def should_wake_next(self) -> bool:
+        """当前是否允许唤醒下一轮（熔断后恒 False）。"""
+        return self.loop_guard.should_wake_next()
+
+    def fuse_loop(self, reason: str) -> bool:
+        """显式叫停循环（人工/上游直接熔断）。"""
+        return self.loop_guard.fuse(reason)
+
+    def resume_loop(self, by: str, reason: str = "") -> bool:
+        """人工解锁熔断（须留痕 ``by``；这是恢复修复预算的**唯一**途径）。"""
+        return self.loop_guard.resume(by=by, reason=reason)
+
+    def silent_handoff(
+        self,
+        source_unit: str,
+        target_unit: str,
+        intent: str,
+        context: str = "",
+        open_items: Optional[List[str]] = None,
+    ) -> HandoffCard:
+        """熔断后的**静默交接**：建 ``wake=False`` 交接卡，接收方只登记不唤醒。
+
+        与 ``create_handoff(..., wake=False)`` 等价，额外把熔断原因与轮次快照
+        一并写入卡面 ``context``（若调用方未提供 context），让下一 agent 一眼
+        看到"为何不得再开一轮"，不依赖它自行推理。
+        """
+        payload = self.loop_guard.silent_handoff_payload(
+            open_items=open_items, target_unit=target_unit)
+        if not context:
+            context = json.dumps(payload, ensure_ascii=False, indent=2)
+        return self.create_handoff(
+            source_unit=source_unit,
+            target_unit=target_unit,
+            intent=intent,
+            context=context,
+            wake=False,
+        )
+
+    def inherit_silent_handoff(self, handoff_context: Any) -> bool:
+        """接收静默交接（``wake=False``）后**继承熔断态**：本会话起手即不唤醒。
+
+        返回 True 表示确实继承到熔断态（载荷为静默交接）；False 表示载荷并非
+        静默交接（常规接力，无变化）。载荷无法解析时不熔断（宽进不炸）。
+        """
+        fused = LoopGuard.from_handoff(
+            session_id=self.session_id,
+            data_dir=self.loop_guard.data_dir,
+            handoff_context=handoff_context,
+            max_rounds=self.loop_guard.max_rounds,
+            max_advisory_fix_rounds=self.loop_guard.max_advisory_fix_rounds,
+            max_total_rounds=self.loop_guard.max_total_rounds,
+            max_stall_repeats=self.loop_guard.max_stall_repeats,
+        )
+        self.loop_guard = fused
+        return fused.is_fused()
 
     # ------------------------------------------------------------------
     # 进度统计

@@ -10,3 +10,7 @@
 - 仅 push 文件 ≠ 创建 Issue：须用 `cnb issues create-issue` 在平台创建正式 Issue
 - 纯文本评论中的 @CodeBuddy 不触发 NPC：须带结构化 mentions（--data JSON）或 UI 编辑器 @ 提及
 - npc:go 承接需要 .cnb/settings.yml 角色定义 + .cnb.yml `$` 事件绑定（二者缺一不触发）
+- CNB Issue #14（循环熔断 · 避免评审/修复无限循环）: https://cnb.cool/dongdongxiaozu/zhuanyemishutuan/-/issues/14
+  - 落地：`state-secretary/src/secretary/loop/loop_guard.py`（轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接）
+  - 门禁接入点：`SecretarySession.review_round` / `silent_handoff` / `resume_loop`
+  - 规范：`docs/secretary-gate-workflow.md` §2.1（v0.3）；角色提示词 `.cnb/settings.yml`（评审/测试/秘书长）
