@@ -362,10 +362,22 @@ class HandoffBus:
             return True
 
     def list_pending(self) -> List[HandoffCard]:
-        """列出所有待处理交接卡（线程安全）"""
+        """列出所有待处理交接卡（线程安全）。
+
+        P0-2 同形加固（既有代码，随 P0-2 一并收口）：``listdir`` 包
+        ``try/except OSError``——数据目录在 ``isdir``/``listdir`` 之间被并发
+        回收，或因权限/IO 异常不可读时，返回空列表而非向调用方抛裸异常。
+        与 ``_build_ho_reference_index`` 来源 3 的 ``listdir`` 守卫同形
+        （该处为本 PR 新增逃逸面，已修）；本处为 ``main`` 既有代码，一并加固。
+        """
         with self._lock:
+            try:
+                names = os.listdir(self.data_dir)
+            except OSError:
+                # 数据目录不可读/已被并发回收 → 无待处理卡可列
+                return []
             pending = []
-            for f in os.listdir(self.data_dir):
+            for f in names:
                 if f.endswith(".json"):
                     card = self.get(f[:-5])
                     if card and card.status == "created":

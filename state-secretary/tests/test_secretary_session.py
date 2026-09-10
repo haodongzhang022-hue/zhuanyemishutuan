@@ -1066,6 +1066,43 @@ class TestPruneNameDirVisibility:
         other.delete_session()
 
 
+class TestListPendingListdirGuard:
+    """P0-2 同形加固（``handoff.py::list_pending``）：数据目录不可读/被并发
+    回收时，``list_pending`` 返回空列表而非抛裸 ``OSError``。"""
+
+    def test_listdir_oserror_returns_empty(self, tmp_dir, monkeypatch):
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        bus.create_handoff("ua", "ub", "待处理意图", "ctx")
+        assert len(bus.list_pending()) == 1, "前置：正常路径应列出待处理卡"
+
+        real_listdir = os.listdir
+
+        def boom(path="."):
+            if os.path.abspath(str(path)) == os.path.abspath(bus.data_dir):
+                raise FileNotFoundError(2, "No such file or directory",
+                                        str(path))
+            return real_listdir(path)
+
+        monkeypatch.setattr(os, "listdir", boom)
+        assert bus.list_pending() == [], \
+            "数据目录被并发回收时 list_pending 应返回空列表，不抛裸异常"
+
+    def test_data_dir_removed_between_calls(self, tmp_dir):
+        """目录整体消失（外部删除）→ 返回空列表（幂等，不抛异常）。"""
+        import shutil
+
+        from secretary.handoff import HandoffBus
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        shutil.rmtree(bus.data_dir, ignore_errors=True)
+        assert bus.list_pending() == [], \
+            "数据目录不存在时 list_pending 应返回空列表"
+
+
 class TestRegistryListdirToctouGuard:
     """🔴 P0-2 复评回归：``isdir → listdir`` TOCTOU 异常不得逃逸。
 
