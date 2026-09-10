@@ -355,3 +355,21 @@
 - 运行：`cd state-secretary && pytest -q`
 - 配置：`pytest.ini` 已配置 `pythonpath=src`
 
+## 六、Issue #4 复评第 4 轮 · 总师裁定 + 🔴1 根因收口
+
+> 裁定：**本 PR 内修复收口**（不开新 Issue、不接受口径收窄规避）；本轮为最终
+> 收口轮（范围冻结）。详见 `docs/design/state-secretary-handoff-visibility.md` §7。
+
+### 🔴1 登记目录 rmdir × 登记写 竞态（根因：临界区无互斥）
+- **问题**：`_register_ref`（`makedirs`/`mkstemp`）与 `_unregister_ref`（空目录
+  `rmdir`）无互斥 → `mkstemp` 抛 `FileNotFoundError`。开发方双通道 + fail-fast
+  把后果转为「fail-fast 误抛 `OSError`（根外布局）+ 登记静默丢失（根内布局）」，
+  **根因未消除**。
+- **修复**：模块级 `_REF_REGISTRY_LOCK`（RLock）；登记临界区与注销临界区互斥。
+- **怎么测**：6 线程 × 300 轮「登记→校验 `.ref` 存在→注销」，丢失须为 0
+  （修复前 22–33/2400）；根外布局并发 `create_handoff` 不得误抛 `OSError`。
+- **回归测试**：`TestRegistryRmdirWriteRace`（3 项，修复前基线确定性失败）
+
+### 🔴2 索引来源 3 `listdir` 无守卫 → `delete_session` 抛未捕获异常
+- 已由开发方 `a852574` 修复（`try/except OSError → []`），总师复跑确认。
+- 回归测试：`TestRegistryListdirToctouGuard` + 测试方独立探针 `TestP0_2...`（硬断言）

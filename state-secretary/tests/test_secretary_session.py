@@ -11,10 +11,12 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 
 import pytest
 
 from secretary.session import SecretarySession
+from secretary.handoff import HandoffBus
 
 
 @pytest.fixture
@@ -1469,3 +1471,90 @@ class TestLedgerMalformedRobustness:
         sec_c.delete_session()
         sec_a.delete_session()
         sec_b.delete_session()
+
+
+# ------------------------------------------------------------------
+# 🔴1 复评第 4 轮：登记目录 rmdir × 登记写 竞态（模块级互斥锁）
+# _register_ref 的「建目录 + mkstemp 原子写」与 _unregister_ref 的「删 .ref +
+# 空目录 rmdir」无互斥 → rmdir 与 mkstemp 交叠 → mkstemp 抛 FileNotFoundError →
+# 双通道同时失败 → .ref 不落地（根外卡引用唯一可见通道失效）→ 共享 ho-* 卡误删。
+# ------------------------------------------------------------------
+
+class TestRegistryRmdirWriteRace:
+    """🔴1：登记/注销临界区互斥，.ref 不得因空目录 rmdir 竞态静默丢失。"""
+
+    def test_concurrent_register_unregister_no_ref_loss(self, tmp_dir):
+        """6 线程 × 300 轮并发「登记→校验 .ref 存在→注销」，丢失须为 0
+        （修复前 22–33/2400）。"""
+        root = os.path.join(tmp_dir, "root")
+        os.makedirs(root, exist_ok=True)
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(outside, exist_ok=True)
+        threads = 6
+        iters = 300
+        lost = []
+        lock = threading.Lock()
+
+        def worker(k):
+            bus = HandoffBus(data_dir=os.path.join(outside, f"q{k}"),
+                             state_root=root)
+            for i in range(iters):
+                cid = f"c{k}-{i}"
+                bus._register_ref(cid, "ho-shared")
+                reg = os.path.join(root, "handoff-refs", f"{cid}.ref")
+                if not os.path.exists(reg):
+                    with lock:
+                        lost.append(cid)
+                bus._unregister_ref(cid)
+
+        ts = [threading.Thread(target=worker, args=(k,))
+              for k in range(threads)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert lost == [], (
+            f"🔴1 回归：并发下 .ref 静默丢失 {len(lost)}/{threads*iters}"
+            "（登记目录 rmdir 与登记写无互斥）")
+
+    def test_register_after_unregister_rmdir_lands_ref(self, tmp_dir):
+        """确定性：注销回收空登记目录后，随后登记须按需重建并落地 .ref。"""
+        root = os.path.join(tmp_dir, "root")
+        os.makedirs(root, exist_ok=True)
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "queue"),
+                         state_root=root)
+        bus._unregister_ref("first")
+        bus._register_ref("second", "ho-shared")
+        assert os.path.isfile(
+            os.path.join(root, "handoff-refs", "second.ref")),             "登记目录被 rmdir 后登记须按需重建并落地"
+
+    def test_concurrent_out_of_root_create_no_spurious_failure(self, tmp_dir):
+        """根外布局并发 create_handoff：登记不得因 rmdir 竞态误判为
+        「双通道全失败」而 fail-fast 抛 OSError（修复前 2/1200）。"""
+        root = os.path.join(tmp_dir, "root")
+        os.makedirs(root, exist_ok=True)
+        outside = os.path.join(tmp_dir, "outside")
+        os.makedirs(outside, exist_ok=True)
+        errors = []
+        lock = threading.Lock()
+
+        def worker(k):
+            bus = HandoffBus(data_dir=os.path.join(outside, f"q{k}"),
+                             state_root=root)
+            for i in range(150):
+                try:
+                    card = bus.create_handoff(
+                        "s", "t", f"intent-{k}-{i}", "ctx",
+                        auto_state_card=True)
+                    bus.delete(card.id)
+                except Exception as exc:  # noqa: BLE001 - 测试记录后断言
+                    with lock:
+                        errors.append(exc)
+
+        ts = [threading.Thread(target=worker, args=(k,)) for k in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert errors == [], (
+            f"🔴1 回归：并发根外建卡误抛 {len(errors)} 次：{errors[:3]}")

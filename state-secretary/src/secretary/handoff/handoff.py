@@ -19,6 +19,14 @@ from .models import HandoffCard
 _CARD_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
+# 引用登记目录（``handoff-refs/`` 与 ``.handoff-refs/``）的**建 / 写 / 删 /
+# 空目录回收**互斥锁（🔴1）。模块级：不同 HandoffBus 实例共享同一 state_root
+# （同一登记目录）时亦互斥，否则「_unregister_ref 空目录 rmdir」与
+# 「_register_ref makedirs/mkstemp」交叠 → mkstemp 抛 FileNotFoundError →
+# 双通道同时失败 → 登记静默丢失（或 fail-fast 误抛 OSError）。
+_REF_REGISTRY_LOCK = threading.RLock()
+
+
 def _is_valid_card_id(card_id: object) -> bool:
     """card_id 是否为合法标识符（拒绝路径分隔符/相对路径/空串）。"""
     return isinstance(card_id, str) and bool(_CARD_ID_PATTERN.match(card_id))
@@ -164,24 +172,28 @@ class HandoffBus:
                 os.path.join(self.data_dir, f"{card_id}.json")),
         }
         written = False
-        for reg_dir in dirs:
-            # 双通道：任一生效即引用可见（🟡E 闭环）。单通道失败不阻断另一通道。
-            try:
-                os.makedirs(reg_dir, exist_ok=True)
-                path = os.path.join(reg_dir, f"{card_id}.ref")
-                fd, tmp_path = tempfile.mkstemp(dir=reg_dir, suffix=".tmp")
+        # 与 _unregister_ref 的「空目录 rmdir」互斥（🔴1）：否则 rmdir 与
+        # makedirs/mkstemp 交叠 → mkstemp 抛 FileNotFoundError → 双通道同时
+        # 失败 → 登记静默丢失 / fail-fast 误抛。临界区覆盖全部候选通道。
+        with _REF_REGISTRY_LOCK:
+            for reg_dir in dirs:
+                # 双通道：任一生效即引用可见（🟡E 闭环）。单通道失败不阻断另一通道。
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False)
-                    os.replace(tmp_path, path)
-                    written = True
-                except OSError:
+                    os.makedirs(reg_dir, exist_ok=True)
+                    path = os.path.join(reg_dir, f"{card_id}.ref")
+                    fd, tmp_path = tempfile.mkstemp(dir=reg_dir, suffix=".tmp")
                     try:
-                        os.unlink(tmp_path)
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, ensure_ascii=False)
+                        os.replace(tmp_path, path)
+                        written = True
                     except OSError:
-                        pass
-            except OSError:
-                continue
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
         # 双通道全部失败：返回 False，由调用方按可见性唯一性决定是否 fail-fast
         return written
 
@@ -194,19 +206,22 @@ class HandoffBus:
         if not _is_valid_card_id(card_id):
             # 🔴 P1-3：非法 card_id 不得构成路径穿越删除面（如 "../handoff-refs/x"）
             return
-        for reg_dir in self.ref_registry_dirs():
-            try:
-                path = os.path.join(reg_dir, f"{card_id}.ref")
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
-            # 回收空登记目录（非空时 os.rmdir 抛 OSError，忽略即可）
-            try:
-                if os.path.isdir(reg_dir) and not os.listdir(reg_dir):
-                    os.rmdir(reg_dir)
-            except OSError:
-                pass
+        # 与 _register_ref 互斥（🔴1）：删 .ref 与「空目录 rmdir」须在同一
+        # 临界区，防止 rmdir 把并发登记线程刚 makedirs 的目录删掉。
+        with _REF_REGISTRY_LOCK:
+            for reg_dir in self.ref_registry_dirs():
+                try:
+                    path = os.path.join(reg_dir, f"{card_id}.ref")
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+                # 回收空登记目录（非空时 os.rmdir 抛 OSError，忽略即可）
+                try:
+                    if os.path.isdir(reg_dir) and not os.listdir(reg_dir):
+                        os.rmdir(reg_dir)
+                except OSError:
+                    pass
 
     def create_handoff(self, source_unit: str, target_unit: str,
                        intent: str, context: str = "",
