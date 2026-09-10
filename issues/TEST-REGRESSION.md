@@ -8,7 +8,7 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **199 项**（159 passed + 40 XPASS；门面 76 项 + 独立探针 41 项）
+- 测试基线：全量 pytest **199 项全部通过**（门面 76 项 + 独立探针 41 项）
 
 ---
 
@@ -332,10 +332,12 @@
   `test_concurrent_create_fold_delete_no_exception`（线程并发）；
 - `TestRegistryFailFast`：`_registry_required` 判定 + 唯一路径 fail-fast 回滚 +
   子树内容忍登记失败（3 项）。
-- **测试基线**：137 → **199 项**（159 passed + 40 XPASS；门面 55 → **76 项**，独立探针 41 项）。
+- **测试基线**：137 → **199 项全部通过**（门面 55 → **76 项**，独立探针 41 项）。
 - **架构·测试独立探针**（`tests/test_ho_ref_invariant_probes.py`，41 项）：
-  修复前 `11dfdd9` 上 40 项 `xfail`（P0-1 33 + P0-2 2 + P1-3 4 + 1 反向守卫失败）；
-  修复后 **40 项全部 XPASS**、反向守卫通过 → P0/P1 清零的可执行证据。
+  修复前（`60b625d`）**40 项 FAIL**（P0-1 33 + P0-2 2 + P1-3 4 + 反向守卫 1），
+  修复后 **41 项全部 PASS** → P0/P1 清零的可执行证据。
+  **xfail 标注已移除**（原 `xfail(strict=False)` 修复后虽显示 XPASS，但日后回归会
+  静默转为 xfail 而不报失败 → 门禁失效）；改为硬断言后任何回归直接 FAIL。
 
 ## 四、测试环境
 

@@ -1,11 +1,15 @@
 """🔴 P0/P1 独立探针（架构·测试）——不变量：「存活交接卡 → 其 state_card_id 状态卡必须存在」
 
-运行：``pytest -q tests/test_ho_ref_invariant_probes.py -rX``
-（当前全部 ``xfail``；修复后对应项转 ``XPASS``，即为 P0/P1 清零的可执行证据）
+运行：``pytest -q tests/test_ho_ref_invariant_probes.py``
 
 本文件由「架构·测试」在 Issue #4 复评阶段独立编写，与评审（架构·评审）新增的三组
-探针互为交叉验证。当前 head（``60b625d`` 及此前 ``570c7ee``）**已知未修复**，故全部
-以 ``xfail(strict=False)`` 标注：修复后自动转为 ``XPASS``，即为 P0 清零的可执行证据。
+探针互为交叉验证。探针在 ``60b625d``/``570c7ee``（及此前）上**全部失败**，
+记录了 P0-1（33 项）/P0-2（2 项）/P1-3（4 项）的破坏面。
+
+**已转为硬断言（2026-09-10，🔴 修复后）**：上述三项已由「架构·开发」在
+``a852574`` 修复，本文件同步**移除 ``xfail`` 标注**——原 ``xfail(strict=False)``
+在修复后虽显示 XPASS，但若日后回归会**静默转为 xfail 而不报失败**，门禁失效。
+改为硬断言后，任何回归都会直接 FAIL，作为 P0/P1 清零的**持续**可执行证据。
 
 覆盖三组（对应评审复评回执的确认项）：
 
@@ -46,12 +50,11 @@ PRUNE_DIRS = [
 NON_HIDDEN_PRUNE = [d for d in PRUNE_DIRS if not d.startswith(".")]
 TRIGGERS = ("legacy_no_registry", "registry_failed", "ref_externally_removed")
 
-_XFAIL_P0_1 = pytest.mark.xfail(
-    strict=False, reason="P0-1 剪枝致存活引用不可见 → 共享 ho-* 卡误删（待修复）")
-_XFAIL_P0_2 = pytest.mark.xfail(
-    strict=False, reason="P0-2 引用登记 listdir 无 try → delete_session 逃逸（待修复）")
-_XFAIL_P1_3 = pytest.mark.xfail(
-    strict=False, reason="P1-3 card_id 未校验 → 路径穿越 / 删除面可达（待修复）")
+# 🔴 修复后（a852574）移除 xfail 标注 → 硬断言。
+# 回归即 FAIL（原 xfail(strict=False) 会让回归静默通过，门禁失效）。
+# P0-1 剪枝致存活引用不可见 → 共享 ho-* 卡误删
+# P0-2 引用登记 listdir 无 try → delete_session 逃逸
+# P1-3 card_id 未校验 → 路径穿越 / 删除面可达
 
 
 @pytest.fixture
@@ -98,7 +101,6 @@ def _invariant_broken(root, bus, card, ho_id):
 class TestP0_1PrunedDirReferenceVisibility:
     @pytest.mark.parametrize("dirname", NON_HIDDEN_PRUNE)
     @pytest.mark.parametrize("trigger", TRIGGERS)
-    @_XFAIL_P0_1
     def test_non_hidden_prune_dir_keeps_live_handoff_reference(
             self, roots, dirname, trigger):
         root, outside = roots
@@ -117,7 +119,6 @@ class TestP0_1PrunedDirReferenceVisibility:
             f"共享 ho-* 卡被误删（card_alive={card_alive}, ho_alive={ho_alive}）")
 
     @pytest.mark.parametrize("trigger", TRIGGERS)
-    @_XFAIL_P0_1
     def test_hidden_venv_baseline_surface(self, roots, trigger):
         """``.venv`` 属隐藏目录剪枝（``11dfdd9`` 基线既有），单列不计入
         新增面，但同根因，建议随 P0-1 一并覆盖。"""
@@ -130,7 +131,6 @@ class TestP0_1PrunedDirReferenceVisibility:
         broken, _, _ = _invariant_broken(root, bus, victim, victim.state_card_id)
         assert not broken, "基线既有面：.venv 剪枝同样破坏不变量"
 
-    @_XFAIL_P0_1
     def test_pure_api_path_registry_failure_pruned_dir(self, roots):
         """纯 API 路径（受害者仅用 HandoffBus，不经门面登记）：登记失败 +
         剪枝目录同样破坏——秘书侧只要认领同一共享 ho-* 卡即可触发误删。"""
@@ -153,7 +153,6 @@ class TestP0_1PrunedDirReferenceVisibility:
 # ----------------------------------------------------------------------
 
 class TestP0_2RegistryListdirEscape:
-    @_XFAIL_P0_2
     def test_listdir_oserror_does_not_escape_delete_session(self, roots):
         root, _ = roots
         sec = SecretarySession("esc-1", data_dir=root)
@@ -174,7 +173,6 @@ class TestP0_2RegistryListdirEscape:
         finally:
             os.listdir = real
 
-    @_XFAIL_P0_2
     def test_isdir_listdir_toctou_does_not_escape(self, roots):
         """``isdir`` 通过后目录消失 → ``listdir`` 抛 FileNotFoundError
         不得逃逸。"""
@@ -206,7 +204,6 @@ class TestP0_2RegistryListdirEscape:
 # ----------------------------------------------------------------------
 
 class TestP1_3CardIdPathTraversal:
-    @_XFAIL_P1_3
     def test_unregister_ref_rejects_traversal(self, roots):
         root, _ = roots
         bus = HandoffBus(data_dir=os.path.join(root, "handoffs"),
@@ -219,7 +216,6 @@ class TestP1_3CardIdPathTraversal:
         assert os.path.exists(victim), \
             "_unregister_ref 不得因 card_id 路径穿越删除登记目录之外的 .ref"
 
-    @_XFAIL_P1_3
     def test_handoffbus_delete_rejects_traversal(self, roots):
         root, _ = roots
         bus = HandoffBus(data_dir=os.path.join(root, "handoffs"),
@@ -232,7 +228,6 @@ class TestP1_3CardIdPathTraversal:
         assert os.path.exists(victim), \
             "HandoffBus.delete 不得删除 data_dir 之外的任意文件"
 
-    @_XFAIL_P1_3
     def test_ledger_handoff_ids_traversal_not_reachable(self, roots):
         """台账 ``handoff_ids`` 注入后经 ``delete_session`` 可达删除面。"""
         root, _ = roots
@@ -251,7 +246,6 @@ class TestP1_3CardIdPathTraversal:
         assert os.path.exists(victim), \
             "台账 handoff_ids 不得构成路径穿越删除面"
 
-    @_XFAIL_P1_3
     def test_traversal_chain_does_not_break_ho_invariant(self, roots):
         """连锁升级：穿越删他人 ``.ref`` → 其异目录引用不可见 → 共享卡误删。"""
         root, outside = roots
