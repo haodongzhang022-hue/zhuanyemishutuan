@@ -31,7 +31,8 @@ from .models import StateCard, TaskRecord
 from .manager import StateManager
 
 # 标识符（session_id / ticket_id）白名单：仅允许字母/数字/下划线/短横线，防路径穿越
-_IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+# 尾锚 ``\Z``（非 ``$``，后者会放行尾换行）——🟡-4 同族收紧。
+_IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 # TaskRecord 中参与冲突仲裁的"语义字段"（排除 meta/时间戳/自动编号）
 _SEMANTIC_FIELDS = [

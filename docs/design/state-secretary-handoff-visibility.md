@@ -271,3 +271,23 @@
 - 独立探针（本角色自写，不复用作者/测试用例）：10-seed 矩阵 **0/10 破坏**、
   隐藏名 4 名 × 3 触发 **0/12 破坏**、剪枝收益不退化。
 
+## 9. 🟡 收口轮（Issue #4 复评第 5 轮 · 架构·评审 `proceed` 后 · 非门禁）
+
+> 触发：架构·评审增量复评 `60e32ec` 处置 **`proceed`**（🔴 清零），点名确认
+> 🟡-2 台账口径 / 🟡-5 契约文档补注，并询问 🟡-1 是否一并收口。本轮**不含 🔴 修复**。
+
+| 项 | 处置 |
+|---|---|
+| 🟡-1 `list_pending` 逐文件读未守 | ✅ 单条读异常（`exists→open` 窗口 / 半写 / 坏 JSON）**跳过**不逃逸（`except (OSError, ValueError)`），与目录级守卫同纪律 |
+| 🟡-2 台账基线并存 | ✅ 已由上游 `e3195ea` 收口为**唯一口径 + 历史行**；本轮复核一致（无残留） |
+| 🟡-3 fail-fast 回滚残留 `ho-*` + `.lock` | ⏸ **本轮不改行为**：上游 §8.3 已在**总师范围冻结**下将其定为「已知边界 + `TestFailFastRollbackBoundary` 锁定」。**修法已就绪**（见下），待总师解冻/授权后落地 |
+| 🟡-4 标识符尾锚 `$` | ✅ 收紧为 `\Z`（同族 6 处 pattern 一并收紧） |
+| 🟡-5 单元名白名单为新增前提 | ✅ §5 迁移前提补注第 4 条 |
+
+**🟡-3 就绪修法（未落地，等授权）**：`create_handoff` 在 `get_or_create` **之前**
+记录 `ho_card_preexisted = sm.get_card(state_card_id) is not None`；fail-fast 回滚
+时仅当 `not ho_card_preexisted` 才 `delete_card`（连带 `.lock` / `.owner.json`）。
+如此**预存在的共享 `ho-*` 卡绝不误删**（回应 §8.3 的顾虑），仅回收本次调用新建者。
+落地时须同步改写 `TestFailFastRollbackBoundary::test_fail_fast_leaves_ho_card_known_boundary`
+（其当前断言"残骸留盘"将转为"残骸已回收"）。
+

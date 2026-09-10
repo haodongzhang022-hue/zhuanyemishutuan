@@ -8,10 +8,10 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **261 项全部通过**（门面 **114 项** = 90 + 24 复评第 5 轮判别性
-  回归，独立探针 65 项；底层模块回归 8 + 15 + 19 + 20 + 12 + 8）。历史口径：
-  `28ca7f6` 228（门面 88）/ `60e32ec` 230（门面 90）/ `bca4193` 237（门面 90）→
-  本轮 **261**（门面 114）。
+- 测试基线：全量 pytest **266 项全部通过**（门面 **119 项** = 90 + 24 复评第 5 轮判别性
+  回归 + 5 🟡 收口回归，独立探针 65 项；底层模块回归 8 + 15 + 19 + 20 + 12 + 8）。
+  历史口径：`28ca7f6` 228（门面 88）/ `60e32ec` 230（门面 90）/ `bca4193` 237（门面 90）
+  / `e3195ea` 261（门面 114）→ 本轮 **266**（门面 119）。
 
 ---
 
@@ -681,6 +681,84 @@
 - 头部状态块 + §3 表 P1-3 行同步加注，指向 §5 第 4 条。
 
 ### 自测
-- `pytest -q`：**261 passed**（文档改动，测试计数不变）；`compileall src` OK。
+- `pytest -q`：**261 passed**（本节为纯文档改动，计数不变）；`compileall src` OK。
 - 无代码/测试改动 → 不改行为、不动门禁结论。
+- **后续**：§十一 代码侧 🟡 收口 +5 用例 → 全量 **266 passed**；本节 🟡-2 / 🟡-5 结论不变。
 
+
+---
+
+## 十一、Issue #4 复评第 5 轮 · 架构·开发 代码侧 🟡 收口（`63345ec` 基线 · 非门禁）
+
+> 角色：架构·开发。触发：架构·评审增量复评 `60e32ec` 处置 **`proceed`**（🔴 清零），
+> 点名确认 🟡-2 台账口径 / 🟡-5 契约文档补注，并询问 🟡-1 是否一并收口。
+> 本轮**不含 🔴 修复**，均为 🟡 建议收口 + 判别性回归。
+> 基线：源分支 head 已由上游推进至 `63345ec`（`e3195ea` 🔴A/🔴B 定点修复 + §十
+> 🟡-2/🟡-5 **文档口径**收口）。本节仅收**代码侧** 🟡（🟡-1 / 🟡-4）+ 🟡-3 报告。
+
+### 10.1 收口清单
+
+| 项 | 处置 | 落点 |
+|---|---|---|
+| 🟡-1 `list_pending` 逐文件读未守 | ✅ **一并收口**（同函数口径不一致，低风险） | `handoff/handoff.py::list_pending` |
+| 🟡-2 台账基线并存 | ✅ **已由 §十 收口**（唯一口径 + 历史行）；本轮复核无残留 | `issues/TEST-REGRESSION.md` 头部 |
+| 🟡-3 fail-fast 回滚未含 `ho-*` + `.lock` | ⏸ **本轮不改行为**（上游 §8.3 总师范围冻结下定为已知边界）；**修法已就绪**待授权 | `handoff/handoff.py::create_handoff`（未落地） |
+| 🟡-4 标识符尾锚 `$` 而非 `\Z` | ✅ 收紧为 `\Z`（**同族 6 处 pattern 一并收紧**） | handoff / manager / arbiter / content_archive / session |
+| 🟡-5 单元名白名单为新增前提 | ✅ **已由 §十 收口**（契约文档 §5 第 4 条） | `docs/design/state-secretary-handoff-visibility.md` |
+
+### 10.2 🟡-1 实现（逐文件读守卫）
+
+- **问题**：`list_pending` 只守目录级 `listdir`；`get()` 内部 `exists → open`
+  窗口被并发删除（或半写/损坏）时 `FileNotFoundError` / `JSONDecodeError` 逃逸，
+  与 docstring「不可读即返回空列表」口径不一致。
+- **改法**：单条读取包 `try/except (OSError, ValueError)` → **跳过该条**，不逃逸
+  （与 `session.py::_read_json_dict` 同纪律）；单条异常不影响其余卡列举。
+- **语义影响**：无新增行为面；仅把「裸异常逃逸」改为「跳过」。方法不在
+  `delete_session` 关键路径（仅 docstring 提及），无数据破坏后果。
+
+### 10.3 🟡-4 实现（尾锚 `$` → `\Z`）
+
+Python `$` 匹配**尾换行之前**，`"abc\n"` 原被判合法。**同族 pattern 全部收紧**
+（避免只改一处留同形缺口）：`handoff._CARD_ID_PATTERN`、`manager._SESSION_ID_PATTERN`、
+`arbiter._IDENTIFIER_PATTERN`、`content_archive._IDENTIFIER_PATTERN` /
+`_REF_PATTERN`、`session.py` 内联 `session_id` / `content_ref` 两处 match。
+
+### 10.4 新增回归（5 项，含变异验证）
+
+| 用例 | 断言 | 变异判别力（实测） |
+|---|---|---|
+| `TestListPendingPerFileReadGuard::test_file_removed_between_exists_and_open_is_skipped` | 单条被并发删除 → 跳过，其余仍列出 | 移除守卫 → **FAIL**（`FileNotFoundError`） |
+| `...::test_corrupt_json_entry_is_skipped` | 半写 JSON → 跳过 | 移除守卫 → **FAIL**（`JSONDecodeError`） |
+| `TestIdentifierTrailingNewlineRejected::test_card_id_trailing_newline_rejected` | 尾换行 `card_id` 拒绝（读/删均拒） | 回退 `$` → **FAIL** |
+| `...::test_session_id_trailing_newline_rejected` | 尾换行 `session_id` 拒绝 | 同上 |
+| `...::test_unit_name_trailing_newline_rejected` | 尾换行单元名 → `ValueError` | 同上 |
+
+- 变异矩阵：2 个变异体分别触发 **2 / 1 项 FAIL**；本实现上 **5/5 PASS** → 非恒真。
+- 全量 `pytest -q`：**266 passed ×3**（门面 119 = 114 + 5，独立探针 65）；`compileall` 通过。
+
+### 10.5 🟡-1 自然并发实证（本角色独立探针，不复用作者/测试用例）
+
+口径：**多实例同 `data_dir`**（3 写 + 3 读 × 8s，读线程每轮新建独立 `HandoffBus`
+实例——同实例共享 `RLock` 不逃逸），统计 `list_pending` 逃逸异常数：
+
+| 版本 | `list_pending` 调用数 | 逃逸 `FileNotFoundError` | 逃逸 `JSONDecodeError` |
+|---|---|---|---|
+| 基线 `e3195ea`（无逐文件守卫） | 34,063 | **6,976** | **174** |
+| 收口后（本提交） | 37,353 | **0** | **0** |
+
+### 10.6 🟡-3 就绪修法（未落地 · 等总师授权）
+
+- **顾虑回应**：上游 §8.3 认为回滚须判「是否本次新建」属**行为变更**——已就绪
+  且**不越界**的实现：`create_handoff` 在 `get_or_create` **之前**记录
+  `ho_card_preexisted = sm.get_card(state_card_id) is not None`；fail-fast 回滚时
+  仅当 `not ho_card_preexisted` 才 `delete_card`（连带 `.lock` / `.owner.json`）。
+  **预存在共享卡绝不误删**，仅回收本次调用新建者。
+- **落地时须同步**：改写 `TestFailFastRollbackBoundary::test_fail_fast_leaves_ho_card_known_boundary`
+  （现断言"残骸留盘" → 转为"残骸已回收"）+ 契约文档 §4/§8.3 口径。
+- **本轮不动**：遵守 §8.3 范围冻结与「不越权改架构」，待总师解冻后一并落地。
+
+### 10.7 计数同步
+
+- 全量 **266 项** = 8 + 15 + 65 + 119 + 19 + 20 + 12 + 8（门面 114 → **119**）。
+- 同步 `state-secretary/README.md`、`docs/design/state-secretary-index.md`、
+  `docs/design/state-secretary-module.md` 三处（261 → 266；门面 114 → 119）。

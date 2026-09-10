@@ -108,7 +108,7 @@ class SecretarySession:
             static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
         """
         # 合法性预检
-        if not re.match(r'^[A-Za-z0-9_-]+$', session_id):
+        if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
             raise ValueError(
                 f"非法 session_id: {session_id!r}。仅允许 [A-Za-z0-9_-]。")
 
@@ -184,7 +184,7 @@ class SecretarySession:
             return max_seq
         for t in card.tasks:
             ref = t.content_ref or ""
-            m = re.match(r'^[A-Za-z0-9_-]+-seg(\d+)$', ref)
+            m = re.match(r'^[A-Za-z0-9_-]+-seg(\d+)\Z', ref)
             if m:
                 max_seq = max(max_seq, int(m.group(1)))
         return max_seq

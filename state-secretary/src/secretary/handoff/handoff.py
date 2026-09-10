@@ -16,7 +16,9 @@ from .models import HandoffCard
 # card_id 会参与 ``<data_dir>/<card_id>.json`` 与 ``<reg_dir>/<card_id>.ref``
 # 路径拼接，未校验时 ``"../state/VICTIM"`` 之类的输入构成**路径穿越删除面**
 # （可删 data_dir / handoff-refs 之外的任意文件，并可与 P0-1 连锁破坏不变量）。
-_CARD_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+# 尾锚用 ``\Z``（非 ``$``）：Python 的 ``$`` 匹配**尾换行之前**，会让
+# ``"abc\n"`` 通过校验并进入路径拼接（🟡-4 收紧；同族 pattern 一并收紧）。
+_CARD_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 
 # 引用登记目录（``handoff-refs/`` 与 ``.handoff-refs/``）的**建 / 写 / 删 /
@@ -369,6 +371,14 @@ class HandoffBus:
         回收，或因权限/IO 异常不可读时，返回空列表而非向调用方抛裸异常。
         与 ``_build_ho_reference_index`` 来源 3 的 ``listdir`` 守卫同形
         （该处为本 PR 新增逃逸面，已修）；本处为 ``main`` 既有代码，一并加固。
+
+        🟡-1 同函数口径统一（复评第 5 轮）：**逐文件读路径与目录级守卫同纪律**。
+        ``get()`` 内部走 ``os.path.exists → open``，文件在该窗口内被并发删除
+        （或半写 / 内容损坏）时，原实现会让 ``FileNotFoundError`` /
+        ``JSONDecodeError`` 从本方法逃逸——与"目录不可读即返回空列表"的
+        目录级声明口径不一致。现将单条读取包 ``try/except (OSError, ValueError)``，
+        坏条**跳过**而不逃逸（与 ``session.py::_read_json_dict`` 同纪律）；
+        单条异常不再影响其余待处理卡的列举。
         """
         with self._lock:
             try:
@@ -378,10 +388,16 @@ class HandoffBus:
                 return []
             pending = []
             for f in names:
-                if f.endswith(".json"):
+                if not f.endswith(".json"):
+                    continue
+                # 🟡-1：单条读取异常（exists→open 窗口被并发删除 / 半写 /
+                # JSON 损坏）跳过该条，不向调用方抛裸异常。
+                try:
                     card = self.get(f[:-5])
-                    if card and card.status == "created":
-                        pending.append(card)
+                except (OSError, ValueError):
+                    continue
+                if card and card.status == "created":
+                    pending.append(card)
             return pending
 
     def delete(self, card_id: str) -> bool:

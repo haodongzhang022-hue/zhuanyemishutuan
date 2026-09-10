@@ -2007,3 +2007,91 @@ class TestFailFastRollbackBoundary:
         assert still, (
             "已知边界：残骸无台账/无引用可达 → 后续 delete_session 不回收"
             "（🟡C，契约文档 §4 已声明）")
+
+
+# ------------------------------------------------------------------
+# 🟡-1 复评第 5 轮：list_pending 逐文件读路径与目录级守卫同纪律
+# ------------------------------------------------------------------
+
+class TestListPendingPerFileReadGuard:
+    """``list_pending`` 的**逐文件读**路径须与目录级守卫同纪律：坏条跳过，
+    不逃逸 ``FileNotFoundError`` / ``JSONDecodeError``。
+
+    原实现只守 ``listdir``；``get()`` 内部 ``os.path.exists → open`` 的窗口
+    被并发删除（或半写/损坏）时异常逃逸出本方法，与 docstring「不可读即返回
+    空列表」口径不一致（评审 🟡-1；实测独立 bus 实例 4×4×200 → JSONDecodeError
+    14261、外部截断写 → 9765 + TypeError 2372）。
+    """
+
+    def test_file_removed_between_exists_and_open_is_skipped(
+            self, tmp_dir, monkeypatch):
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        good = bus.create_handoff("ua", "ub", "正常意图", "ctx")
+        bus.create_handoff("uc", "ud", "被删意图", "ctx")
+        assert len(bus.list_pending()) == 2, "前置：两张待处理卡"
+
+        real_open = open
+        victim = os.path.join(bus.data_dir, "uc-ud")
+
+        def flaky_open(file, *args, **kwargs):
+            # 模拟 exists() 判定通过后、open 前文件被并发删除（TOCTOU 窗口）
+            if str(file).startswith(victim):
+                raise FileNotFoundError(2, "No such file or directory", str(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", flaky_open)
+        pending = bus.list_pending()  # 旧实现此处抛 FileNotFoundError
+        monkeypatch.undo()
+
+        assert [c.id for c in pending] == [good.id], \
+            "单条读异常须跳过该条，其余待处理卡仍须列出"
+
+    def test_corrupt_json_entry_is_skipped(self, tmp_dir):
+        """半写/损坏 JSON → 跳过该条，不逃逸 ``JSONDecodeError``。"""
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        good = bus.create_handoff("ua", "ub", "正常意图", "ctx")
+        with open(os.path.join(bus.data_dir, "broken.json"), "w",
+                  encoding="utf-8") as f:
+            f.write("{ half-written")
+
+        assert [c.id for c in bus.list_pending()] == [good.id], \
+            "损坏条目须跳过，不得让 JSONDecodeError 逃逸"
+
+
+# ------------------------------------------------------------------
+# 🟡-4 复评第 5 轮：标识符白名单尾锚 $ → \Z
+# ------------------------------------------------------------------
+
+class TestIdentifierTrailingNewlineRejected:
+    """Python 的 ``$`` 匹配**尾换行之前**，故 ``"abc\\n"`` 原被判合法并进入
+    路径拼接（不可穿越，但口径不严）。尾锚收紧为 ``\\Z``。
+    """
+
+    def test_card_id_trailing_newline_rejected(self, tmp_dir):
+        from secretary.handoff.handoff import _is_valid_card_id
+
+        assert _is_valid_card_id("abc") is True
+        assert _is_valid_card_id("abc\n") is False, \
+            "尾换行不得通过 card_id 白名单（$ → \\Z）"
+
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        card = bus.create_handoff("ua", "ub", "意图", "ctx")
+        assert bus.get(card.id + "\n") is None, "尾换行 card_id 读取须返回 None"
+        assert bus.delete(card.id + "\n") is False, "尾换行 card_id 删除须拒绝"
+
+    def test_session_id_trailing_newline_rejected(self, tmp_dir):
+        from secretary.state.manager import StateManager
+
+        assert StateManager._is_valid_session_id("sid-1") is True
+        assert StateManager._is_valid_session_id("sid-1\n") is False
+        with pytest.raises(ValueError):
+            SecretarySession("sid-1\n", data_dir=tmp_dir)
+
+    def test_unit_name_trailing_newline_rejected(self, tmp_dir):
+        bus = HandoffBus(data_dir=os.path.join(tmp_dir, "handoffs"),
+                         state_root=tmp_dir)
+        with pytest.raises(ValueError):
+            bus.create_handoff("ua\n", "ub", "意图", "ctx")
