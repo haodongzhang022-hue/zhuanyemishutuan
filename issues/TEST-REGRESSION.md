@@ -325,10 +325,14 @@
   ——6 参数化 + 门面 + `_save` 纵深），在修复前 head 上 **8/8 FAIL**（有判别力）。
 
 **④ 🟡 台账/忽略口径收口**
-- `.gitignore` 补 `data/content/`（原文归档根）——原忽略清单为 `state/ bindings/
-  handoffs/ handoff-refs/`，缺 `content/`，默认路径运行后 `git status` 出现未跟踪
-  归档文件（评审+测试双方复现）。现为 `state/ content/ bindings/ handoffs/
-  handoff-refs/`，与「数据根子目录」口径一致。
+- `.gitignore` 补 `data/content/`（原文归档根）——原忽略清单缺 `content/`，默认
+  路径运行后 `git status` 出现未跟踪归档文件（评审+测试双方复现）。现忽略清单为
+  **6 条**数据根项：`state/ content/ bindings/ handoffs/ handoff-refs/
+  .handoff-refs/`（后两项分别由 🔴#4 引用登记与 🟡E 双通道登记引入）。
+  口径说明：`bindings/` 为数据根**结构性目录**（全仓无代码引用，仅忽略项），
+  故「数据根**四子目录**」指会话门面实际派生的
+  `state/ content/ handoffs/ handoff-refs/`；`bindings/`、`.handoff-refs/`
+  为附加项，不与「四子目录」表述冲突。
 - `docs/design/state-secretary-handoff-visibility.md` §3「API 路径保证」口径更正：
   P1-1 修复后该保证**无条件成立**（原文档承诺在登记静默失败时不成立）。
 
@@ -365,6 +369,55 @@
   - `test_secretary_session.py` F841（未用 `ho` 变量）。
 - **核验**：本 PR 四个改动文件 `flake8 --max-line-length=100` **0 告警**
   （基线同口径 5 条）。
+
+### 🔴 修复 #K — 复评 `ee4214e` 打回项独立核验 + 口径收口（PR #7 · 收口轮 3）
+
+> 评审对象 head `ee4214e`（增量 `82807ff..ee4214e`，纯文档/注释/忽略项）。评审
+> 维持 `fix_bug` + `blocked` 上报总师，要求：① 补 Issue #8 影响面同步；② P0-2
+> 无争议先修；③ P0-1 待总师定方向；④ P1-3 删除面白名单。本角色**独立复跑**
+> （自写探针，不复用作者/测试用例）+ 5 版本矩阵（`6393886` / `11dfdd9` /
+> `570c7ee` / `ee4214e` / 现 head）逐项核验。
+
+**一、P0-1 / P0-2 / P1-3 独立复现（`ee4214e`，确认未清零）**
+
+| 项 | 我的独立探针结果（`ee4214e`） |
+|---|---|
+| P0-1 | in-root 名单名目录 × {登记缺失 / 登记失败} → **误删**（`11dfdd9` 同矩阵 OK ⇒ 确为 `570c7ee` 新增回归）；非名单名（`queue`）OK |
+| P0-2 | 注入 `listdir` `OSError` → **逃逸出 `delete_session`**、返回丢失、`state/ho-*.json` 残骸 |
+| P1-3 | `bus.delete('../../…')` → 根外文件被删（返回 `False` 但文件已删）；`_unregister_ref` 穿越删他人 `.ref`；台账 `handoff_ids` 注入经 `delete_session` 可达删除面 |
+
+**二、修复核验（现 head）**
+
+| 项 | 现状 | 证据 |
+|---|---|---|
+| P0-1 | ✅ 闭环 | in-root 名单名目录 12/12 全 OK（现 head 复跑） |
+| P0-2 | ✅ 闭环 | 注入式异常 None、残骸 `[]` |
+| P1-3 | ✅ 闭环 | `delete` 返 `False` 且 victim 完好；`_unregister_ref` 不删他人 `.ref`；台账注入被拦截；`8790e5f` 补 `source_unit/target_unit` 写入面白名单 |
+| 全量 | ✅ | **228 passed**（门面 88 + 独立探针 58）；`compileall` 通过 |
+
+**三、残留边界（本轮实测，非阻塞）**
+
+- **名单目录内再嵌套 ≥ 3 层**：卡目录 `<root>/node_modules/a/b/`（深度 2）**可见**；
+  `<root>/node_modules/a/b/c/`（深度 3）**不可见** → 登记不可用时误删。非名单名
+  （`queue`）任意深度均 OK。已写入契约文档 §3/§4。
+- **根外卡 + 双通道登记均不可用**（外部删 `.ref`）：误删仍在，但 `6393886`(main)
+  同场景即破坏 ⇒ **baseline 既有面，非本 PR 引入**（归因措辞已按此更正）。
+
+**四、本轮改动（仅文档/台账，行为零变更）**
+
+- **Issue #8 正文同步**：🟡A 影响面 `8/8` → **11/11**；作废「仅影响非 API 路径」
+  过度声明（实测 API 卡目录落剪枝名 + 登记不可用同样误删，影响面与写入路径无关）；
+  待办更新为处置状态（🟡A/🟡D/🟡E 已闭环，仅剩 🟡B + 深度残留边界）。
+- `docs/design/state-secretary-handoff-visibility.md` §3/§4：深度边界改为**实测口径**
+  （深度 2 可见 / 深度 3 不可见）+ 补「根外卡 + 登记不可用 = baseline 既有面」。
+- 本节 `.gitignore` 口径精确化（6 条数据根项；「四子目录」指门面派生项，`bindings/`
+  与 `.handoff-refs/` 为附加项）。
+
+**五、待总师裁定**
+
+- P0-1 剪枝方向：现状采用评审倾向的「**保护子树 + 形状判定**」路线（= 评审 §五 ②
+  的加强版，兼容剪枝性能收益）；若总师另定方向（回退剪枝 / 收窄契约），我按裁定返工。
+- 深度残留边界是否需覆盖（会牺牲剪枝收益）。
 
 ## 四、测试环境
 
