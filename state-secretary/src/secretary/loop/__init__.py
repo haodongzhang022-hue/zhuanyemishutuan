@@ -14,6 +14,7 @@ from .loop_guard import (
     MAX_COERCE_DEPTH,
     extract_json_object,
     extract_json_objects,
+    extract_json_objects_report,
     pick_wake_object,
     parse_wake,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "parse_wake",
     "extract_json_object",
     "extract_json_objects",
+    "extract_json_objects_report",
     "pick_wake_object",
     "MAX_COERCE_DEPTH",
 ]

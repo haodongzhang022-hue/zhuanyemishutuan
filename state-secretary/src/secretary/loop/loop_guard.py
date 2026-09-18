@@ -92,6 +92,7 @@ from ..trail import (  # noqa: E402
     attributed,
     collect_marked,
     json_objects_in,
+    json_objects_in_report,
     trail_re,
 )
 
@@ -132,13 +133,29 @@ def extract_json_objects(text: str, budget: Optional[int] = None) -> List[dict]:
     ``should_wake_next()=True``（熔断语义从新入口漏出去，且方向是**放行**）。
 
     **复杂度**（🔴5 复评第 4 轮）：扫描实现收敛到 ``secretary.trail``
-    （``scan_json_spans``，**单次线性**）——未闭合 ``{`` 不再触发"每个起点
-    重扫文末"的 O(n²)（``"{" * 40000`` 从 63 s 降到毫秒级，见该函数 docstring）。
-    ``budget`` 缺省用 ``DEFAULT_SCAN_BUDGET``（超长正文只扫前一段，保守不表态）。
+    （``scan_json_spans``）——候选 ``{`` **独立起算**（``raw_decode``），未闭合
+    ``{`` 不再触发"每个起点重扫文末"的 O(n²)（``"{" * 40000`` 从 63 s 降到毫秒级，
+    见该函数 docstring）。``budget`` 缺省用 ``DEFAULT_SCAN_BUDGET``
+    （超长正文只扫前一段，保守不表态）。
     """
     if not isinstance(text, str) or not text:
         return []
     return json_objects_in(text, DEFAULT_SCAN_BUDGET if budget is None else budget)
+
+
+def extract_json_objects_report(
+        text: str, budget: Optional[int] = None) -> "tuple[List[dict], bool]":
+    """``extract_json_objects`` 的**带降级标记**版本：``(对象清单, degraded)``。
+
+    复评第 5 轮总师裁定"预算触顶**只允许降级为该区间不表态**，**不得**丢掉整段
+    结果；降级须**显式标记**"。本入口即该标记的来源；判定侧（``from_handoff`` /
+    ``pick_wake_object``）据此把安全旗标取**保守方向**——否则"降级"本身又是一条
+    fail-open（上一轮 `MAX_REPAIR_CHARS` 静默收摊就是这么漏卡的）。
+    """
+    if not isinstance(text, str) or not text:
+        return [], False
+    return json_objects_in_report(
+        text, DEFAULT_SCAN_BUDGET if budget is None else budget)
 
 
 def extract_json_object(text: str) -> Optional[dict]:
@@ -462,6 +479,7 @@ class LoopGuard:
         """
         raw: Any = handoff_context
         payload: Any = raw
+        degraded = False
         if isinstance(raw, str) and raw.strip():
             try:
                 payload = json.loads(raw)
@@ -469,9 +487,19 @@ class LoopGuard:
                 # 常见形态：JSON 载荷 + `<!-- loop-budget: … -->` 留痕拼接。
                 # 🔴2：**优先取含 `wake` 键的对象**——正文里"留痕在前"时第一个
                 # 对象是预算留痕（不带 `wake`），盲取第一个 = 判不出静默交接。
-                payload = pick_wake_object(extract_json_objects(raw))
+                objs, degraded = extract_json_objects_report(raw)
+                payload = pick_wake_object(objs)
         if not isinstance(payload, dict):
             payload = None
+        if payload is None and degraded:
+            # **降级不表态 → 安全旗标取保守方向**（复评第 5 轮裁定）：
+            # 扫描降级（正文被上界截断 / 工作量触顶）意味着"后面那一段没看"，
+            # 而静默交接卡**可能就在没看的那一段里**。此时按"判不出"处理
+            # （→ 保守静默），**不得**因为"没找到 `wake` 键"就判"常规接力"——
+            # 后者正是 N1/N2 的 fail-open 方向（卡被丢掉 → `wake=True` 放行）。
+            payload = {"wake": None,
+                       "reason": "扫描降级（正文超上界/工作量触顶）：该区间不表态，"
+                                 "按判不出处理（保守静默）"}
 
         guard = cls(session_id=session_id, data_dir=data_dir, **kwargs)
         # 轮次预算**无条件合并**（常规接力也要带，见上"跨容器/跨棒预算继承"）。
@@ -484,6 +512,12 @@ class LoopGuard:
 
         has_wake = payload is not None and "wake" in payload
         wake_state = parse_wake(payload.get("wake")) if has_wake else None
+        if degraded and wake_state == WAKE_AWAKE:
+            # 降级 = "后面那一段没看" → 那里**可能还有**一张静默卡。
+            # 此时"找到了一张 `wake=True` 的卡"不足以判放行（可能是**更早**的
+            # 那张）→ 按**判不出**处理（保守静默）。方向与上面同：降级本身
+            # **不得**成为 fail-open 通道。
+            wake_state = WAKE_UNKNOWN
         if wake_state == WAKE_AWAKE or not has_wake:
             guard._save()
             return guard
@@ -645,24 +679,42 @@ class LoopGuard:
             # 顺序无关：最长优先，并列取字典序最小（同一次判定的原因唯一）
             merged["reason"] = sorted(reasons, key=lambda x: (-len(x), x))[0]
         if budgets:
+            # 🟡b（复评第 5 轮）：``budget`` 段**只作观测**，**无采纳路径**——
+            # 外部载荷的 ``max_rounds`` 一旦被采纳就是 ``max()`` 抬高上界
+            # = 削弱熔断（与 N1/N2 同属 fail-open），且归属可缺省、不可信正文
+            # 可借此放大预算。消费侧（``adopt_budget``）只读 ``rounds`` / ``fused``。
             merged["budget"] = LoopGuard._merge_budget_values(budgets)
         return merged or None
 
     @staticmethod
     def _merge_budget_values(budgets: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """把多份 ``budget`` 段**逐字段**合并（顺序无关）。
+        """把多份 ``budget`` 段**逐字段**合并（**真顺序无关**）。
 
-        数字取 ``max()``（上界只增不减：``[3, 9]`` → 9，不能被旧值盖小）；
-        其余类型按"最大"的**确定性**定义取（字符串取字典序最大、``None`` 视为
-        缺席、其它类型取 ``repr`` 最大）——目的是**同一次判定的结果与顺序无关**，
-        而不是给"非数字上界"赋业务含义（``budget`` 段本来就只放数字上界）。
+        ⚠️ **只作观测，不被消费**（复评第 5 轮 🟡b · 总师裁定）：本方法的返回值
+        **没有任何采纳路径**——``adopt_budget()`` 只消费 ``rounds`` 与 ``fused``，
+        **不**把外部载荷的 ``max_rounds`` 采纳成本会话的上界。原因：把外部载荷的
+        ``max_rounds`` 采纳进来是 ``max()`` **抬高上界 = 削弱熔断**（方向与 N1/N2
+        同属 fail-open），且归属字段可缺省（"不表态"即被合并），不可信正文可借此
+        放大预算。故这里只保留**观测**语义（供留痕/排查），调用方**不得**据此改
+        ``self.max_rounds`` 等上界。
+
+        合并口径（**N3 修**：旧实现 ``None`` 参与比较 → 顺序相关）：
+
+        - ``None`` = **缺席**，**不参与比较**（``[{"x": None}, {"x": 9}]`` 与
+          ``[{"x": 9}, {"x": None}]`` 都必须读成 ``9``；旧实现在后者上返回
+          ``None``——``max(9, None, key=repr)`` 比的是 ``repr``，``'None' > '9'``）；
+        - 数字（排除 ``bool``）取 ``max()``；字符串取字典序最大；
+        - 其余（混类型/怪值）按 ``(类型名, repr)`` 的**确定性**全序取大——
+          同样与顺序无关，且不给"非数字上界"赋业务含义。
         """
         out: Dict[str, Any] = {}
         for b in budgets:
             if not isinstance(b, dict):
                 continue
             for k, v in b.items():
-                if k not in out or out[k] is None:
+                if v is None:
+                    continue          # N3：None 视为缺席（不参与比较）
+                if k not in out:
                     out[k] = v
                     continue
                 cur = out[k]
@@ -673,7 +725,8 @@ class LoopGuard:
                 elif isinstance(v, str) and isinstance(cur, str):
                     out[k] = max(cur, v)
                 else:
-                    out[k] = max(cur, v, key=repr)
+                    out[k] = max(cur, v,
+                                 key=lambda x: (type(x).__name__, repr(x)))
         return out
 
     @staticmethod

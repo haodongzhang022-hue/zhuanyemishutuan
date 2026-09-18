@@ -752,7 +752,8 @@ class CheckpointProbe:
             # ② 正文里散落的顶层 JSON 对象（如 `{"checks_used": 5}` / 事件载荷）
             #    ——**与留痕一起取 max**（🔴1 残留：旧实现只扫留痕，
             #    `trail(2) + {"checks_used": 5}` 读成 2，载荷的 5 直接丢）。
-            #    扫描用 `secretary.trail.scan_json_spans`（单次线性，🔴5）。
+            #    扫描用 `secretary.trail.scan_json_spans`（候选 `{` 独立起算
+            #    `raw_decode`，构造性"不漏"，复评第 5 轮改实现路径）。
             for obj in json_objects_in(value):
                 if not attributed(obj, "checkpoint_key", cp_key):
                     continue
