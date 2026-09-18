@@ -178,6 +178,24 @@
 
 # $ 节点兜底：未指定角色名（@ 路径不带括号角色）或非角色 key 事件时，
 # 走默认角色「秘书·接待」——与 .cnb/settings.yml 的 npc.defaultRole 对齐。
+# 显式注入 CNB_NPC_NAME：@npc 事件由平台注入 CNB_NPC_PROMPT，但兜底路径需自报
+# 角色名，方能从 .cnb/settings.yml 回落取到「秘书·接待」的 prompt（评审建议）。
 $:
-  issue.comment@npc: *npc
-  pull_request.comment@npc: *npc
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            CNB_NPC_NAME: "秘书·接待"
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            CNB_NPC_NAME: "秘书·接待"
+            DSH_MODEL: deepseek-v4-flash

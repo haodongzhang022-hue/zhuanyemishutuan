@@ -60,7 +60,9 @@ docs/dsh-ecosystem-adaptation.md → 本文件
 ```
 
 触发：评论中 `@dongdongxiaozu/zhuanyemishutuan(秘书·评审)` → 平台按 key 路由到该 pipeline。
-未带角色名时由 `$` 段兜底走默认角色（`秘书·接待`，与 `npc.defaultRole` 对齐）。
+未带角色名时由 `$` 段兜底走默认角色。`$` 段显式注入 `CNB_NPC_NAME: 秘书·接待`
+与 `npc.defaultRole` 对齐——`@npc` 事件由平台注入 `CNB_NPC_PROMPT`，但兜底路径需
+自报角色名，镜像才能从 `.cnb/settings.yml` 回落到对应 prompt。
 
 7 个角色：`秘书·接待` / `秘书·秘书长` / `秘书·状态管理` / `秘书·会话` / `秘书·开发` / `秘书·评审` / `秘书·测试`。
 
