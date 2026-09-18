@@ -70,6 +70,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .backoff import DEFAULT_MAX_ATTEMPTS, StepBackoff
 
+# 平台语义对齐（**具体任务的真实约束**）：`cnb:await` 只能在**同一事件**配对，
+# 且一个 key 仅能 resolve 一次。挂之前先校验，配不上对就降级 crontab——
+# 否则 await 会静默等不到（要靠平台死锁检测才发现）。见 `collab/platform.py`。
+from .platform import (  # noqa: E402  （同包内相对导入，放这里保持常量可见）
+    await_key_for,
+    resolve_driver,
+)
+
 # 会话/检查点标识白名单（与 LockRegistry / LoopGuard 同族口径，尾锚 \Z）
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_.:-]+\Z')
 
@@ -188,6 +196,10 @@ class ProbeEvent:
 
     checkpoint_key: str = ""
     kind: str = CHECK_EVENT
+    # 平台语义对齐（Issue #14）：await 只能**同一事件**配对。
+    # 跨仓传递时必须带上这两项，否则接收方无从校验、只能保守降级 crontab。
+    waiter_event: str = ""
+    resolver_event: str = ""
     verdict: str = UNKNOWN
     # 采集到的**轻量**事实（锁表视图 / 版本号 / 外部信号），不塞原始数据
     facts: Dict[str, Any] = field(default_factory=dict)
@@ -205,6 +217,8 @@ class ProbeEvent:
         return {
             "checkpoint_key": self.checkpoint_key,
             "kind": self.kind,
+            "waiter_event": self.waiter_event,
+            "resolver_event": self.resolver_event,
             "verdict": self.verdict,
             "facts": dict(self.facts),
             "driver": self.driver,
@@ -225,6 +239,8 @@ class ProbeEvent:
         ev = cls()
         ev.checkpoint_key = str(data.get("checkpoint_key") or "")
         ev.kind = str(data.get("kind") or CHECK_EVENT)
+        ev.waiter_event = str(data.get("waiter_event") or "")
+        ev.resolver_event = str(data.get("resolver_event") or "")
         ev.verdict = str(data.get("verdict") or UNKNOWN)
         ev.facts = data.get("facts") if isinstance(data.get("facts"), dict) else {}
         ev.driver = str(data.get("driver") or DRIVER_AWAIT)
@@ -252,6 +268,10 @@ class Checkpoint:
     await_key: str = ""
     resolve_status: str = ""         # ""(未挂) / "awaiting" / "resolved" / "timeout"
     sn: str = ""
+    # 平台语义对齐（Issue #14）：await 只能**同一事件**配对。
+    # 两侧事件留痕，便于事后复核"为什么这次降级成了 crontab"。
+    waiter_event: str = ""           # 探测方（等待方）这条 pipeline 的事件
+    resolver_event: str = ""         # 放锁方（对端）那条 pipeline 的事件
     checks_used: int = 0             # 已探测次数（**最多 6 次**）
     max_checks: int = DEFAULT_MAX_ATTEMPTS
     next_delay_sec: float = 0.0      # 下一次等待时长（取阶梯）
@@ -280,6 +300,8 @@ class Checkpoint:
             "await_key": self.await_key,
             "resolve_status": self.resolve_status,
             "sn": self.sn,
+            "waiter_event": self.waiter_event,
+            "resolver_event": self.resolver_event,
             "checks_used": self.checks_used,
             "max_checks": self.max_checks,
             "checks_left": self.checks_left(),
@@ -305,6 +327,8 @@ class Checkpoint:
         cp.await_key = str(data.get("await_key") or "")
         cp.resolve_status = str(data.get("resolve_status") or "")
         cp.sn = str(data.get("sn") or "")
+        cp.waiter_event = str(data.get("waiter_event") or "")
+        cp.resolver_event = str(data.get("resolver_event") or "")
         cp.checks_used = int(data.get("checks_used") or 0)
         cp.max_checks = int(data.get("max_checks") or DEFAULT_MAX_ATTEMPTS)
         cp.next_delay_sec = float(data.get("next_delay_sec") or 0.0)
@@ -454,6 +478,8 @@ class CheckpointProbe:
         await_key: str = "",
         max_checks: Optional[int] = None,
         note: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
     ) -> Checkpoint:
         """登记一个检查点（**幂等**：同键已存在则原样返回，不重置预算）。
 
@@ -470,6 +496,8 @@ class CheckpointProbe:
             holder=str(holder or ""),
             scope=str(scope or ""),
             await_key=str(await_key or ""),
+            waiter_event=str(waiter_event or ""),
+            resolver_event=str(resolver_event or ""),
             max_checks=(self.max_checks if max_checks is None
                         else max(1, int(max_checks))),
             created_at=self._clock(),
@@ -512,16 +540,28 @@ class CheckpointProbe:
         `resume_required`（停止自动挂账，交回人工/上游）。
         """
         n = cp.max_checks if cp is not None else self.max_checks
+        we = cp.waiter_event if cp is not None else ""
+        re_ = cp.resolver_event if cp is not None else ""
         rows: List[Dict[str, Any]] = []
         for i in range(n):
             st = self.backoff.status(i)
-            driver = _driver_for_delay(st.delay_sec, self.await_max_sec)
+            wanted = _driver_for_delay(st.delay_sec, self.await_max_sec)
+            # 平台语义校验：await 要求**同一事件**配对且 key 仅能 resolve 一次。
+            # 配不上对就**在计划里就**显示降级后的真实落点（不是"计划一套、执行一套"）。
+            v = resolve_driver(wanted, checkpoint_key=(cp.key if cp else ""),
+                               attempt=i, waiter_event=we, resolver_event=re_,
+                               await_max_sec=self.await_max_sec)
+            driver = v.driver
             rows.append({
                 "check": i + 1,
                 "delay_sec": st.delay_sec,
                 "label": st.label,
                 "at_top": st.at_top,
                 "driver": driver,
+                "requested_driver": wanted,
+                "downgraded": v.downgraded,
+                "downgrade_reason": v.reason if v.downgraded else "",
+                "await_key": v.await_key,
                 "crontab": (_cron_fixed_5min(st.delay_sec, self.crontab_base_minutes)
                             if driver == DRIVER_CRONTAB else ""),
                 "local_cpu": "0（不占构建核时）",
@@ -553,12 +593,26 @@ class CheckpointProbe:
         sn: str = "",
         driver: str = DRIVER_AWAIT,
         note: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
+        stage: str = "stages",
     ) -> Optional[Checkpoint]:
         """登记"等待已挂到平台语义上"：挂上了 → 本地**零占用**（可被回收）。
 
         这对应 `.cnb.yml` 里的 `cnb:await`（配对键 `await_key`）——
         锁/状态一旦变化，由对端 `cnb:resolve` 唤醒；也可由外部 webhook
         触发 `api_trigger` 再跑（`external_webhook`）。
+
+        **平台语义校验（Issue #14 对齐官方文档）**：`cnb:await` 要求
+        「只能对**同一个事件**触发的 pipeline 做 await/resolve」且
+        「一个 key **仅能 resolve 一次**」。因此这里在真正挂之前过一道
+        `resolve_driver()`：
+
+        - 两侧事件不同 / 不可判定 / 不在 `stages` → **自动降级 `crontab`**
+          （平台代跑 + 平台死锁检测兜底），并在 `history` 里留下降级理由；
+        - `await_key` **按轮次自动生成**（`probe:<key>:r<checks_used>`）——
+          复用同一 key 会让第 2 次及以后的 await 永远等不到 resolve；
+        - 显式传入的 `await_key` 仍尊重（调用方明确口径优先）。
         """
         cp = self.load(key)
         if cp is None:
@@ -567,14 +621,35 @@ class CheckpointProbe:
             raise ValueError(
                 f"非法平台落点: {driver!r}（不得为本地空转/人工落点）。"
                 f"允许: {ALL_DRIVERS}")
-        if await_key:
+        # 两侧事件：显式传入优先，否则用检查点登记时留痕的事件
+        we = waiter_event or cp.waiter_event
+        re_ = resolver_event or cp.resolver_event
+        verdict = resolve_driver(
+            driver, checkpoint_key=key, attempt=cp.checks_used,
+            waiter_event=we, resolver_event=re_, stage=stage,
+            await_max_sec=self.await_max_sec,
+        )
+        if we:
+            cp.waiter_event = str(we)
+        if re_:
+            cp.resolver_event = str(re_)
+        if verdict.downgraded:
+            driver = verdict.driver
+        if driver == DRIVER_AWAIT:
+            cp.await_key = str(await_key) if await_key else verdict.await_key
+        elif await_key:
             cp.await_key = str(await_key)
         if sn:
             cp.sn = str(sn)
         cp.resolve_status = "awaiting"
         cp.history.append({
             "at": self._clock(), "action": "platform_wait", "driver": driver,
+            "requested_driver": verdict.requested,
+            "downgraded": verdict.downgraded,
+            "downgrade_reason": verdict.reason if verdict.downgraded else "",
             "await_key": cp.await_key, "sn": cp.sn, "note": note,
+            "waiter_event": cp.waiter_event, "resolver_event": cp.resolver_event,
+            "platform_sources": list(verdict.sources),
         })
         self._save(cp)
         return cp
@@ -786,6 +861,8 @@ class CheckpointProbe:
         event = ProbeEvent(
             checkpoint_key=cp.key,
             kind=cp.kind,
+            waiter_event=cp.waiter_event,
+            resolver_event=cp.resolver_event,
             verdict=verdict,
             facts=dict(facts or cp.last_facts),
             driver=driver,
@@ -825,8 +902,17 @@ class CheckpointProbe:
         return _dispatch_for_session(
             event, sid, self._clock, self.crontab_base_minutes)
 
-    def dispatch_core(self, event: ProbeEvent) -> Dict[str, Any]:
-        """dispatch 的**核心实现**（实例内直接调用；跨仓共享走模块级函数）。"""
+    def dispatch_core(
+        self,
+        event: ProbeEvent,
+        checkpoint: Optional[Checkpoint] = None,
+    ) -> Dict[str, Any]:
+        """dispatch 的**核心实现**（实例内直接调用；跨仓共享走模块级函数）。
+
+        Args:
+            event: 探测产出的结构化事件（跨仓时由对端序列化而来）
+            checkpoint: 可选上下文（跨仓纯函数路径用；给了就不读本地磁盘）
+        """
         if event.verdict == PROCEED:
             return {
                 "action": "resume",
@@ -859,18 +945,39 @@ class CheckpointProbe:
                 "reason": event.reason + "｜需人工 resume(by=…, reason=…) 留痕解锁",
             }
         if event.driver == DRIVER_AWAIT:
-            return {
-                "action": "platform_await",
-                "driver": DRIVER_AWAIT,
-                "trigger": {
-                    "type": "cnb:await",
-                    "key": f"{self.session_id}-{event.checkpoint_key}",
-                    "note": "零占用挂起；锁/状态变化时由对端 cnb:resolve 唤醒。"
-                            "**本地不 sleep、不轮询**",
-                },
-                "wake_allowed": False,
-                "reason": event.reason,
-            }
+            # 平台语义校验：await 必须**同一事件**配对，且 key 仅能 resolve 一次。
+            # 配不上对就降级 crontab——不硬上一个"一定会等不到"的 await。
+            # 上下文来源：显式传入（跨仓）→ 本地检查点（本地）。
+            cp = checkpoint if checkpoint is not None else self.load(
+                event.checkpoint_key)
+            v = resolve_driver(
+                DRIVER_AWAIT, checkpoint_key=event.checkpoint_key,
+                attempt=(cp.checks_used if cp else 0),
+                waiter_event=(cp.waiter_event if cp else ""),
+                resolver_event=(cp.resolver_event if cp else ""),
+                await_max_sec=self.await_max_sec,
+            )
+            if not v.downgraded:
+                return {
+                    "action": "platform_await",
+                    "driver": DRIVER_AWAIT,
+                    "trigger": {
+                        "type": "cnb:await",
+                        # key 带**轮次**：官方「一个 key 仅能 resolve 一次」，
+                        # 复用同一 key 会让第 2 次起永远等不到。
+                        "key": v.await_key or await_key_for(
+                            event.checkpoint_key,
+                            (cp.checks_used if cp else 0)),
+                        "note": "零占用挂起；锁/状态变化时由对端 cnb:resolve 唤醒。"
+                                "**本地不 sleep、不轮询**",
+                    },
+                    "wake_allowed": False,
+                    "reason": event.reason,
+                }
+        else:
+            v = None
+        downgrade_reason = (
+            v.reason if v is not None and v.downgraded else event.reason)
         return {
             "action": "platform_crontab",
             "driver": DRIVER_CRONTAB,
@@ -882,6 +989,9 @@ class CheckpointProbe:
                 "note": "长等待交**平台**定时任务到点代跑一次探测；平台最小间隔 5 分钟",
             },
             "wake_allowed": False,
+            "downgraded": bool(v is not None and v.downgraded),
+            "downgrade_reason": downgrade_reason if v is not None
+            and v.downgraded else "",
             "reason": event.reason,
         }
 
@@ -998,18 +1108,22 @@ def _dispatch_for_session(
     clock: Optional[Callable[[], float]] = None,
     crontab_base_minutes: int = 5,
     await_max_sec: float = AWAIT_MAX_SEC,
+    checkpoint: Optional[Checkpoint] = None,
 ) -> Dict[str, Any]:
     """按**指定会话号**算落点（纯函数：不读不写任何检查点状态）。
 
     `CheckpointProbe.dispatch()` 与模块级 `dispatch_shared()` **共用这一条**算法——
     两处各写一遍就会分叉（"本地这么判、跨仓那么判"，正是协同漂移的来源）。
+
+    `checkpoint` 为**跨仓/纯函数**路径下的可选上下文：跨仓事件里带的事件名与轮次
+    不可能从本地检查点读出来（那是**别人的**会话），只能由事件自己携带。
     """
     if session_id == "":
         session_id = "shared"
     probe = CheckpointProbe(
         session_id, backoff=None, clock=clock,
         crontab_base_minutes=crontab_base_minutes, await_max_sec=await_max_sec)
-    return probe.dispatch_core(event)
+    return probe.dispatch_core(event, checkpoint=checkpoint)
 
 
 def dispatch_shared(
@@ -1038,8 +1152,27 @@ def dispatch_shared(
     await_max = getattr(rules, "probe_await_max_sec", AWAIT_MAX_SEC)
     if not isinstance(await_max, (int, float)) or isinstance(await_max, bool):
         await_max = AWAIT_MAX_SEC
-    out = _dispatch_for_session(ev, sid, None, crontab_base_minutes, await_max)
+    # 跨仓上下文：**只能由事件自带**（对方的检查点不在本地磁盘上，
+    # 也不能按本地会话号去读——那会读到别人的/读不到）。
+    # 事件没带侧边事件名时 → 两侧均不可判定 → 落点保守降级 crontab（平台兜底）。
+    ctx = None
+    facts = ev.facts if isinstance(ev.facts, dict) else {}
+    if ev.waiter_event or ev.resolver_event or facts.get("waiter_event")             or facts.get("resolver_event") or facts.get("checks_used"):
+        ctx = Checkpoint(
+            key=str(event.get("checkpoint_key") if isinstance(event, dict)
+                    else ev.checkpoint_key or "shared"),
+            waiter_event=str(ev.waiter_event or facts.get("waiter_event") or ""),
+            resolver_event=str(ev.resolver_event
+                               or facts.get("resolver_event") or ""),
+        )
+        try:
+            ctx.checks_used = int(facts.get("checks_used") or 0)
+        except (TypeError, ValueError):
+            ctx.checks_used = 0
+    out = _dispatch_for_session(ev, sid, None, crontab_base_minutes, await_max,
+                                checkpoint=ctx)
     out["verdict"] = probe_verdict_of(ev)
+    out["session_id"] = sid          # 归属会话随事件流转（接收方据此知道是谁的检查点）
     out["shared"] = True
     return out
 

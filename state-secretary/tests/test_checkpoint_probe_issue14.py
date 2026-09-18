@@ -139,13 +139,32 @@ class TestBudget:
 # ------------------------------------------------------------------
 
 class TestNonPolling:
-    def test_short_waits_use_platform_await(self, tmp_probe):
-        """短等待（≤5 分钟）挂 `cnb:await`：零占用，状态一变就醒。"""
-        plan = tmp_probe.delay_plan()
+    def test_short_waits_use_platform_await_when_pairing_ok(self, tmp_probe):
+        """短等待（≤5 分钟）**且两侧同一事件**时挂 `cnb:await`：零占用，状态一变就醒。
+
+        Issue #14 本轮（对齐官方文档）：`cnb:await` 要求「只能对**同一个事件**触发的
+        pipeline 做 await/resolve」。故这里显式给出两侧同一事件（`push`）。
+        """
+        cp = tmp_probe.create("pair-ok", kind=CHECK_LOCK,
+                              waiter_event="push", resolver_event="push")
+        plan = tmp_probe.delay_plan(cp)
         short = [r for r in plan if r["delay_sec"] and r["delay_sec"] <= 300]
         assert short, "应有短等待档"
         assert all(r["driver"] == DRIVER_AWAIT for r in short)
         assert all(r["crontab"] == "" for r in short)
+
+    def test_short_waits_without_event_pairing_fall_back_to_crontab(self, tmp_probe):
+        """**反向对照**：配不上对（事件未知/不同）→ 短等待也**不**硬挂 await。
+
+        官方口径：不同事件的 await/resolve **配不上对**，挂上去就是"等不到"，
+        只能靠平台死锁检测兜底。故宁可在计划阶段就降级 crontab。
+        """
+        cp = tmp_probe.create("pair-unknown", kind=CHECK_LOCK)   # 两侧事件均未知
+        plan = tmp_probe.delay_plan(cp)
+        short = [r for r in plan if r["delay_sec"] and r["delay_sec"] <= 300]
+        assert all(r["driver"] == DRIVER_CRONTAB for r in short)
+        assert all(r["downgraded"] is True for r in short)
+        assert all(r["crontab"] == "*/5 * * * *" for r in short)
 
     def test_long_waits_use_platform_crontab(self, tmp_probe):
         """长等待（>5 分钟）交**平台定时任务**到点代跑——平台是"不睡觉的进程"。"""
@@ -180,12 +199,19 @@ class TestNonPolling:
         assert all(r["local_cpu"].startswith("0") for r in plan)
 
     def test_waiting_probe_reports_platform_instruction(self, tmp_probe):
-        """等待中的探测 → 给出**平台指令**（await/crontab），不是"再睡一会"。"""
-        tmp_probe.create("c2", kind=CHECK_EVENT)
+        """等待中的探测 → 给出**平台指令**（await/crontab），不是"再睡一会"。
+
+        Issue #14 本轮：`cnb:await` 要求**同一事件**配对，故这里显式给出两侧
+        同一事件（`push`）——配不上对时落点会（正确地）降级 crontab。
+        """
+        tmp_probe.create("c2", kind=CHECK_EVENT,
+                         waiter_event="push", resolver_event="push")
         out = tmp_probe.probe("c2", event_fired=False)     # 第 1 次 → 10s
         dis = tmp_probe.dispatch(out.event)
         assert dis["action"] == "platform_await"
         assert dis["trigger"]["type"] == "cnb:await"
+        # key 带**轮次**（官方：一个 key 仅能 resolve 一次；复用会让第 2 次起等不到）
+        assert dis["trigger"]["key"] == "probe:c2:r1"
         assert "不 sleep" in dis["trigger"]["note"]
         # 走到长等待档（第 5 次 = 6 分钟）→ 交平台定时任务（反向：不是本地循环）
         for _ in range(4):
@@ -321,12 +347,26 @@ class TestJudge:
         assert seq == sorted(seq), f"下一次等待只增不减: {seq}"
 
     def test_unknown_keeps_waiting_not_proceed(self, tmp_probe):
-        """unknown 的处置是"继续等"（挂检查点），**不是**放行。"""
-        tmp_probe.create("cp-u", kind=CHECK_LOCK, scope="card:y")
+        """unknown 的处置是"继续等"（挂检查点），**不是**放行。
+
+        落点同为平台语义——**同一事件**时挂 `cnb:await`；配不上对则 crontab。
+        这里两种都验：关键是"继续等"，而不是"放行"。
+        """
+        tmp_probe.create("cp-u", kind=CHECK_LOCK, scope="card:y",
+                         waiter_event="push", resolver_event="push")
         out = tmp_probe.probe("cp-u")
         assert out.verdict == UNKNOWN
         assert out.event.next_delay_sec == 30.0, "已等过 10s 档，下一次取 30s 档"
         assert tmp_probe.dispatch(out.event)["action"] == "platform_await"
+
+        # 反向对照：配不上对 → 落点降级 crontab，但**判定仍是不放行**（继续等）
+        tmp_probe.create("cp-u2", kind=CHECK_LOCK, scope="card:y2")
+        out2 = tmp_probe.probe("cp-u2")
+        assert out2.verdict == UNKNOWN
+        dis2 = tmp_probe.dispatch(out2.event)
+        assert dis2["action"] == "platform_crontab"
+        assert dis2["downgraded"] is True
+        assert dis2["wake_allowed"] is False
 
 
 def tmp_probe_dispatch(sec, out):

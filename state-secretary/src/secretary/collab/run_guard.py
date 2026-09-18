@@ -42,6 +42,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .platform import impact_available
 from .rules import CollabRules
 
 RUN = "run"                          # 放行执行
@@ -153,6 +154,10 @@ class RunDecision:
     prior_count: int = 0
     max_identical_repeats: int = 1
     alternatives: List[str] = field(default_factory=list)
+    # 能力降级留痕（Issue #14 本轮）：判不出"能不能增量"时**保守放行**并说明原因，
+    # 不静默跳过（漏跑比多跑危险）。
+    degraded: bool = False
+    degrade_reason: str = ""
 
     @property
     def should_run(self) -> bool:
@@ -172,6 +177,8 @@ class RunDecision:
             "prior_count": self.prior_count,
             "max_identical_repeats": self.max_identical_repeats,
             "alternatives": list(self.alternatives),
+            "degraded": self.degraded,
+            "degrade_reason": self.degrade_reason,
         }
 
 
@@ -215,7 +222,8 @@ class RunScopeGuard:
 
     def decide(self, mode: str = "", revision: Any = "",
                impact: Any = "", command: str = "",
-               last_verdict: Any = "", window_repeats: int = 1) -> RunDecision:
+               last_verdict: Any = "", window_repeats: int = 1,
+               base: Optional[str] = None, event: str = "") -> RunDecision:
         """判定本次是否该跑。
 
         Args:
@@ -225,6 +233,8 @@ class RunScopeGuard:
             command: 实际命令（构建/测试）
             last_verdict: 上一次同口径的结论（用于"上一轮不绿可重跑"例外）
             window_repeats: 想连跑几次（> 上界 → 稳定性滥用）
+            base: 基线版本（判"能否算受影响面"用）；``None`` = 未提供
+            event: 触发事件名（判"能否算受影响面"用，如 `branch.create`）
         """
         rules = self.rules
         eff_mode = mode if mode in ("scan", "full") else rules.scan_default_mode
@@ -249,7 +259,21 @@ class RunScopeGuard:
             )
 
         key = self.key_of(eff_mode, revision, impact, cmd)
-        # ② 四元组任一缺失 → 判不出"是不是同一口径" → 不拦（保守）
+        # ② 口径信息不全 / 能力缺失 → 判不出"是不是同一口径" → **保守放行**。
+        #
+        # 能力探测（Issue #14 本轮，官方 SCA 增量规则同源）：判重的可信前提是
+        # **能算受影响面**。算不出（新建分支 push 无基准 / 受影响面为空）时，
+        # 空 impact 会被归一化成同一个合法指纹 → 不同变更集可能被误判成"同一口径"
+        # → **该跑的被跳过**（漏跑，方向危险）。故此处取安全一侧：宁可多跑，不可漏跑。
+        cap = impact_available(revision, base=base, impact=impact, event=event)
+        if not cap["available"] and cap["degraded"]:
+            return RunDecision(
+                action=RUN,
+                reason=f"降级放行（{cap['action']}）：{cap['reason']}",
+                key=key, prior_count=0,
+                max_identical_repeats=rules.max_identical_repeats,
+                degraded=True, degrade_reason=cap["reason"],
+            )
         if not _norm_revision(revision) or not cmd:
             return RunDecision(
                 action=RUN,

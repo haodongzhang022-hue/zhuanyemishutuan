@@ -209,3 +209,91 @@ wp.explain()                             # "等待是否占 CPU"的完整口径
 - **非法阶梯会被拒绝**：出现回退档位（如 `[60, 30]`）直接 `ValueError`——
   "等待被缩短"在入口就挡掉，而不是等到运行时才发现承诺被回退。
 - **规则包缺失/损坏**：一律回落内置默认（不抛、不静默乱读）。
+
+## 7. 平台语义对齐（v0.3 · Issue #14 本轮）
+
+> 检查一下这个功能是否正常了…另外这个功能可能也有其他用户开发了，可以检索一下有没有。
+> 有可能开发的比我们处理的要好，或者**官方有没有对此有最佳实践可以参考过来**。
+> 帮助我们把这个功能开发到完善，然后**分配到组织下，实现各个仓库的通用**。
+
+### 7.1 查证结果：官方有最佳实践，且**推翻了我们两处设计**
+
+方向（事件驱动 + 零占用挂起）是对的，但**抽象的"平台语义"≠ 具体任务的真实约束**。
+逐条查证官方文档后，`cnb:await` 有两条**会让落点失效**的硬约束：
+
+| 官方约束（原文） | 原实现的问题 | 收口 |
+|---|---|---|
+| 「只能对**同一个事件**触发的 pipeline 进行 await 和 resolve 操作」 | 探测/干活 pipeline 常由 `crontab`/`api_trigger` 触发，而放锁方多在 `push`/评论事件 → **配不上对，await 永远等不到** | `await_eligible()`：不同事件/不可判定 → **降级 `crontab`**（平台代跑，**且平台会做死锁检测**） |
+| 「一个 `key` **仅能 resolve 一次**（可 await 多次）」 | 同一检查点第 4、5 次探测复用同一 key → 第 2 次起**必死等** | `await_key_for(ck, attempt)`：key 带**轮次**，每轮唯一 |
+| 「await-resolve 任务只能运行在流水线的 `stages` 中」（`endStages`/`failStages` 内不生效） | 收尾/失败阶段挂 await 会**直接不生效** | `await_stage_ok()`：位置校验 |
+
+出处：`/zh/build/internal-steps/cnb/await-resolve.md`。
+
+**降级不等于丢功能**：`crontab` 仍是**平台**在等（平台是那个不睡觉的进程），
+本地 CPU 占用恒为 **0**；两处落点都**不允许**本地 sleep/轮询。
+
+代码口径：`secretary/collab/platform.py`
+（`await_eligible` / `await_key_for` / `resolve_driver` / `platform_report`）。
+
+### 7.2 官方最佳实践对照（"别人/官方怎么做的"）
+
+| 能力 | 官方已有（出处） | 我们已有 | 本轮补的缺口 |
+|---|---|---|---|
+| PR 代码评审 | `cnbcool/code-review`：**diff 增量**、过滤非代码文件、`include_existing_comments` 拉历史评论**避免重复**、`min_severity`/`min_confidence`/`exclude_categories` 降噪、`max_comments` 截断、`auto` 评审事件 | `decide_scan()` 日常只审变化；`begin_review()` 只在开启评审时记版本；`RunScopeGuard` 同口径只跑一次 | **确定性**去重：官方把"别重复刷评论"交给**模型判断**；我们补 `review_fingerprint`（类别 + 语义锚点，**不含路径/行号**）→ 同一问题不报第二遍，重复项**结转** |
+| 增量扫描 | SCA 插件：「同一组件同一 CVE **不重复阻断**」「**内容未变化的文件重命名不重复产生**」 | 同口径指纹（范围+版本+受影响面+命令） | 把"改名不产生新工作"升级为通用不变式（锚点不含路径）；并补**能力探测降级** |
+| 零占用等待 | `cnb:await` / `cnb:resolve`（挂起不占核时）+ 平台**死锁检测** | `probe` 的 `platform_await` 落点 + 固定 `*/5` crontab 兜底 | 挂之前先过**同一事件**与 **key 一次性**约束（否则等不到才发现） |
+
+**结论（回"有没有比我们做得更好的"）**：官方在**评审内容层**做得更成熟
+（评审插件的降噪/去重/事件表态），我们在**协同调度层**做得更细（多仓一份规则、
+熔断预算、探测预算、能力降级）。两者是**不同层**，故本轮取"官方做对的点"补齐
+我们的确定性去重与能力降级，而不是重复实现一个评审插件。
+
+### 7.3 能力探测与降级（判不出就不增量）
+
+`RunScopeGuard` 的"同一口径不重复"依赖**受影响面**。若某次触发**拿不到变更集**
+（新建分支 push 没有上一个 commit / 受影响面为空），空 impact **本身是一个合法指纹**
+→ 不同变更集可能撞成同一个 → **该跑的被跳过**（漏跑，方向危险）。
+
+按官方 SCA 增量口径（"判不出新增就不报增量"）改为**保守放行**：
+
+| 情形 | 判定 |
+|---|---|
+| 有版本 + 有具体受影响面 | 正常增量判重 |
+| 缺 `revision`（不知道被测版本） | **降级放行**（`conservative_run`）+ 留痕 |
+| `base` 给空 / `branch.create`（无变更基准） | **降级放行** |
+| 有 base 但受影响面为空（算出来是空 vs 算不出来无法区分） | **降级放行** |
+
+口径：**漏跑比多跑危险**，故一律取安全一侧。代码：`platform.impact_available()`。
+
+### 7.4 分发到组织（各仓库通用）
+
+**分发的是内容，不是文档**：
+
+| 分发物 | 作用 | 说明 |
+|---|---|---|
+| `shared/collab/organization.yaml` | **组织级语义基线（全组织一份）** | 各仓只需有这一份，`load_rules()` 从任意子目录向上都能取到**同一份** |
+| `shared/collab/collab-rules.yaml` | 仓库级**数值覆写**模板 | **已存在则不覆盖**（那是该仓的数值差异，不该被分发抹掉） |
+| `scripts/distribute-collab-rules.sh` | 分发**并校验** | 默认 dry-run；`--apply` 才写；铺完当轮可校验 |
+
+```bash
+# 先看会动哪些仓（安全默认）
+scripts/distribute-collab-rules.sh --group dongdongxiaozu
+
+# 真正写入（每仓建分支，不直推 main）
+scripts/distribute-collab-rules.sh --group dongdongxiaozu --apply
+```
+
+**为什么是脚本 + 校验**：口径漂移的根因从来不是"没人写文档"，而是"每仓各写一套、
+写完没人验"。分发必须**可执行**（铺得下去）且**可校验**（不一致会报出来）。
+
+### 7.5 本轮新增门面
+
+| 方法 | 作用 |
+|---|---|
+| `platform_report()` | 平台语义对齐快照（await 硬约束 / 官方能力对照 / 降级策略 + 出处） |
+| `await_eligibility(waiter_event, resolver_event, stage)` | 只回答"能不能挂 await" |
+| `await_plan(key)` | 按检查点上下文给**校验后**的落点（配不上对 → crontab） |
+| `await_key_of(ck, attempt)` | 按轮次生成 await 配对键 |
+| `capability_report()` / `impact_availability(...)` | 能力与降级口径 / 能不能可信地算受影响面 |
+| `review_dedup(items, round_no)` | 一轮评审**去重**（新问题→回转；老问题→结转） |
+| `carry_review_items(keys)` / `review_fingerprints_overview()` | 结转留痕 / 台账总览 |

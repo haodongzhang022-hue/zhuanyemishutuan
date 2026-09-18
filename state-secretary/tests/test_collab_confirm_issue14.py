@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -46,7 +47,7 @@ from secretary.collab import (
     organization_probe_rules,
     probe_verdict_of,
 )
-from secretary.collab.probe import ALL_DRIVERS, _driver_for_delay
+from secretary.collab.probe import ALL_DRIVERS, CHECK_LOCK, _driver_for_delay
 from secretary.session import SecretarySession
 
 RULES = "shared/collab/collab-rules.yaml"
@@ -99,8 +100,11 @@ class TestAwaitVsCrontabSplit:
         assert _driver_for_delay(301.0) == DRIVER_CRONTAB     # 越过一档 → crontab
 
     def test_ladder_split_rows(self, tmp_probe):
-        """真实阶梯的分工：10/30/60s 与 3min 挂 await；6min / 10min 交 crontab。"""
-        plan = tmp_probe.delay_plan()
+        """真实阶梯的分工（**同一事件**配对成立时）：10/30/60s 与 3min 挂 await；
+        6min / 10min 交 crontab。"""
+        cp = tmp_probe.create("split-same-event", kind=CHECK_LOCK,
+                              waiter_event="push", resolver_event="push")
+        plan = tmp_probe.delay_plan(cp)
         got = {r["delay_sec"]: r["driver"] for r in plan if r["delay_sec"]}
         assert got == {
             10.0: DRIVER_AWAIT,
@@ -110,6 +114,21 @@ class TestAwaitVsCrontabSplit:
             360.0: DRIVER_CRONTAB,    # 6 分钟 > 5 分钟 → 交平台
             600.0: DRIVER_CRONTAB,    # 10 分钟（顶）→ 交平台
         }
+
+    def test_ladder_split_rows_when_pairing_impossible(self, tmp_probe):
+        """**平台语义覆盖**：配不上对时，**短等待也一律**交 crontab。
+
+        这不是"取消分工"，而是"分工**之前**先过平台硬约束"：
+        await 与 resolve 必须同一事件；否则挂上去必然等不到。
+        """
+        cp = tmp_probe.create("split-no-pair", kind=CHECK_LOCK)
+        plan = tmp_probe.delay_plan(cp)
+        got = {r["delay_sec"]: r["driver"] for r in plan if r["delay_sec"]}
+        assert set(got.values()) == {DRIVER_CRONTAB}
+        # 短等待档（≤5min）本是 await 档位 —— 降级必然发生；
+        # 长等待档本就是 crontab，不算"降级"（它本来就该走平台定时）。
+        short = [r for r in plan if r["delay_sec"] and r["delay_sec"] <= 300]
+        assert short and all(r["downgraded"] is True for r in short)
 
     def test_no_all_await_fallback_path(self, tmp_probe):
         """**反向对照**：不存在"一律挂 await"的回退路径。
@@ -303,23 +322,46 @@ class TestOrganizationLevelSharing:
             shutil.rmtree(d, ignore_errors=True)
 
     def test_cross_repo_event_decides_by_verdict_string(self):
-        """跨仓事件只带**判定字符串**也能出正确动作（不必、也不该按本地会话号重算）。"""
+        """跨仓事件只带**判定字符串**也能出正确动作（不必、也不该按本地会话号重算）。
+
+        平台语义（Issue #14 本轮）：落点还要过 await 的**同一事件**约束——
+        故事件需自带两侧事件名；没带时**保守降级 crontab**（见下一条反向对照）。
+        """
         pending = dispatch_shared({"checkpoint_key": "cp-1",
                                    "verdict": WAIT, "driver": DRIVER_AWAIT,
+                                   "waiter_event": "push", "resolver_event": "push",
                                    "next_delay_sec": 10.0})
         assert pending["action"] == "platform_await"
         assert pending["shared"] is True and pending["wake_allowed"] is False
+        assert pending["trigger"]["key"].endswith(":r0")
 
         done = dispatch_shared({"checkpoint_key": "cp-1", "verdict": PROCEED})
         assert done["action"] == "resume"
         assert done["trigger"]["event"] == "api_trigger_probe_resume"
 
+    def test_cross_repo_event_without_events_falls_back_to_crontab(self):
+        """**反向对照**：跨仓事件**没带**两侧事件名 → 不猜、降级 crontab。
+
+        对方的检查点不在本地磁盘上；按本地会话号去读会读到别人的/读不到。
+        判不出就保守落平台兜底（crontab + 平台死锁检测），而不是硬挂一个可能
+        永远等不到的 await。
+        """
+        dis = dispatch_shared({"checkpoint_key": "cp-1", "verdict": WAIT,
+                               "driver": DRIVER_AWAIT})
+        assert dis["action"] == "platform_crontab"
+        assert dis["downgraded"] is True
+
     def test_cross_repo_event_honours_its_own_session_id(self):
         """事件带 `session_id` → 落点按**它归属的会话**算（不是本地会话号）。"""
         dis = dispatch_shared({"checkpoint_key": "cp-1", "verdict": WAIT,
+                               "waiter_event": "push", "resolver_event": "push",
                                "facts": {"session_id": "repo-b/issue-7"}})
         assert dis["action"] == "platform_await"
-        assert "repo-b/issue-7" in dis["trigger"]["key"]
+        # await key 以检查点为主键（轮次后缀保证唯一）；**归属会话**体现在事件
+        # 与落点判定上（同一份规则 → 同一套动作），不再把本地会话号拼进配对键。
+        assert dis["trigger"]["key"] == "probe:cp-1:r0"
+        # 归属会话随事件流转（接收方据此知道"这是哪个会话的检查点"）
+        assert dis["session_id"] == "repo-b/issue-7"
 
     def test_bad_verdict_is_unknown_and_waits(self):
         """**反向对照**：非法判定 → `unknown`，处置是**继续等**（绝不误判放行）。"""

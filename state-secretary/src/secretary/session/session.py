@@ -37,6 +37,12 @@ from ..handoff.models import HandoffCard
 from ..loop import LoopDecision, LoopGuard
 from ..collab import (
     TWO_WAY_SPLIT_NOTE,
+    await_eligible,
+    await_key_for,
+    capability_report,
+    impact_available,
+    platform_report,
+    resolve_driver,
     cron_expr_for,
     CollabRules,
     CheckpointProbe,
@@ -51,7 +57,9 @@ from ..collab import (
 from ..review import (
     ArbiterDecision,
     ConflictCard,
+    DedupResult,
     ReviewArbiter,
+    ReviewFingerprintLedger,
     ScanContext,
     decide_scan,
     scan_commands,
@@ -145,6 +153,7 @@ class SecretarySession:
         rules_path: Optional[str] = None,
         probe_dir: Optional[str] = None,
         max_checks: Optional[int] = None,
+        fingerprint_dir: Optional[str] = None,
     ):
         """初始化一个会话秘书。
 
@@ -179,6 +188,9 @@ class SecretarySession:
             probe_dir: 检查点探测器数据目录（默认 ``<数据根>/probe``）。
             max_checks: 检查点探测次数上界。不传取规则包（默认 6 = 阶梯档位数）；
                 **用尽即停止自动挂账**，交回人工/上游。
+            fingerprint_dir: 评审项指纹台账目录（默认 ``<数据根>/review-fp``）。
+                用于"**同一问题不报第二遍**"：重复项只结转、不回转
+                （对应官方 SCA "同一 CVE 不重复阻断 / 内容未变的改名不重复产生"）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -300,6 +312,13 @@ class SecretarySession:
         self.run_guard = RunScopeGuard(
             rules=self.collab_rules,
             data_dir=run_guard_dir or os.path.join(self._session_root, "run-scope"),
+        )
+        # 评审项指纹台账（Issue #14 本轮）：**同一问题不报第二遍**。
+        # 降噪口径照抄官方 AI 评审插件（`exclude_categories: style,nit`）——
+        # 官方已验证过的默认值，没必要另立一套。
+        self.review_fingerprints = ReviewFingerprintLedger(
+            data_dir=fingerprint_dir or os.path.join(
+                self._session_root, "review-fp"),
         )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
@@ -1584,17 +1603,22 @@ class SecretarySession:
         command: str = "",
         last_verdict: str = "",
         window_repeats: int = 1,
+        base: Optional[str] = None,
+        event: str = "",
     ) -> RunDecision:
         """**跑不跑**：日常默认增量；同一口径（范围/版本/受影响面/命令）只跑一次。
 
         - 同一口径第 2 次起 → ``skip_duplicate``（跑法固定，重复跑不产生判别力）；
         - 想"连跑 N 次"当稳定性论证 → ``blocked_stability`` + 替代口径
           （定点/变异探针、独立场景）；
-        - 例外：同口径已达上界但上一轮**不绿** → 允许重跑（红→修→再跑有新信息）。
+        - 例外：同口径已达上界但上一轮**不绿** → 允许重跑（红→修→再跑有新信息）；
+        - **能力降级**（Issue #14 本轮）：判不出"能不能算受影响面"时
+          **保守放行**并在判定里标明 `degraded`（漏跑比多跑危险）。
         """
         return self.run_guard.decide(
             mode=mode, revision=revision, impact=impact, command=command,
-            last_verdict=last_verdict, window_repeats=window_repeats)
+            last_verdict=last_verdict, window_repeats=window_repeats,
+            base=base, event=event)
 
     def record_run(
         self,
@@ -1712,6 +1736,97 @@ class SecretarySession:
         """**跨仓**落点判定：同一份组织级规则包 → 同一套动作（不依赖本地会话号）。"""
         from ..collab import dispatch_shared
         return dispatch_shared(event, self.collab_rules)
+
+    # ------------------------------------------------------------------
+    # 平台语义对齐（Issue #14：对齐官方 cnb:await 约束，不硬上"一定等不到"的等待）
+    # ------------------------------------------------------------------
+
+    def platform_report(self) -> Dict[str, Any]:
+        """平台语义对齐快照：await 硬约束、官方最佳实践对照、降级策略与出处。"""
+        return platform_report()
+
+    def await_plan(
+        self,
+        key: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
+        stage: str = "stages",
+    ) -> Dict[str, Any]:
+        """**挂 await 之前先校验**：配不上对就返回降级后的真实落点。
+
+        官方约束：`cnb:await` 只能对**同一个事件**触发的 pipeline 配对，
+        且一个 key **仅能 resolve 一次**。因此：
+        - 两侧事件不同 / 不可判定 / 位置不是 `stages` → **降级 crontab**；
+        - key 按**轮次**生成（`probe:<key>:r<n>`），避免第 2 次起等不到。
+        """
+        cp = self.probe.load(key) if key else None
+        we = waiter_event or (cp.waiter_event if cp else "")
+        re_ = resolver_event or (cp.resolver_event if cp else "")
+        attempt = cp.checks_used if cp else 0
+        verdict = resolve_driver(
+            "platform_await", checkpoint_key=key, attempt=attempt,
+            waiter_event=we, resolver_event=re_, stage=stage,
+            await_max_sec=self.probe.await_max_sec,
+        )
+        out = verdict.to_dict()
+        out["waiter_event"] = we
+        out["resolver_event"] = re_
+        out["platform_sources"] = list(verdict.sources)
+        return out
+
+    def await_eligibility(
+        self,
+        waiter_event: str = "",
+        resolver_event: str = "",
+        stage: str = "stages",
+    ) -> Dict[str, Any]:
+        """只回答"能不能挂 await"（不涉及具体检查点）。"""
+        return await_eligible(waiter_event, resolver_event, stage)
+
+    def await_key_of(self, checkpoint_key: str = "", attempt: int = 0) -> str:
+        """按**轮次**生成 await 配对键（官方：一个 key 仅能 resolve 一次）。"""
+        return await_key_for(checkpoint_key, attempt)
+
+    def capability_report(self) -> Dict[str, Any]:
+        """能力与降级口径快照（增量可达性 / 降级策略 / 已知降级情形）。"""
+        return capability_report()
+
+    def impact_availability(
+        self,
+        revision: str = "",
+        base: Optional[str] = None,
+        impact: Any = "",
+        event: str = "",
+    ) -> Dict[str, Any]:
+        """能不能**可信地**算受影响面（决定增量判重是否成立）。
+
+        判不出时**保守放行**（宁可多跑，不可漏跑）——因为把"算不出变更集"
+        当成"没有变更"，会让不同变更集撞成同一个指纹而被**跳过**（危险方向）。
+        """
+        return impact_available(revision, base=base, impact=impact, event=event)
+
+    # ------------------------------------------------------------------
+    # 评审项指纹（同一问题不报第二遍）
+    # ------------------------------------------------------------------
+
+    def review_dedup(self, items: Any, round_no: int = 0) -> DedupResult:
+        """对一轮评审结果**去重**：新问题保留、老问题结转、降噪项滤掉。
+
+        `items` 支持官方评审插件风格的 dict（`category` / `line_text` / `path` /
+        `severity`），也支持已算好的指纹。**只看新问题是否需要回转**：
+        老问题重复报不产生新一轮修复（`should_rotate` 为假）。
+        """
+        return self.review_fingerprints.dedup(items, round_no=round_no)
+
+    def carry_review_items(self, keys: Any) -> int:
+        """把指定评审项标记为**已结转**（再出现只登记，不回转、不占轮次）。"""
+        if isinstance(keys, str):
+            keys = [keys]
+        return self.review_fingerprints.carry(keys or [])
+
+    def review_fingerprints_overview(self) -> Dict[str, Any]:
+        """评审项台账总览：几项、几项被重复报、几项已结转（重复报的一眼可见）。"""
+        return self.review_fingerprints.overview()
 
     # ------------------------------------------------------------------
     # 进度统计

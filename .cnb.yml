@@ -35,6 +35,17 @@
 #   （定点/变异探针、独立场景）。规则：shared/collab/*.yaml 的 `scan` 段；
 #   执行入口：scripts/ci-incremental-test.sh（接入 main.push，日常唯一跑法）。
 #   全量（full）只在**大版本**，日常绝不走。
+# 平台语义对齐（v0.10 · Issue #14 本轮）：查证官方文档后发现 `cnb:await` 有两条
+#   会让落点失效的硬约束 —— ① 「只能对**同一个事件**触发的 pipeline 做 await/resolve」；
+#   ② 「一个 `key` **仅能 resolve 一次**」。故落点判定**先过平台约束**（`resolve_driver()`）：
+#   配不上对 → **降级 crontab**（平台代跑 + 平台死锁检测兜底），await key **按轮次唯一**
+#   （`probe:<checkpoint>:r<attempt>`）；`cnb:await` 还必须位于 `stages`（endStages/failStages 不生效）。
+#   出处：/zh/build/internal-steps/cnb/await-resolve.md
+#   同时对齐官方**增量**最佳实践（SCA 插件：「同一组件同一 CVE 不重复阻断」、
+#   「内容未变化的文件重命名不重复产生」）→ 评审侧**同一问题不报第二遍**（评审项指纹），
+#   执行侧**能力降级保守放行**（判不出受影响面就不做增量判重；漏跑比多跑危险）。
+# 组织级分发（v0.10）：`scripts/distribute-collab-rules.sh`（默认 dry-run，`--apply` 才写；
+#   只铺组织级基线，**不覆盖**各仓已有的数值覆写）——各仓库通用。
 # 角色定义见 .cnb/settings.yml（秘书· 命名空间）
 # ============================================================
 
@@ -90,8 +101,10 @@ main:
           - **严禁本地 sleep / 空转轮询**（等待一律走平台挂起语义，否则按 CPU 核时计费）。
 
 # 「等锁」的零占用等待：`cnb:await` 挂起，由对端 `cnb:resolve` 在锁释放时唤醒。
-# 说明：`cnb:await`/`cnb:resolve` 只能配合同一事件触发的 pipeline；
-#   跨事件（如 push 放锁）请用 `cnb:apply` / `cnb:trigger` 触发 `api_trigger_probe_*`。
+# 说明（官方硬约束，本轮对齐）：`cnb:await`/`cnb:resolve` **只能配合同一事件**触发的
+#   pipeline；跨事件（如 push 放锁）**配不上对、会永远等不到** ——
+#   请用 `cnb:apply` / `cnb:trigger` 触发 `api_trigger_probe_*`，
+#   或按 `await_plan()` 的判定**降级 `crontab`**（平台代跑 + 平台死锁检测兜底）。
 .await_lock_task: &await_lock_task
   name: await lock release
   stages:

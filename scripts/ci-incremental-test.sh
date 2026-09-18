@@ -6,10 +6,12 @@
 #   判定逻辑（同口径/同版本 → 跳过；连跑 → 拒绝）必须被**真正执行**，
 #   而不是散在流水线里靠"记得这么写"。脚本是机制的唯一落点。
 #
-# 口径（Issue #14 追问）：
+# 口径（Issue #14 追问 / 本轮对齐官方）：
 #   - 日常只跑增量（`scan`）；全量（`full`）只在**大版本**；
 #   - 同一口径（范围/版本/受影响面/命令）只跑一次，第 2 次起跳过；
-#   - "连跑 N 次同一命令"当稳定性论证 → 拒绝，改走定点/变异探针/独立场景。
+#   - "连跑 N 次同一命令"当稳定性论证 → 拒绝，改走定点/变异探针/独立场景；
+#   - **能力降级**：算不出受影响面时**保守放行**（判不出就不增量；
+#     漏跑比多跑危险——官方 SCA 增量规则同源）。
 #
 # 用法：
 #   ./scripts/ci-incremental-test.sh                      # 增量（默认）
@@ -34,6 +36,9 @@ REVISION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # 每次都当成"新口径"→ 判重形同虚设（"机制看似有、实际拦不住"的典型形态）。
 # 故：一律用 `git diff <base>...<REVISION>`（三点，只看该提交的变更）。
 BASE_REF="${CNB_BASE_REF:-origin/main}"
+# 基线是否**真的可解析**：解析不出（新建分支 / 无该 ref）时不要把空变更集
+# 当成"没有变更"——那会让不同变更集撞成同一指纹而被**跳过**（漏跑，危险方向）。
+BASE_SHA="$(git -C "$ROOT" rev-parse --verify -q "$BASE_REF" 2>/dev/null || true)"
 CHANGED="$(git -C "$ROOT" diff --name-only "$BASE_REF"..."$REVISION" 2>/dev/null \
   || git -C "$ROOT" show --name-only --pretty=format: "$REVISION" 2>/dev/null \
   || true)"
@@ -75,9 +80,11 @@ CANON_TARGETS="$(printf '%s\n' ${TEST_TARGETS:-full} \
 #   10 = 跳过（同口径重复 / 稳定性滥用）
 set +e
 GUARD_OUT="$(python3 - "$REVISION" "$SCOPE" "$WINDOW_REPEATS" "$CANON_TARGETS" \
-             "$PKG" <<'PYEOF'
+             "$PKG" "${BASE_SHA:-}" "${CNB_EVENT:-}" <<'PYEOF'
 import os, sys
 pkg = sys.argv[5]
+base_sha = sys.argv[6] if len(sys.argv) > 6 else ""
+event = sys.argv[7] if len(sys.argv) > 7 else ""
 sys.path.insert(0, os.path.join(pkg, "src"))
 try:
     from secretary.collab import RunScopeGuard, load_rules
@@ -95,8 +102,11 @@ try:
 except ValueError:
     wr = 1
 d = guard.decide(mode=scope, revision=revision, impact=targets,
-                 command=cmd, window_repeats=wr)
+                 command=cmd, window_repeats=wr,
+                 base=(base_sha or None), event=event)
 print("[guard] action=%s :: %s" % (d.action, d.reason))
+if getattr(d, "degraded", False):
+    print("[guard] 能力降级 → 保守放行（%s）" % d.degrade_reason)
 if not d.should_run:
     if d.alternatives:
         print("[guard] 稳定性论证请改用：%s" % ", ".join(d.alternatives))
