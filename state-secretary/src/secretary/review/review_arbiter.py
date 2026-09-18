@@ -40,6 +40,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..state.lock_registry import (
+    KIND_DEFER,
+    KIND_REVIEW,
+    LOCK_HELD,
+    LegacyLockScanner,
+    LockRegistry,
+)
 from ..state.manager import StateManager
 from ..state.models import StateCard
 
@@ -48,6 +55,12 @@ _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 # 冲突卡 ID 前缀（仅 [A-Za-z0-9_-]，可直接参与路径拼接，无需再转义）
 _CONFLICT_ID_PREFIX = "REVCONF"
+
+# 延迟窗：首次触发「正在编辑」→ 延迟 **1 分钟**再检测（不用立刻抢写）
+DEFAULT_RETRY_DELAY_SEC = 60.0
+# 再次触发（第 2 次及以后）→ 升级为**持续锁**，默认 **3 分钟**宽限，
+# 持续到对方处理完为止（不自动打开）
+DEFAULT_PERSISTENT_GRACE_SEC = 180.0
 
 # 冲突类别
 NO_CONFLICT = "none"
@@ -136,6 +149,9 @@ class ConflictCard:
     detected_at: str = ""
     editing: bool = False          # 疑似"正在编辑"（有租约/延迟窗内）→ 先等
     retry_after: float = 0.0       # 重试时间戳（0 = 无需等待）
+    deferred: bool = False         # 「先做其他，并挂锁」：评审已先做完，锁挂着待检测
+    deferred_persistent: bool = False  # 锁已升级为持续锁（持续到对方处理完）
+    retriggered: int = 0           # 重触发次数（>=1 → 锁升级为持续锁）
     status: str = "pending"        # pending | resolved | superseded
     merged_conflicts: int = 1      # 合并进本卡的冲突次数（>1 说明已折叠）
     superseded_by: Optional[str] = None
@@ -153,6 +169,9 @@ class ConflictCard:
             "detected_at": self.detected_at,
             "editing": self.editing,
             "retry_after": self.retry_after,
+            "deferred": self.deferred,
+            "deferred_persistent": self.deferred_persistent,
+            "retriggered": self.retriggered,
             "status": self.status,
             "merged_conflicts": self.merged_conflicts,
             "superseded_by": self.superseded_by,
@@ -197,6 +216,9 @@ class ConflictCard:
             detected_at=_str("detected_at"),
             editing=bool(data.get("editing", False)),
             retry_after=float(retry),
+            deferred=bool(data.get("deferred", False)),
+            deferred_persistent=bool(data.get("deferred_persistent", False)),
+            retriggered=max(0, _int("retriggered")),
             status=_str("status") or "pending",
             merged_conflicts=max(1, _int("merged_conflicts")),
             superseded_by=sup if isinstance(sup, str) and sup else None,
@@ -217,6 +239,8 @@ class ArbiterDecision:
     retry_after: float = 0.0
     retry_delay_sec: float = 0.0
     rebased: bool = False      # 是否"以新版本为准"重立基线
+    deferred: bool = False     # 「先做其他，并挂锁」：已把本次评审做完，锁挂着待检测
+    lock: Optional[dict] = None  # 本次涉及锁的聚合台账快照（触发即可查看）
     card: Optional[ConflictCard] = None
     baseline: Optional[ReviewBaseline] = None
     reason: str = ""
@@ -232,6 +256,8 @@ class ArbiterDecision:
             "retry_after": self.retry_after,
             "retry_delay_sec": self.retry_delay_sec,
             "rebased": self.rebased,
+            "deferred": self.deferred,
+            "lock": dict(self.lock) if self.lock else None,
             "card": self.card.to_dict() if self.card else None,
             "baseline": self.baseline.to_dict() if self.baseline else None,
             "reason": self.reason,
@@ -265,8 +291,10 @@ class ReviewArbiter:
         state_manager: StateManager,
         reviewer: str = "reviewer",
         data_dir: Optional[str] = None,
-        retry_delay_sec: float = 30.0,
+        retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
         clock: Optional[Callable[[], float]] = None,
+        lock_registry: Optional[LockRegistry] = None,
+        persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
     ):
         """
         Args:
@@ -275,8 +303,14 @@ class ReviewArbiter:
             reviewer: 评审方标识（用于"同向可重试 / 反向算冲突"判定与留痕）
             data_dir: 仲裁数据目录（默认 ``<state 数据根>/../review``，
                 即与会话数据同根，随会话生命周期一并回收）
-            retry_delay_sec: 疑似"正在编辑"时的延迟窗（默认 30s），窗内不落盘、先等
+            retry_delay_sec: 疑似"正在编辑"时的延迟窗（默认 **60s**），
+                窗内不落盘、先把其他做完；**再次触发**则该锁升级为持续锁
             clock: 时间源（默认 ``time.time``，测试可注入）
+            lock_registry: 锁聚合台账（默认在 ``<state 数据根>/locks/`` 自建）。
+                **所有锁统一登记**：评审读锁 / 延迟锁 / 卡片写租约都在一本台账里，
+                触发即可 `locks_overview()` 一眼看清"哪里要避开"
+            persistent_grace_sec: 重触发后持续锁的宽限（默认 **3 分钟**），
+                持续到对方处理完（不自动打开）
         """
         if not isinstance(session_id, str) or not _SAFE_ID.match(session_id):
             raise ValueError(
@@ -287,6 +321,10 @@ class ReviewArbiter:
                 or isinstance(retry_delay_sec, bool) or retry_delay_sec < 0:
             raise ValueError(
                 f"非法 retry_delay_sec: {retry_delay_sec!r}（须为非负数）。")
+        if not isinstance(persistent_grace_sec, (int, float)) \
+                or isinstance(persistent_grace_sec, bool) or persistent_grace_sec < 0:
+            raise ValueError(
+                f"非法 persistent_grace_sec: {persistent_grace_sec!r}（须为非负数）。")
         if not isinstance(reviewer, str) or not reviewer.strip():
             raise ValueError("reviewer 不可为空（评审留痕需要）。")
 
@@ -299,6 +337,15 @@ class ReviewArbiter:
             os.path.abspath(state_manager.data_dir.rstrip(os.sep))) or os.getcwd()
         self.data_dir = data_dir or os.path.join(self._state_dir, "review")
         os.makedirs(self.data_dir, exist_ok=True)
+        self.persistent_grace_sec = float(persistent_grace_sec)
+        # 锁聚合台账（"所有锁应该被聚合的管理"）：与会话数据同根，随会话回收
+        self.lock_registry = lock_registry or LockRegistry(
+            session_id=session_id,
+            data_dir=os.path.join(self._state_dir, "locks"),
+            clock=self._clock,
+            ttl_sec=self.retry_delay_sec,
+            persistent_grace_sec=self.persistent_grace_sec,
+        )
 
     # ------------------------------------------------------------------
     # 路径与落盘
@@ -317,6 +364,56 @@ class ReviewArbiter:
         if not isinstance(ticket_id, str) or not _SAFE_ID.match(ticket_id):
             raise ValueError(f"非法票据 ID: {ticket_id!r}。仅允许 [A-Za-z0-9_-]。")
         return os.path.join(self.data_dir, f"{ticket_id}.conflict.json")
+
+    # ---- 锁键 / 台账留痕 ----
+
+    def lock_key(self, purpose: str) -> str:
+        """聚合台账里的锁键（``<session>:<用途>``；用途仅 [A-Za-z0-9_-]）。"""
+        if not isinstance(purpose, str) or not re.match(r'^[A-Za-z0-9_-]+\Z', purpose):
+            raise ValueError(f"非法锁用途: {purpose!r}（仅允许 [A-Za-z0-9_-]）。")
+        return f"{self.session_id}:{purpose}"
+
+    def review_lock_key(self) -> str:
+        """评审读锁键（**保证有基线才评审**）。"""
+        return self.lock_key("review")
+
+    def defer_lock_key(self) -> str:
+        """延迟锁键（"正在编辑"→ 先做其他，并挂锁）。"""
+        return self.lock_key("review_defer")
+
+    def locks_overview(self) -> dict:
+        """本会话**全部锁**的聚合总览（触发了就去看一眼情况）。"""
+        try:
+            return self.lock_registry.overview()
+        except Exception:  # noqa: BLE001 - 观测面异常不得影响评审
+            return {"session_id": self.session_id, "count": 0, "held": [],
+                    "where_to_avoid": [], "by_kind": {}, "stale_candidates": []}
+
+    def _registry_register(self, key: str, kind: str, holder: str,
+                           scope: str, reason: str = "",
+                           persist: bool = False,
+                           retry_delay_sec: float = 0.0,
+                           increment: bool = False) -> Optional[dict]:
+        """台账登记（失败静默：台账是观测面，不得阻塞评审落盘）。"""
+        try:
+            rec = self.lock_registry.register(
+                key, kind=kind, holder=holder, scope=scope,
+                persist=persist, retry_delay_sec=retry_delay_sec,
+                increment=increment, reason=reason)
+            return rec.to_dict()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _registry_release(self, key: str, by: str = "",
+                          reason: str = "") -> None:
+        try:
+            self.lock_registry.release(key, by=by, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _legacy_locks(self) -> List[Dict[str, Any]]:
+        """历史遗留单锁文件（<state 根>/*.owner.json）——聚合视图里一并列出。"""
+        return LegacyLockScanner.scan(self._state_dir)
 
     def _atomic_write(self, path: str, data: dict) -> None:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-",
@@ -378,6 +475,12 @@ class ReviewArbiter:
             source="begin_review",
         ).with_snapshot(card)
         self._atomic_write(self.baseline_path(), base.to_dict())
+        # 评审读锁（聚合登记）：「已开启评审」这件事本身也是一把锁——
+        # 别人一眼能看见"评审开着呢"，不必靠测试去猜哪里要避开。
+        self._registry_register(
+            self.review_lock_key(), KIND_REVIEW, self.reviewer,
+            scope="评审读锁（评审已有基线，勿重复开启）",
+            reason="开启评审：登记基线 + 挂评审读锁")
         return base
 
     def rebase(self, current_card: Optional[StateCard] = None) -> ReviewBaseline:
@@ -447,15 +550,21 @@ class ReviewArbiter:
                 detail=note,
             )
 
-        # 情形 B：疑似"正在编辑"（存在他人租约）→ 给防同写锁 + 延迟，稍后再处理
+        # 情形 B：疑似"正在编辑"（存在他人租约）→ 先做其他，并挂锁；延迟后检测
         editing = self._editing()
         if editing:
-            after = self._clock() + self.retry_delay_sec
+            lock = self._defer_while_editing(note)
+            after = float(lock.get("retry_at") or (self._clock()
+                                                   + self.retry_delay_sec))
             return ArbiterDecision(
                 action="retry", applied=False, conflict=False,
                 should_retry=True, retry_after=after,
                 retry_delay_sec=self.retry_delay_sec,
-                baseline=baseline, reason="卡正在被编辑（存在写租约）→ 延迟后重试",
+                deferred=True, lock=lock,
+                baseline=baseline,
+                reason=("卡正在被编辑（存在写租约）→ **先做其他，并挂锁**；"
+                        f"延迟后检测（首次 {self.retry_delay_sec:.0f}s，"
+                        f"重触发升级 {self.persistent_grace_sec:.0f}s 持续到对方处理完）"),
                 detail=note,
             )
 
@@ -476,14 +585,18 @@ class ReviewArbiter:
         if int(disk_before.version or 0) > baseline.version:
             other = self._owner_of(disk_before)
             if other and other != self.reviewer and self._same_side(other):
-                after = self._clock() + self.retry_delay_sec
+                lock = self._defer_while_editing(
+                    note, scope=f"同向写入（{other}）时序冲突", holder=other)
+                after = float(lock.get("retry_at") or (self._clock()
+                                                       + self.retry_delay_sec))
                 return ArbiterDecision(
                     action="retry", applied=False, conflict=False,
                     should_retry=True, retry_after=after,
                     retry_delay_sec=self.retry_delay_sec,
+                    deferred=True, lock=lock,
                     baseline=baseline,
                     reason=(f"同向写入（{other}）已推进 v{disk_before.version}"
-                            "→ 可重试的时序冲突，延迟后重试"),
+                            "→ 可重试的时序冲突，**先做其他、并挂锁**，延迟后检测"),
                     detail=note,
                 )
 
@@ -517,28 +630,182 @@ class ReviewArbiter:
             reason=card.reason, detail=note,
         )
 
+    def _defer_while_editing(self, note: str, scope: str = "状态卡正在被编辑",
+                             holder: str = "", persistent: bool = False) -> dict:
+        """「**先做其他，并挂锁**」：挂一把锁等对方处理完，锁上带延迟后检测点。
+
+        首次触发：TTL = ``retry_delay_sec``（默认 1 分钟）——到点自动重试；
+        **再次触发**：台账里同一把锁升级为**持续锁**（默认 3 分钟宽限、持久），
+        一直持续到对方处理完（`should_release()` 为 False 时**绝不释放**）。
+        """
+        key = self.defer_lock_key()
+        now = self._clock()
+        existing = self.lock_registry.get(key)
+        is_retrigger = existing is not None
+        # 重触发 = 本会话此前已挂过同一把锁（第 2 次及以后触发同一问题）
+        triggers = int(existing.retry_count) + 1 if existing is not None else 0
+        want_persistent = bool(is_retrigger or persistent)
+        # 退避：本次「延迟后检测」的等待 = 上一档 +1 分钟，**上限 = 持续锁宽限
+        # （默认 3 分钟）**；只增不减（已承诺的等待绝不缩短）→ 60 → 120 → 180 封顶。
+        prev_gap = (max(0.0, existing.retry_at - now)
+                    if existing is not None and existing.retry_at > now else 0.0)
+        requested = min(prev_gap + self.retry_delay_sec, self.persistent_grace_sec)
+        # 一次登记同时带上「持续锁」与「延迟后检测点」两项语义
+        # （不许分两次登记，否则会被当成"重触发"而互相抬高计数）
+        lock = self._registry_register(
+            key, KIND_DEFER, self.reviewer,
+            scope=f"{scope}（先做其他，勿抢写）",
+            persist=want_persistent, retry_delay_sec=requested,
+            increment=is_retrigger,
+            reason=note or "评审遇到他人写租约：先做其他，并挂锁")
+        if lock is None:      # 台账不可用时的最小降级（内存语义仍正确）
+            return {"key": key, "kind": KIND_DEFER, "holder": self.reviewer,
+                    "scope": scope,
+                    "retry_at": (now + requested if want_persistent
+                                 else now + self.retry_delay_sec),
+                    "persistent": want_persistent,
+                    "retriggered": triggers}
+        lock["persistent"] = bool(lock.get("persistent") or want_persistent)
+        lock["retriggered"] = triggers
+        self._update_deferred(
+            scope=scope, reason=note,
+            persistent=bool(lock.get("persistent")),
+            retriggered=triggers,
+            retry_after=float(lock.get("retry_at") or 0.0))
+        return lock
+
     def retry(
         self,
         mutate: Optional[Callable[[StateCard], None]] = None,
         proposed: Optional[StateCard] = None,
         note: str = "",
     ) -> ArbiterDecision:
-        """过了延迟窗后的重试（延迟窗未到则继续 `should_retry`，不落盘）。"""
-        card = self.get_conflict()
-        if card is not None and card.status == "pending" \
-                and card.retry_after > self._clock():
+        """**延迟后检测**：到点重试一次。
+
+        - 锁未到点（或对方仍在编辑）→ 续期等待（``should_retry=True``，**不释放锁**）；
+          持续锁在宽限期内永不提前打开（"别遗留锁一直不打开"的反面：也不许早开）；
+        - 对方已处理完 → 正常走 `apply_save()`，成功后释放锁（编辑真的结束了）。
+        """
+        lock = self.lock_registry.get(self.defer_lock_key())
+        if lock is not None and lock.status == LOCK_HELD \
+                and lock.retry_at > self._clock():
             return ArbiterDecision(
                 action="retry", applied=False, conflict=False,
-                should_retry=True, retry_after=card.retry_after,
-                retry_delay_sec=self.retry_delay_sec, card=card,
-                reason="延迟窗未到，继续等待编辑结束",
+                should_retry=True, retry_after=lock.retry_at,
+                retry_delay_sec=self.retry_delay_sec, deferred=True,
+                lock=lock.to_dict(),
+                reason=("延迟窗未到：**先做其他**，到点再来检测"
+                        f"（剩余 {max(0.0, lock.retry_at - self._clock()):.0f}s）"),
                 detail=note,
             )
+
+        if self._editing():
+            # 还在编辑：续期，绝不释放。重触发过的持续锁按 3 分钟宽限续期，
+            # 且 retry_at 只能更靠后（不把"等到对方处理完"缩短回 1 分钟）。
+            grant = (self.persistent_grace_sec
+                     if (lock is not None and lock.persistent)
+                     else self.retry_delay_sec)
+            self.lock_registry.heartbeat(
+                self.defer_lock_key(), self.reviewer, extend_sec=grant)
+            prev_retry = lock.retry_at if lock is not None else 0.0
+            if prev_retry <= self._clock():
+                # 只重排**已过期**的检测点：本轮新窗口默认 = 在旧窗口上续 grant；
+                # 仍在未来的窗口绝不缩短（"持续到对方处理完"的承诺不可回退）。
+                self.lock_registry.register(
+                    self.defer_lock_key(), kind=KIND_DEFER, holder=self.reviewer,
+                    scope=(lock.scope if lock is not None else "状态卡正在被编辑"),
+                    reason="延迟后检测：对方仍在编辑 → 续期等待（锁不打开）",
+                    retry_delay_sec=grant)
+            new_lock = self.lock_registry.get(self.defer_lock_key())
+            return ArbiterDecision(
+                action="retry", applied=False, conflict=False,
+                should_retry=True,
+                retry_after=(new_lock.retry_at if new_lock is not None
+                             else self._clock() + self.retry_delay_sec),
+                retry_delay_sec=self.retry_delay_sec, deferred=True,
+                lock=new_lock.to_dict() if new_lock is not None else None,
+                reason="延迟后检测：对方仍在编辑 → 锁续期等待，先做其他",
+                detail=note,
+            )
+
         decision = self.apply_save(mutate=mutate, proposed=proposed, note=note)
-        # 重试成功且无冲突 → 之前的冲突卡作废（同一冲突不重复占用处理位）
+        # 重试成功且无冲突 → 之前的冲突卡作废 + 释放延迟锁（编辑已结束）
         if decision.applied and not decision.conflict:
             self.supersede_pending()
+            self._registry_release(self.defer_lock_key(), by=self.reviewer,
+                                   reason="延迟后检测成功：对方已处理完，锁打开")
         return decision
+
+    def complete_deferred(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """「**先做其他**」做完之后的收尾：补做被延迟的那次评审。
+
+        与 `retry()` 的差别：`retry()` 是"到点自动检测"，本方法是"我把其他事
+        做完了，主动回来收尾"。锁打开是**人在回路**的：只有真的落盘成功
+        （对方处理完）才释放；否则继续挂着并返回 `should_retry`。
+        """
+        lock = self.lock_registry.get(self.defer_lock_key())
+        if lock is not None and lock.status == LOCK_HELD and self._editing():
+            self.lock_registry.heartbeat(self.defer_lock_key(), self.reviewer)
+            return ArbiterDecision(
+                action="retry", applied=False, conflict=False,
+                should_retry=True,
+                retry_after=float(lock.retry_at
+                                  or (self._clock() + self.retry_delay_sec)),
+                retry_delay_sec=self.retry_delay_sec, deferred=True,
+                lock=lock.to_dict(),
+                reason="收尾时对方仍在编辑 → 锁保持挂着（不打开），先做其他",
+                detail=note,
+            )
+        decision = self.retry(mutate=mutate, note=note)
+        if decision.applied and not decision.conflict:
+            self._registry_release(self.defer_lock_key(), by=self.reviewer,
+                                   reason="先做其他的那次评审已补做完成，锁打开")
+        return decision
+
+    def release_locks(self, by: str = "", reason: str = "评审结束") -> int:
+        """释放本会话评审相关的全部锁（评审读锁 + 延迟锁）。
+
+        **只释放本评审方持有的锁**，不动卡片写租约（那是别人的编辑锁）；
+        返回实际释放数量。
+        """
+        n = 0
+        for key in (self.defer_lock_key(), self.review_lock_key()):
+            try:
+                if self.lock_registry.release(key, by=by or self.reviewer,
+                                              reason=reason):
+                    n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        return n
+
+    def sweep_locks(self, by: str = "") -> List[dict]:
+        """清理本会话的**遗留锁**（过期且超宽限仍未处理）→ 聚合视图里留痕。
+
+        「注意别遗留锁一直不打开」：被扫成 stale 的若是延迟锁，对应的"待处理"
+        挂账项同步关闭（避免锁没了、票还挂着 → 又成新的遗留）。
+        """
+        try:
+            swept = self.lock_registry.sweep(by=by or self.reviewer)
+        except Exception:  # noqa: BLE001
+            return []
+        if any(r.key == self.defer_lock_key() for r in swept):
+            card = self.get_conflict()
+            if card is not None and card.status == "pending" and card.deferred:
+                card.status = "superseded"
+                card.deferred = False
+                card.deferred_persistent = False
+                card.history.append({
+                    "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "by": by or self.reviewer,
+                    "action": "sweep-stale-lock",
+                    "resolution": "延迟锁过期未续期 → 挂账项一并关闭",
+                })
+                self._atomic_write(self.conflict_path(), card.to_dict())
+        return [r.to_dict() for r in swept]
 
     def apply(
         self,
@@ -583,6 +850,9 @@ class ReviewArbiter:
             raise ValueError("resolve 须提供非空 resolution（收口留痕）。")
         card.status = "resolved"
         card.resolution = resolution.strip()
+        card.deferred = False
+        card.deferred_persistent = False
+        card.editing = False
         card.history.append({
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "by": (by or "unknown").strip(),
@@ -590,6 +860,9 @@ class ReviewArbiter:
             "resolution": card.resolution,
         })
         self._atomic_write(self.conflict_path(), card.to_dict())
+        # 收口 = 这件事处理完了 → 一并打开挂着的延迟锁（不遗留锁一直不打开）
+        self._registry_release(self.defer_lock_key(), by=by or self.reviewer,
+                               reason="冲突已收口，延迟锁打开")
         if rebase_baseline:
             try:
                 self.rebase()
@@ -607,6 +880,9 @@ class ReviewArbiter:
         if card is None or card.status != "pending":
             return 0
         card.status = "superseded"
+        card.deferred = False
+        card.deferred_persistent = False
+        card.editing = False
         card.history.append({
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "by": (by or "auto").strip(),
@@ -614,6 +890,9 @@ class ReviewArbiter:
             "resolution": "冲突已消解（重试成功/已被新票据接管）",
         })
         self._atomic_write(self.conflict_path(), card.to_dict())
+        # 待处理项消解 → 延迟锁一并打开（别遗留锁一直不打开）
+        self._registry_release(self.defer_lock_key(), by=by or self.reviewer,
+                               reason="冲突已消解，延迟锁打开")
         return 1
 
     def _enqueue_conflict(
@@ -677,6 +956,90 @@ class ReviewArbiter:
         )
         self._atomic_write(self.conflict_path(), card.to_dict())
         return card
+
+    def _update_deferred(self, scope: str = "", reason: str = "",
+                         persistent: bool = False, retriggered: int = 0,
+                         retry_after: float = 0.0) -> ConflictCard:
+        """把「延迟 + 挂锁」也登记成一张**冲突卡**（与人看的 `overview()` 对齐）。
+
+        口径：冲突卡**至多一张**——延迟与真冲突都是"同一件待处理的事"，
+        因此都收敛到同一张卡特；这样「触发了就去看一眼情况」只需看**一个**地方
+        （聚合总览 + 唯一冲突卡），不会散落成多张票（那正是要治的循环特征）。
+        """
+        existing = self.get_conflict()
+        now = self._clock()
+        if existing is not None and existing.status == "pending":
+            existing.deferred = True
+            existing.retriggered = max(existing.retriggered, int(retriggered))
+            existing.deferred_persistent = bool(existing.deferred_persistent
+                                                or persistent)
+            existing.retry_after = retry_after or (now + self.retry_delay_sec)
+            existing.editing = True
+            existing.reason = reason or (
+                "先做其他，并挂锁：等对方处理完再检测"
+                + ("（持续锁，一直挂到对方处理完）" if existing.deferred_persistent
+                   else f"（延迟 {self.retry_delay_sec:.0f}s 后检测）"))
+            existing.history.append({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"), "by": self.reviewer,
+                "action": "defer", "scope": scope, "reason": reason,
+                "persistent": existing.deferred_persistent,
+                "retriggered": existing.retriggered,
+            })
+            self._atomic_write(self.conflict_path(), existing.to_dict())
+            return existing
+
+        if existing is not None:
+            existing.status = "superseded"
+            existing.history.append({
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"), "by": self.reviewer,
+                "action": "superseded_by_new",
+            })
+            self._atomic_write(self.conflict_path(), existing.to_dict())
+
+        card = ConflictCard(
+            id=f"{_CONFLICT_ID_PREFIX}-{self.session_id}-{int(self._clock() * 1000)}",
+            session_id=self.session_id,
+            base_version=0,
+            current_version=0,
+            kind=NO_CONFLICT,
+            reason=reason or (
+                "先做其他，并挂锁：等对方处理完再检测"
+                + ("（持续锁，一直挂到对方处理完）" if persistent
+                   else f"（延迟 {self.retry_delay_sec:.0f}s 后检测）")),
+            detected_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            editing=True,
+            retry_after=retry_after or (now + self.retry_delay_sec),
+            deferred=True,
+            deferred_persistent=bool(persistent),
+            retriggered=int(retriggered),
+            history=[{
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"), "by": self.reviewer,
+                "action": "defer", "scope": scope, "reason": reason,
+                "persistent": bool(persistent), "retriggered": int(retriggered),
+            }],
+        )
+        self._atomic_write(self.conflict_path(), card.to_dict())
+        return card
+
+    def deferred_status(self) -> Optional[dict]:
+        """当前「先做其他，并挂锁」项的状态（无 → None）。"""
+        card = self.get_conflict()
+        if card is None or not card.deferred or card.status != "pending":
+            return None
+        lock = self.lock_registry.get(self.defer_lock_key())
+        now = self._clock()
+        return {
+            "ticket": card.id,
+            "reason": card.reason,
+            "retriggered": card.retriggered,
+            "persistent": card.deferred_persistent,
+            "retry_at": card.retry_after,
+            "retry_in_sec": max(0.0, card.retry_after - now),
+            "lock": lock.to_dict() if lock is not None else None,
+            "lock_should_release": self.lock_registry.should_release(
+                self.defer_lock_key()),
+            "editing": self._editing(),
+        }
 
     # ------------------------------------------------------------------
     # 冲突判定（宽进：判不出就"以新为准"，不编造冲突）

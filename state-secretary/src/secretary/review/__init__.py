@@ -5,6 +5,8 @@
 """
 from .rules import classify, is_same_side, is_transition_state
 from .review_arbiter import (
+    DEFAULT_PERSISTENT_GRACE_SEC,
+    DEFAULT_RETRY_DELAY_SEC,
     NO_BASELINE,
     NO_CONFLICT,
     STALE_BASE,
@@ -17,6 +19,8 @@ from .review_arbiter import (
 from .scope import FULL, SCAN, ScanContext, decide_scan, scan_commands
 
 __all__ = [
+    "DEFAULT_RETRY_DELAY_SEC",
+    "DEFAULT_PERSISTENT_GRACE_SEC",
     "ReviewArbiter",
     "ReviewBaseline",
     "ConflictCard",

@@ -59,6 +59,8 @@ def env():
     rev = SecretarySession("i14", data_dir=d, role_name="secretary.review")
     dev = SecretarySession("i14", data_dir=d, role_name="secretary.dev")
     rev.review_arbiter._clock = clock          # 注入假时钟
+    # 假时钟须一并注入**锁聚合台账**（否则台账按真实时间算 TTL，与假时钟不同步）
+    rev.review_arbiter.lock_registry._clock = clock
     try:
         yield d, clock, rev, dev
     finally:

@@ -29,6 +29,7 @@
 | 循环熔断 | `LoopGuard` — 轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒 | loop-guard.md |
 | 评审写回仲裁 | `ReviewArbiter` — 只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口 | review-arbiter.md |
 | 审查范围分级 | `decide_scan` / `ScanContext` — 日常只审变化，全量只在大版本 | review-arbiter.md §6 |
+| 锁聚合台账 | `LockRegistry` — 所有锁统一登记 + 延迟后检测 + 先做其他并挂锁 + 绝不遗留 | lock-registry.md |
 
 ## 快速开始
 
@@ -87,6 +88,12 @@ sec.resume_loop(by="人工", reason="确认收口")    # 恢复预算须人工�
 # 评审写回：只在开启评审时记版本 + 冲突只额外处理一个
 sec.begin_review()                            # ① 开启评审才登记基线
 dec = sec.apply_review(mutate=lambda c: None) # ② 先落盘（冲突不阻塞评审）
+# 锁聚合：所有锁（写租约/评审读锁/延迟锁）统一登记，触发即可查看
+view = sec.locks_overview()                   # where_to_avoid = 哪里要避开
+sec.deferred_review_status()                  # 当前"先做其他，并挂锁"项
+sec.sweep_locks(by="秘书·会话")                # 兜底回收遗留锁（不误杀活跃锁）
+sec.release_review_locks(by="秘书·评审")        # 评审结束放锁（别遗留）
+
 if dec.should_retry:
     dec = sec.retry_review()                  # ③ 正在被编辑 → 延迟后重试
 for conf in sec.pending_review_conflicts():   # ④ 待处理冲突至多一张

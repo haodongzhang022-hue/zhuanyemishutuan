@@ -41,6 +41,8 @@ from ..loop.loop_guard import (
     DEFAULT_MAX_STALL_REPEATS,
 )
 from ..review import (
+    DEFAULT_PERSISTENT_GRACE_SEC,
+    DEFAULT_RETRY_DELAY_SEC,
     ArbiterDecision,
     ConflictCard,
     ReviewArbiter,
@@ -48,6 +50,7 @@ from ..review import (
     decide_scan,
     scan_commands,
 )
+from ..state import LockRegistry, LegacyLockScanner
 
 # 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
 # 遍历，亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）。
@@ -128,7 +131,9 @@ class SecretarySession:
         max_total_rounds: Optional[int] = None,
         max_stall_repeats: int = DEFAULT_MAX_STALL_REPEATS,
         review_dir: Optional[str] = None,
-        retry_delay_sec: float = 30.0,
+        retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+        locks_dir: Optional[str] = None,
+        persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
     ):
         """初始化一个会话秘书。
 
@@ -149,7 +154,13 @@ class SecretarySession:
                 ``max_rounds + max_advisory_fix_rounds + 1``。
             max_stall_repeats: 同一整改项指纹连续出现上界（默认 2）→ 停滞熔断。
             review_dir: 评审仲裁数据目录（默认 ``<数据根>/review``）。
-            retry_delay_sec: 疑似"正在编辑"时的延迟重试窗（默认 30s）。
+            retry_delay_sec: 疑似"正在编辑"时的延迟窗，默认 **60s**（1 分钟），
+                窗内**先做其他**；**再次触发**则对应锁升级为持续锁。
+            locks_dir: 锁聚合台账目录（默认 ``<数据根>/locks``）。
+                **所有锁统一登记在此**：卡片写租约 / 评审读锁 / 延迟锁，
+                `locks_overview()` 一次看全"哪里要避开"。
+            persistent_grace_sec: 重触发后持续锁的宽限，默认 **180s**（3 分钟），
+                持续到对方处理完为止（不自动打开）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -206,7 +217,16 @@ class SecretarySession:
             reviewer=role_name,
             data_dir=review_dir or os.path.join(self._session_root, "review"),
             retry_delay_sec=retry_delay_sec,
+            lock_registry=LockRegistry(
+                session_id=session_id,
+                data_dir=locks_dir or os.path.join(self._session_root, "locks"),
+                ttl_sec=retry_delay_sec,
+                persistent_grace_sec=persistent_grace_sec,
+            ),
+            persistent_grace_sec=persistent_grace_sec,
         )
+        # 锁聚合台账（同一本，供总览/清扫/外部模块登记；卡片写租约也镜像到此）
+        self.lock_registry = self.review_arbiter.lock_registry
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
         # 持久化记录为准，实例内存清单仅为会话内缓存镜像。
@@ -890,6 +910,7 @@ class SecretarySession:
         #    一 session_id 复用时带上陈旧基线与待处理冲突。
         try:
             self.review_arbiter.delete_state()
+            self.lock_registry.delete_state()
         except OSError:
             pass
         return ok
@@ -1123,6 +1144,7 @@ class SecretarySession:
         # 「是否还可能被自动唤醒继续修」，无需回读会话本地状态。
         summary["loop"] = self.loop_guard.status()
         summary["wake_allowed"] = self.loop_guard.should_wake_next()
+        summary["locks"] = self.locks_overview()
         return summary
 
     def set_upstream(self, upstream_session: str) -> bool:
@@ -1338,6 +1360,55 @@ class SecretarySession:
     ) -> bool:
         """收口那张冲突卡（**只额外处理一个**），收口后以当前版本重立基线。"""
         return self.review_arbiter.resolve(ticket_id, resolution, by=by)
+
+    def complete_deferred_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """「先做其他」做完后回来收尾：补做被延迟的那次评审，成功才打开锁。"""
+        return self.review_arbiter.complete_deferred(mutate=mutate, note=note)
+
+    def deferred_review_status(self) -> Optional[dict]:
+        """当前「先做其他，并挂锁」项：锁还剩多久、对方动没动、是否已升级持续锁。"""
+        return self.review_arbiter.deferred_status()
+
+    # ------------------------------------------------------------------
+    # 锁聚合管理（Issue #14：所有锁统一登记，触发即可查看，绝不遗留）
+    # ------------------------------------------------------------------
+
+    def locks_overview(self) -> dict:
+        """**所有锁**的聚合总览：「哪里要避开」一眼可见（不必靠测试才知道）。
+
+        汇总三处：
+        - 锁聚合台账（卡片写租约 / 评审读锁 / 延迟锁 / 序列化锁）；
+        - 历史遗留单锁文件（``<数据根>/state/*.owner.json``，只读上报）；
+        - 「先做其他，并挂锁」当前项（若有）。
+        `by_kind` 按类型计数，`where_to_avoid` 是给人看的避开清单。
+        """
+        view = self.lock_registry.overview()
+        legacy = LegacyLockScanner.scan(self.lock_registry.data_dir)
+        if not legacy:
+            legacy = LegacyLockScanner.scan(self.state_manager.data_dir)
+        view["legacy_locks"] = legacy
+        view["deferred"] = self.review_arbiter.deferred_status()
+        view["where_to_avoid"] = list(view.get("where_to_avoid", [])) + [
+            f"{l.get('session_id')}（legacy 写租约｜持有者 "
+            f"{l.get('holder') or '未标注'}｜{'已过期' if l.get('expired') else '仍有效'}）"
+            for l in legacy
+        ]
+        return view
+
+    def sweep_locks(self, by: str = "") -> List[dict]:
+        """清理**遗留锁**（过期且超宽限仍未处理）→ 置 stale + 留痕。
+
+        不误杀活跃锁与宽限内的持续锁；返回被回收的锁清单。
+        """
+        return self.review_arbiter.sweep_locks(by=by or self.role_name)
+
+    def release_review_locks(self, by: str = "", reason: str = "评审结束") -> int:
+        """释放本会话**评审相关**的锁（评审读锁 + 延迟锁），不动他人写租约。"""
+        return self.review_arbiter.release_locks(by=by, reason=reason)
 
     def review_scope(
         self,

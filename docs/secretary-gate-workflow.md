@@ -84,7 +84,7 @@ v0.4（Ref: #14）补**评审写回机制**：只在开启评审时记版本 + �
 |---|---|---|
 | 1 | **只在开启评审时记录版本** | 开发过程不记；`begin_review()` 才登记基线（幂等，不偷偷推前） |
 | 2 | **无法追踪变化就以新的** | 基线缺失/版本退化/无共同祖先 → `REBASE`，不编造冲突 |
-| 3 | **正在编辑 → 防同写锁 + 延迟** | 他人写租约 → 本次不落盘，等 `retry_delay_sec`（默认 30s）后重试 |
+| 3 | **正在编辑 → 防同写锁 + 延迟** | 他人写租约 → **先做其他，并挂锁**；延迟 **1 分钟**后检测（重触发转 3 分钟持续锁） |
 | 4 | **先完成该做的，只额外处理一个** | 评审**先落盘**；冲突收敛为**一张**卡，后续冲突合并进同一张 |
 
 - 🔴 **冲突不阻塞评审**：`applied=True`，评审结果照常落盘；
@@ -97,6 +97,32 @@ v0.4（Ref: #14）补**评审写回机制**：只在开启评审时记版本 + �
 > 参照物口径（易踩）：判"对方是否有效推进"必须拿**评审基线快照**比，
 > 不能拿"开始写回时的最新卡"比——后者已含对方变更，互比恒为"无进展"→ 每次并发
 > 都误判冲突。落地见 `ReviewBaseline.history` 与 `ReviewArbiter._is_progress`。
+
+## 2.2.1 锁聚合管理（v0.5 新增 · Ref: #14 追问）
+
+> 延迟可以到 **1 分钟**；**再次触发就按 3 分钟持续到对方解决完**；**别遗留锁一直不
+> 打开**；**所有锁应该被聚合的管理**，哪里要避开**不用测试才知道**，触发了**看一眼
+> 就有数**；触发机制 = **延迟后检测** + **先做其他，并挂锁**。
+
+| # | 口径 | 落地 |
+|---|---|---|
+| 1 | 延迟 1 分钟 | `DEFAULT_RETRY_DELAY_SEC=60`（`SecretarySession(retry_delay_sec=…)`） |
+| 2 | 重触发 3 分钟持续到对方解决完 | 重触发即 `persistent`；退避 **60 → 120 → 180 封顶**，只增不减 |
+| 3 | 别遗留锁一直不打开 | 每锁必有到期；`sweep_locks()` 回收过期+超宽限；收口/消解即释放 |
+| 4 | 所有锁聚合管理 | 一本台账 `<数据根>/locks/registry.json`（写租约 / 评审读锁 / 延迟锁） |
+| 5 | 触发即可查看 | `locks_overview()` 的 `where_to_avoid`：谁锁的、锁什么、还有多久 |
+| 6 | 延迟后检测 + 先做其他并挂锁 | `retry_review()` 到点检测；`deferred_review_status()` 看挂账项 |
+
+- 四种锁：`card_write`（正在编辑）/ `review`（评审读锁）/ `defer`（延迟锁）/
+  `serialize`（写入序列化）；
+- **单锁兼容**：`<session>.owner.json` 仍是终态判据，台账只是镜像 + 聚合视图，
+  台账坏了不影响加锁语义；
+- 持续锁在宽限内 `should_release()` 恒 `False`——**不许提前打开**；
+- 收尾：`complete_deferred_review()`；释放：`release_review_locks()`。
+
+> 设计详见 `docs/design/state-secretary-lock-registry.md`。
+> 落地：`state/lock_registry.py`（`LockRegistry` / `LegacyLockScanner`）＋
+> 门面 `SecretarySession.locks_overview() / sweep_locks() / deferred_review_status()`。
 
 ## 2.3 审查范围分级（v0.4 新增 · Ref: #14）
 
