@@ -791,11 +791,11 @@ class TestReverseControlRealBodyBeyond417K:
         led = self._ledger()
         assert len(led) * 5 >= 417_480, (len(led), len(led) * 5)
 
-    #: 规模阶梯取到 **×6**（= 本轮实测余量 ≥ 2× 的最大档）：判据要**稳定**，
+    #: 规模阶梯取到 **×8**（≈ 742 K，实测余量仍 ≥ 2.5×）：判据要**稳定**，
     #: 不取"贴在上界附近"的档位（那是**允许**保守降级的区间，见下一条用例）。
-    @pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
+    @pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 8])
     def test_reverse_real_ledger_is_not_degraded(self, k):
-        """台账 ×1…×6（92 K → 550 K，含 **≥ 417 K** 档）**不降级**，静默卡可见。"""
+        """台账 ×1…×8（92 K → 742 K，含 **≥ 417 K** 档）**不降级**，静默卡可见。"""
         body = self._ledger() * k + "\n" + CARD
         objs, degraded, reason = _objects_diag(body)
         assert degraded is False, f"台账 ×{k}（{len(body)} 字符）误降级：{reason}"
@@ -809,7 +809,7 @@ class TestReverseControlRealBodyBeyond417K:
         `degraded=True` + `reason` 可读，且 `from_handoff` **不得**因此 fail-open。
         本条把"上界附近是保守区间"写死，避免下一轮把它误读成"误降级缺陷"。
         """
-        body = self._ledger() * 12 + "\n" + CARD     # ~1.1 MB > 417 K 数倍
+        body = self._ledger() * 16 + "\n" + CARD     # ~1.5 MB > `DEFAULT_SCAN_BUDGET`
         objs, degraded, reason = _objects_diag(body)
         assert degraded is True, "超 `DEFAULT_SCAN_BUDGET` 却未标记（静默收摊）"
         assert reason == SCAN_REASON_TRUNCATED
@@ -838,17 +838,18 @@ class TestReverseControlRealBodyBeyond417K:
         assert g.status()["round_no"] == 4
 
     def test_reverse_calibration_has_margin_beyond_417k(self):
-        """取值依据（实测）：上界对应的**合法正文**规模必须**远超** 417 K。
+        """取值依据（实测 · **裁定明示余量 ≥ 5×**）：417 K 反向对照必须留足余量。
 
-        判据 = 台账 ×5（417 480 字符）的实际记账量 **≪ `MAX_SCAN_WORK`**
-        （余量 ≥ 2×）；且"不误降级"的规模上限 ≥ `DEFAULT_SCAN_BUDGET`。
+        判据 = 台账 ×5（**≥ 417 480 字符**，总师裁定的反向对照规模）的实际记账量
+        **≤ `MAX_SCAN_WORK` / 5**（余量 **≥ 5×**，不是 2×——2× 会让 ×5 档离上界
+        太近，任何记账口径微调都会把它推进"允许保守降级"区间）。
         """
         cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
         body = self._ledger() * 5 + "\n" + CARD
         assert len(body) >= 417_480, len(body)
         _, _, _, work = _scan_diag_probe(body)
         assert work < cap, (work, cap)
-        assert work * 2 <= cap, f"417 K 正文余量不足 2×：work={work} cap={cap}"
+        assert work * 5 <= cap, f"417 K 正文余量不足 5×：work={work} cap={cap}"
 
     def test_reverse_worst_adversarial_still_bounded(self):
         """**同批对照的另一半**：真实正文不降级，同时对抗输入**仍被上界拦住**。"""
