@@ -1606,3 +1606,77 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - **性能表（§24.4）更正**：其中 `"{"×20000` / `if (x) {"×3000` 等**无 `}`** 的
   输入**绕开**了 `raw_decode` 路径（O(1) 预检短路），故当时"毫秒级"结论
   **不构成**对 O(n²) 路径的验证；本轮 G6 用**含 `}`** 的输入重测。
+
+---
+
+## 26. Issue #21 · G8 与「≥ 417 K 真实正文」反误降级对照（承接 CP1 `0b129dc`）
+
+> 触发：架构·总师裁定（PR #15 @ `9382552` · 2026-09-18T22:00:44Z）——**新增验收项 G8**
+> （`budget <= 0` 不得绕过降级规则，与 **G4 同批**落地，**不得单独**）+ 本轮**重申**的两条
+> 口径修正：**禁止纯回退**、**`G3/G4/G5 必须同批`**（只修记账 = 新 fail-open，触发于
+> **417 K 非对抗正文**）。
+>
+> 本段为 **CP1（`0b129dc`）之上的增量**：G1–G7 已在 §25 留痕，本轮只补 **G8** 与
+> **≥ 417 K 反误降级对照**。**不引入新机制**。
+
+### 26.1 G8：`budget <= 0` 与截断是**同一条规则**
+
+| 项 | 缺陷（总师独立复现） | 修法 | 判别性判据 |
+|---|---|---|---|
+| **G8** | `scan_json_spans_diag` 的 `if limit <= 0: return out, False` 位于 `degraded = limit < len(text)` **之前**提前返回 ⇒ 非空正文被「整段截断」却**不标记**（实测 `([], False)`） | **删掉该提前返回**：`limit` 一律交给 `_scan_diag` 的**唯一那条规则**（`limit < len(text)` ⇒ `truncated`；`limit = 0` 时该式自然成立）⇒ 降级**只有一个判定处**（单一语义源） | `scan_json_spans_report(text, 0)` / `json_objects_in_report(text, -5)`（`text` 非空）→ `degraded=True` + `reason="truncated"`；**源码护栏**：该函数体内不得出现 `limit <= 0` / `limit < 1` 的早退；**反向对照**：**空正文**任何 `budget` 都**不**降级 |
+
+- **口径归属**（总师明示）：G8 与 **G4（降级契约）同批**，**不是**新语义——
+  `limit=0 < len(text)` 本应为 `True`，属"提前返回绕过已定规则"。
+- **同批理由（重申）**：`cost = pos`（G3）单独落地时，台账 ×5（417 480 字符）
+  即触上界、卡被吞，且落在**非对抗正文**上 ⇒ 单修记账会把 CP1 变成**新的 fail-open
+  通道**。故 G3/G4/G5/G8 **必须同批**（本轮一并校验）。
+
+### 26.2 ≥ 417 K 真实正文**反误降级**对照（[HIGH]）
+
+| 判据 | 实测 |
+|---|---|
+| 台账 ×1…×6（92 K → 550 K） | **不降级**（`degraded=False` / `reason=""`），静默卡**始终可见** |
+| **台账 ×5 = 458 146 字符（≥ 417 480）** | `degraded=False`；端到端 `from_handoff` → `fused=True` / `wake=False`；`adopt_budget` → `degraded=False`、`round_no=4`（**卡不丢**） |
+| 台账 ×12（~1.1 MB > `DEFAULT_SCAN_BUDGET`） | **允许**保守降级（`truncated`）—— 判据是**方向保守**（`fused=True` / `wake=False`），不是"永不降级"（后者 = 无上界 = O(n²) 回归） |
+| 余量 | 台账 ×5 的记账量 **≪ `MAX_SCAN_WORK`**（判据 ≥ 2×） |
+| **同批另一半** | 含 `}` 对抗输入仍被上界拦住（`degraded=True` + `work_cap` / `rescan_len`） |
+
+⇒ "真实正文不误降级"与"对抗输入被上界拦住"**必须同时成立**：只满足其一都是失真
+（前者缺 = 上界过小（新丢卡）；后者缺 = 上界失效（O(n²) 回归））。
+
+### 26.3 自测
+
+- `pytest -q`：**1118 passed**（CP1 基线 `0b129dc` **1099** + 本轮 **19** 项），
+  连跑稳定；`compileall src tests` OK；`pyflakes`（改动 + 新文件）**0 告警**。
+- **判别力验证（两级基线，均非恒真断言）**：
+  - 放到 **`9382552`**（scan 重做前）上跑 G8 + 反误降级两组 → **9 failed / 10 passed**
+    （**实测命令**：把本文件拷入 `9382552` worktree 后 `pytest -k "g8 or ReverseControl"`）。
+    失败项 = G8（`budget<=0` 未标记：4 项）+ ≥ 417 K 对照（`degraded` 外露缺失 /
+    `_scan_diag` 缺失 / 对抗输入未降级 / 静默收摊 / 记账余量：5 项）。
+  - 放到 **CP1 `0b129dc`**（本轮的直接前驱）上跑同两组 → **3 failed / 16 passed**，
+    失败项恰好对应本轮新增的三件事：
+    ① `test_g8_same_rule_as_truncation_is_the_shared_source`（**源码护栏**：
+    CP1 里 `limit <= 0` 的**提前返回**仍在 ⇒ 降级有两个判定处，违反"单一语义源"；
+    G8 的"取值"用例在 CP1 上**通过**正是因为那个提前返回**碰巧**给出了 `True`）；
+    ② `test_g8_end_to_end_conservative_on_zero_budget`（CP1 未从包出口导出
+    `extract_json_objects_diag`）；③ `test_reverse_ledger_x5_adopt_budget_not_degraded`
+    （CP1 的 `adopt_budget` 返回值**未外露** `degraded`，≥ 417 K 的观测面缺失）。
+- **G8 判别性口径**（总师原文）：`scan_json_spans_report(text, 0)` 与
+  `json_objects_in_report(text, -5)`（`text` 非空）→ `degraded=True`；
+  **空正文** → `False`（反向对照）。
+
+### 26.4 风险与边界（主动暴露，不吞）
+
+- **`[MEDIUM]` 超 `MAX_RESCAN_LEN` 的合法长对象被跳过** —— 但**显式降级**
+  （`degraded=True` + `reason="rescan_len"`），消费侧取保守方向，**不是静默丢卡**。
+  取值有实测依据（全仓语料最大 4 842，54× 余量）+ 反向对照。
+- **`[LOW]` 上界附近的规模是"允许保守降级"区间**：台账 ×12（~1.1 MB > `DEFAULT_SCAN_BUDGET`）
+  会 `truncated`。**判据是方向保守**（`fused=True` / `wake=False`），不是"永不降级"
+  ——后者等于无上界 = O(n²) 回归（`test_reverse_beyond_margin_degrades_conservatively` 钉住）。
+- **`[INFO]` 预存 flaky 用例（**非本轮引入**）**：`tests/test_state_manager.py::
+  test_session_id_path_traversal_guard` 断言"父目录（`/tmp`）下不得有名字含 `evil` 的条目"
+  —— 该断言依赖**环境**：`/tmp` 里任何名字含 `evil` 的条目（含**其他进程**的临时目录）
+  都会让它失败（本机实测触发一次，概率量级 ~1e-6/次）。**属 `main` @ `de5eae8` 既有代码**，
+  本轮 diff **未触碰**该文件（`git diff 0b129dc 9382552 -- …test_state_manager.py` 为空）。
+  **不吞**：登记为待收口项（修法是"只检查本次会话应有的文件"，而不是扫父目录全量）；
+  **本轮不动**（范围冻结：Issue #21 只承载 scan + 降级契约 + 消费侧接线）。

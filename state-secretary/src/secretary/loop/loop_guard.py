@@ -876,6 +876,7 @@ class LoopGuard:
             payload, session_id=self.session_id)
         if data is None and not degraded:
             return {"merged": False, "adopted": {},
+                    "degraded": False, "scan_reason": "",
                     "reason": "载荷无法解析（无操作）"}
         if data is None:
             # 降级且没解析出载荷：**不得**按空操作返回（🔴-4：卡静默丢）
@@ -938,7 +939,11 @@ class LoopGuard:
         if save:
             self._save()
         return {"merged": True, "adopted": adopted, "changed": changed,
-                "fused": st.fused, "reason": note}
+                "fused": st.fused,
+                # 扫描降级标记**外露**（G5 观测面）：消费侧据此取保守方向，
+                # 复核者也据此看出"这次为什么判不出"（不吞异常/不静默）。
+                "degraded": degraded, "scan_reason": scan_reason,
+                "reason": note}
 
     # ---- 状态读取 ----
 

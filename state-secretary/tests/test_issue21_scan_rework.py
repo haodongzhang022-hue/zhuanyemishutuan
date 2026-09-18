@@ -139,6 +139,17 @@ def _spans_diag(text, budget=None):
     return scan_json_spans_diag(text, budget)
 
 
+#: G8 判据用：**旧二元组**入口（`(片段清单, degraded)`）。
+scan_json_spans_report = getattr(trail_mod, "scan_json_spans_report", None)
+
+
+def _scan_diag_probe(text):
+    """内部四元组（含 `work`）：判"记账余量"用；旧基线无 → 断言失败。"""
+    fn = getattr(trail_mod, "_scan_diag", None)
+    assert fn is not None, "缺 trail._scan_diag（G3/G8 硬要求）"
+    return fn(text, len(text))
+
+
 def _need(name, value):
     """取新常量：缺失（旧基线）→ **断言失败**（而非 TypeError）。"""
     assert value is not None, f"缺 {name}（Issue #21 硬要求）"
@@ -667,3 +678,181 @@ class TestG7AccountingMechanism:
         assert "SCAN_REASON_RESCAN_LEN" in src
         # 记账口径的说明必须点明"错误位置 pos（整段前缀）"
         assert "错误位置" in src and "pos" in src
+
+
+# ==================================================================
+# G8 `budget <= 0` 不得绕过降级规则（总师 Issue #21 评论
+#    `2101068933304893440` @ 2026-09-18T22:00:44Z 新增验收项）
+# ==================================================================
+
+class TestG8ZeroBudgetIsTheSameRuleAsTruncation:
+    """**G8**：`budget <= 0` 与截断是**同一条规则**，不得"提前返回、静默不标记"。
+
+    缺陷（总师独立复现）：旧实现在 ``scan_json_spans_diag`` 里
+    ``if limit <= 0: return out, False``，**位于** ``degraded = limit < len(text)``
+    **之前** ⇒ 非空正文被整段截断却**不标记**（实测 `([], False)`）。
+
+    修法（本文件判据）：该分支**与截断同规则**（`limit=0 < len(text)` 本应为 `True`），
+    属"提前返回绕过已定规则"，**不是**新语义 ⇒ 现在 `limit <= 0` **不再自己判定**，
+    一律交给 ``_scan_diag`` 的唯一那条规则。
+
+    归属：与 **G4（降级契约）同批**落地（总师明示"不得单独"）。
+    """
+
+    def test_g8_zero_budget_on_nonempty_body_is_degraded(self):
+        """判别性用例（总师原文口径）：`scan_json_spans_report(text, 0)` → `degraded=True`。"""
+        text = '{"a":1}'
+        spans, degraded = scan_json_spans_report(text, 0)
+        assert spans == []
+        assert degraded is True, "非空正文 + budget=0 被静默成未降级（G8）"
+
+    def test_g8_negative_budget_on_nonempty_body_is_degraded(self):
+        """判别性用例：`json_objects_in_report(text, -5)` → `degraded=True`。"""
+        objs, degraded = json_objects_in_report('{"a":1}', -5)
+        assert objs == []
+        assert degraded is True, "非空正文 + budget<0 被静默成未降级（G8）"
+
+    def test_g8_reason_is_truncated_same_as_rule(self):
+        """`reason` 必须与**截断**同一条：`truncated`（不是新语义、不是空串）。"""
+        for budget in (0, -1, -5, -1000):
+            _, degraded, reason = _spans_diag('{"a":1}', budget)
+            assert degraded is True
+            assert reason == SCAN_REASON_TRUNCATED, (budget, reason)
+
+    def test_g8_same_rule_as_truncation_is_the_shared_source(self):
+        """**机制断言（单一语义源）**：`budget=0` 与"正文超 budget"走**同一判定处**。
+
+        判据 = 两种输入的 `(degraded, reason)` 完全一致；且 `trail.py` 里
+        `scan_json_spans_diag` **不再**有"`limit <= 0` 提前 return"的绕过分支
+        （源码护栏：该函数体内不得出现 `limit <= 0` / `limit < 1` 的早退）。
+        """
+        small = '{"a":1}'
+        big = "x" * 100 + small
+        a = _spans_diag(small, 0)
+        b = _spans_diag(big, 50)          # 截断：limit=50 < len(text)
+        assert a[1:] == b[1:] == (True, SCAN_REASON_TRUNCATED), (a, b)
+        path = os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
+                            "trail.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        body = src.split("def scan_json_spans_diag(", 1)[1].split(
+            "\ndef ", 1)[0]
+        code = "\n".join(ln for ln in body.splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "limit <= 0" not in code, "仍有绕过已定规则的提前返回（G8）"
+        assert "limit < 1" not in code
+        # 仍必须把 `limit` 交给唯一判定处
+        assert "_scan_diag(text, limit)" in code
+
+    def test_g8_empty_body_is_not_degraded(self):
+        """**反向对照**：空正文**不**降级（没有内容可表态，防"恒降级"恒真）。"""
+        for budget in (None, 0, -5, 10):
+            assert _spans_diag("", budget) == ([], False, "")
+            assert _objects_diag("", budget) == ([], False, "")
+
+    def test_g8_reverse_normal_budget_unchanged(self):
+        """**反向对照**：`budget > 0` 且不截断 → 结果与不传 `budget` 一致。"""
+        text = '{"a":1} {"b":2}'
+        assert _spans_diag(text, len(text)) == _spans_diag(text)
+        assert _spans_diag(text, 10_000) == _spans_diag(text)
+
+    def test_g8_end_to_end_conservative_on_zero_budget(self):
+        """端到端：`budget=0` 的降级不得成为 fail-open 通道（卡在未表态区间）。"""
+        from secretary.loop import extract_json_objects_diag
+        assert extract_json_objects_diag is not None, "缺 diag 入口（G4/G5）"
+        objs, degraded, reason = extract_json_objects_diag(CARD, 0)
+        assert objs == [] and degraded is True
+        assert reason == SCAN_REASON_TRUNCATED
+
+
+# ==================================================================
+# ≥ 417 K 正文**反误降级**对照（总师：只修记账 = 新 fail-open，
+#   触发于 417 K **非对抗**正文；故必须有"不误降级"的对照）
+# ==================================================================
+
+class TestReverseControlRealBodyBeyond417K:
+    """**反向对照**：真实台账正文 **≥ 417 K** 不得误降级。
+
+    为什么必须有这条（总师 `[HIGH]`）：`cost = pos` 单独落地时，台账 ×5
+    （**417 480 字符**）即触旧上界、卡被吞 —— 且落在**非对抗正文**上，
+    于是"修记账"反而把 CP1 变成**新的 fail-open 通道**（`adopt_budget` →
+    `wake=True`）。故判据不只要"对抗输入 < 1 s"，还要"**真实正文不降级**"。
+
+    本条用**实读台账 ×N**（非构造串）作为"真实正文"，并给出规模阶梯。
+    """
+
+    @staticmethod
+    def _ledger():
+        with open(LEDGER, encoding="utf-8") as f:
+            return f.read()
+
+    def test_ledger_size_meets_the_417k_threshold(self):
+        """用例前提：台账 ×5 **≥ 417 480 字符**（总师实测的误降级触发规模）。"""
+        led = self._ledger()
+        assert len(led) * 5 >= 417_480, (len(led), len(led) * 5)
+
+    #: 规模阶梯取到 **×6**（= 本轮实测余量 ≥ 2× 的最大档）：判据要**稳定**，
+    #: 不取"贴在上界附近"的档位（那是**允许**保守降级的区间，见下一条用例）。
+    @pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
+    def test_reverse_real_ledger_is_not_degraded(self, k):
+        """台账 ×1…×6（92 K → 550 K，含 **≥ 417 K** 档）**不降级**，静默卡可见。"""
+        body = self._ledger() * k + "\n" + CARD
+        objs, degraded, reason = _objects_diag(body)
+        assert degraded is False, f"台账 ×{k}（{len(body)} 字符）误降级：{reason}"
+        assert reason == ""
+        assert CARD_OBJ in objs, f"台账 ×{k} 丢卡"
+
+    def test_reverse_beyond_margin_degrades_conservatively(self):
+        """**边界明示**：规模继续放大（远超 417 K）时**允许**保守降级。
+
+        判据不是"永不降级"（那等于无上界 = O(n²) 回归），而是**降级方向保守**：
+        `degraded=True` + `reason` 可读，且 `from_handoff` **不得**因此 fail-open。
+        本条把"上界附近是保守区间"写死，避免下一轮把它误读成"误降级缺陷"。
+        """
+        body = self._ledger() * 12 + "\n" + CARD     # ~1.1 MB > 417 K 数倍
+        objs, degraded, reason = _objects_diag(body)
+        assert degraded is True, "超 `DEFAULT_SCAN_BUDGET` 却未标记（静默收摊）"
+        assert reason == SCAN_REASON_TRUNCATED
+        g = _guard(body)
+        assert g.is_fused() is True and g.should_wake_next() is False
+
+    def test_reverse_ledger_x5_end_to_end_still_fused(self):
+        """端到端（≥417 K 真实正文 + 静默卡）：`fused=True` / `wake=False`。
+
+        这正是总师实测的**误降级触发规模**（417 480 字符）：若上界取值过小，
+        此处的卡会被吞 → `wake=True`（fail-open）。本判据把它钉住。
+        """
+        body = self._ledger() * 5 + "\n" + CARD
+        assert len(body) >= 417_480
+        g = _guard(body)
+        assert g.is_fused() is True, "≥417 K 真实正文被误降级（fail-open 方向）"
+        assert g.should_wake_next() is False
+
+    def test_reverse_ledger_x5_adopt_budget_not_degraded(self):
+        """端到端（`adopt_budget` 通道）：≥417 K 正文**不得**被保守继承熔断。"""
+        body = self._ledger() * 5 + "\n" + CARD
+        g = LoopGuard(SESSION, data_dir=tempfile.mkdtemp())
+        res = g.adopt_budget(body)
+        assert res["merged"] is True
+        assert res.get("degraded") is False, res
+        assert g.status()["round_no"] == 4
+
+    def test_reverse_calibration_has_margin_beyond_417k(self):
+        """取值依据（实测）：上界对应的**合法正文**规模必须**远超** 417 K。
+
+        判据 = 台账 ×5（417 480 字符）的实际记账量 **≪ `MAX_SCAN_WORK`**
+        （余量 ≥ 2×）；且"不误降级"的规模上限 ≥ `DEFAULT_SCAN_BUDGET`。
+        """
+        cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
+        body = self._ledger() * 5 + "\n" + CARD
+        assert len(body) >= 417_480, len(body)
+        _, _, _, work = _scan_diag_probe(body)
+        assert work < cap, (work, cap)
+        assert work * 2 <= cap, f"417 K 正文余量不足 2×：work={work} cap={cap}"
+
+    def test_reverse_worst_adversarial_still_bounded(self):
+        """**同批对照的另一半**：真实正文不降级，同时对抗输入**仍被上界拦住**。"""
+        body = '{"k":1, ' * 40000 + '}'
+        _, degraded, reason = _objects_diag(body)
+        assert degraded is True
+        assert reason in (SCAN_REASON_WORK_CAP, SCAN_REASON_RESCAN_LEN)

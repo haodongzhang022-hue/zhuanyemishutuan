@@ -214,9 +214,15 @@ def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
       ② **总工作量**：折算量超过 ``MAX_SCAN_WORK`` → 停止尝试（`work_cap`）。
     * **降级（只降级、不丢段）**：两条上界都**只**让"未扫到的区间"不表态，
       已取到的片段照常返回。
+    * **G8（`budget <= 0` 与截断同一条规则）**：``limit < len(text)`` 即
+      `truncated` —— `limit = 0` 时本式自然成立，故调用方（``..._diag``）
+      **不得**再为 `budget <= 0` 另设"提前返回"分支（那正是"绕过已定规则"，
+      会把"非空正文被整段截断"静默成"未降级"）。**降级只有一个判定处**
+      （本函数这一行），这是本文件的口径。
     """
     out: List[str] = []
     # 截断（``limit < len(text)``）同样是"该区间不表态" → 显式标记（不得静默）。
+    # **G8**：`limit = 0`（`budget <= 0`）也走这一行 —— 不再有绕过它的分支。
     truncated = limit < len(text)
     # 基扫（一次 ``rfind``）计入记账：总上界因此也是"含基扫"的真实耗时上界。
     work = limit
@@ -296,14 +302,17 @@ def scan_json_spans_diag(
     ``rescan_len``）让消费侧能区分"正文被截断" / "总量触顶" / "某候选超长"，
     并据此把安全旗标（``fused`` / ``wake``）取**保守方向**、把原因写进留痕。
     """
-    out: List[str] = []
     if not isinstance(text, str) or not text:
-        return out, False, ""
+        return [], False, ""
     n = len(text)
     limit = n if budget is None else min(n, max(0, budget))
-    if limit <= 0:
-        return out, True, SCAN_REASON_TRUNCATED if n > 0 else ""
-    spans, degraded, reason, _ = _scan_diag(text, limit)
+    # **G8：`budget <= 0` 与截断是同一条规则**（`limit < len(text)`）。
+    # 旧实现在此**提前返回** `(out, False)`，把"非空正文被整段截断"静默成
+    # "未降级"（总师实测 `scan_json_spans_report(text, 0) → ([], False)`）。
+    # 现在**不再**自己判定，一律交给 `_scan_diag` 的唯一那条规则 ——
+    # `limit = 0` 时它自然给出 `degraded=True` / `reason="truncated"`。
+    # 这样"降级"只有一个判定处（单一语义源），不会再长出"绕过已定规则"的分支。
+    spans, degraded, reason, _work = _scan_diag(text, limit)
     return spans, degraded, reason
 
 
