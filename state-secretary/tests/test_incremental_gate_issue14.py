@@ -31,7 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from secretary.gate import (  # noqa: E402
     INCREMENT_ADDED, INCREMENT_DISSOLVED, INCREMENT_LEGACY,
     CounterWordingError, FullSweepReport, IncrementalGate,
-    SweepPlan, SweepTarget, SweepRules, assert_counter, render_count,
+    SweepPlan, SweepReport, SweepTarget, SweepRules,
+    assert_counter, render_count,
 )
 from secretary.gate.rules import (  # noqa: E402
     classify_changed_path, looks_like_test_path,
@@ -42,9 +43,11 @@ TEST_ROOT = "state-secretary/tests"
 NEW_TEST_FILE = f"{TEST_ROOT}/test_incremental_gate_issue14.py"
 
 # 历史增量节点（本仓库真实存在的提交）：用于增量 diff 判定的真实复核
-LEGACY_BASE = "a455608"   # 前一已跑过的 head
-LEGACY_SMALL = "798e80d"  # 增量 = 由本 PR 引入的测试文件（新增）
-LEGACY_BIG = "0ed083d"    # 增量 = 新增测试文件 + 既有文件消解
+# 🟡10：原契约写的 798e80d / 0ed083d 在本仓库不存在（git cat-file 失败）→
+# 3 项永久 skip、"跨版复核"不可复现。此处改用**真实存在**的修订。
+LEGACY_BASE = "a455608"    # 前一已跑过的 head（本 PR 的基线）
+LEGACY_BIG = "e3195ea"     # 增量 = 既有测试文件新增 + 消解（真实大增量）
+LEGACY_MID = "d6abaab"     # 增量 = 两个测试文件新增（真实中等增量）
 
 
 def _gate() -> IncrementalGate:
@@ -136,14 +139,18 @@ class TestG1IncrementalOnly:
                            cwd=REPO_ROOT, capture_output=True, text=True)
 
     def test_g1_small_increment_plan_is_small(self):
-        """**判别性**：增量只含一个新增测试文件 → 计划须 ≈ 该文件用例数，
-        不得是 308（全量）。"""
-        _rev_or_skip(LEGACY_SMALL)
-        plan = _gate().plan_sweep(base=LEGACY_SMALL)
-        assert plan.planned_count < 40, (
-            f"小增量（单文件）却计划 {plan.planned_count} 例 → 全量冗余回归")
-        assert NEW_TEST_FILE in plan.planned_files, \
-            "新增测试文件须在计划内（未跑过 → 必跑）"
+        """**判别性**：增量只含一个新增测试文件 → 计划须**只**落在该文件，
+        不得夹带既有用例（全量冗余回归）。"""
+        gate = _gate()
+        plan = gate.plan_sweep(base=LEGACY_BASE)
+        full = gate.collect("WORKTREE")
+        assert plan.planned_files == [NEW_TEST_FILE], (
+            f"单文件增量却计划触及 {plan.planned_files} → 夹带无关用例")
+        assert plan.planned_count < len(full) * 0.25, (
+            f"小增量计划 {plan.planned_count} 例 / 全量 {len(full)} 例 → "
+            "未体现『只跑增量』")
+        assert plan.deferred_count > len(full) * 0.7, \
+            "绝大多数既有用例须被标为『已跑过、默认不重复』"
 
 
 # ======================================================================
@@ -407,14 +414,27 @@ class TestG7EffectiveCoverage:
         assert supplements == []
 
     def test_g7_plan_covers_all_effective_faces(self):
-        """**判别性端到端**：小增量计划仍须覆盖全部有效面（9 个测试文件各 ≥1）。"""
-        _rev_or_skip(LEGACY_SMALL)
-        gate = _gate()
-        plan = gate.plan_sweep(base=LEGACY_SMALL)
+        """**判别性端到端**：兜底只在**本轮触及范围**内生效（不夹带无关用例）。
+
+        口径收敛（复评第 1 轮登记）：契约 §5 原写「9 个测试文件各 ≥1 例」，
+        与不变量 5「计划只落在 diff 触及的测试文件内」互斥。正解是：
+        **兜底不得把与增量无关的既有文件拉进计划**（允许漏，允许后续重提）。
+        本用例锁定该口径：触及范围内的有效面须有覆盖，触及范围外**不得**补入。
+        """
         from secretary.gate.incremental import DEFAULT_GUARDS
+        gate = _gate()
+        plan = gate.plan_sweep(base=LEGACY_BASE)
+        touched = {c["path"] for c in gate.changed_files(LEGACY_BASE)
+                   if looks_like_test_path(c["path"])}
+        # 计划不得触及范围外文件（兜底不得夹带无关用例）
+        assert not (set(plan.planned_files) - touched), \
+            f"兜底夹带了无关文件：{sorted(set(plan.planned_files) - touched)}"
+        # 触及范围内的有效面须有覆盖
+        in_scope = [g for g in DEFAULT_GUARDS
+                    if any(g in p for p in touched)]
         planned = "\n".join(plan.planned_files)
-        missing = [g for g in DEFAULT_GUARDS if g not in planned]
-        assert not missing, f"有效面缺覆盖（兜底失效）：{missing}"
+        missing = [g for g in in_scope if g not in planned]
+        assert not missing, f"触及范围内的有效面缺覆盖：{missing}"
 
 
 # ======================================================================
@@ -438,18 +458,23 @@ class TestG8RealRepoEndToEnd:
             "绝大多数既有用例须被标为『已跑过、默认不重复』"
 
     def test_g8_big_increment_plan_matches_real_diff(self):
-        """较大增量（新增测试文件 + 既有文件消解）→ 计划含 added 与 dissolved，
+        """较大增量（新增用例 + 既有用例消解）→ 计划含 added 与 dissolved，
         且仍不含无关既有项。"""
         _rev_or_skip(LEGACY_BIG)
         gate = _gate()
         plan = gate.plan_sweep(base=LEGACY_BIG)
         kinds = {t.kind for t in plan.targets}
-        assert INCREMENT_ADDED in kinds, "新增测试文件须判为 added（未跑过）"
+        assert INCREMENT_ADDED in kinds, "新增用例须判为 added（未跑过）"
+        assert INCREMENT_DISSOLVED in kinds, "既有用例改动须判为 dissolved（消解）"
         assert plan.count_by_kind(INCREMENT_ADDED) > 0
+        assert plan.count_by_kind(INCREMENT_DISSOLVED) > 0
         touched = {c["path"] for c in gate.changed_files(LEGACY_BIG)
                    if looks_like_test_path(c["path"])}
         assert not (set(plan.planned_files) - touched), \
             "计划不得含与 diff 无关的既有文件"
+        # 中等增量对照：两个文件新增
+        plan_mid = gate.plan_sweep(base=LEGACY_MID)
+        assert len(plan_mid.planned_files) == 2, plan_mid.planned_files
 
     def test_g8_gate_module_self_consistent(self):
         """门禁自身：计划/报告/计数三处口径一致（不变量断言）。"""
@@ -501,12 +526,313 @@ class TestG9DiscriminativePower:
                            deferred=296)
 
     def test_g9_plan_count_equals_executed_count(self):
-        """不变量：计划数 == 实跑数（若不等 → 权责不一致）。"""
-        _rev_or_skip(LEGACY_BASE)
+        """不变量：计划数 == 实跑数 —— **真实子进程**判别（🔴-2）。
+
+        旧实现为自证式恒真（手工 ``report.executed = [t.nodeid …]`` 再断言），
+        与真实执行无关。本用例改为沙箱真实 pytest 子进程：新增测试文件 →
+        计划 N 例 → 实跑必须恰为 N 例（既非 0 也非全量）。
+        """
+        sandbox = _sandbox_repo(with_new_file=True)
+        plan = sandbox.gate.plan_sweep(base="HEAD")
+        assert plan.planned_count > 0, "前置：新增文件须产生计划"
+        report = sandbox.gate.run(plan)
+        assert report.exit_code == 0, report.raw_output[-400:]
+        assert report.executed_count == plan.planned_count, (
+            f"计划 {plan.planned_count} 例 ≠ 实跑 {report.executed_count} 例 "
+            "→ 权责不一致（🔴-2 判别点）")
+        assert report.counter_claim.executed == report.executed_count
+
+# ======================================================================
+# G10 端到端判别性回归（🔴-2：核心路径 run() 真实覆盖）
+# ======================================================================
+#
+# 旧 34 项用例中 `gate.run(` 调用数 = 0 —— 全部手工构造 SweepReport 后自填
+# executed/passed 再断言，故 🔴-1 的「假绿 + 空计划退化为全量」能全绿通过。
+# 本组用**真实 pytest 子进程 + rc/汇总/失败注入**做判别，四类必备：
+#   (a) 失败注入下报告不得 green；
+#   (b) selector 路径正确性（错误口径须 rc=4，正确口径须命中）；
+#   (c) 空计划不得退化为全量；
+#   (d) 守卫拒绝未含实跑数的文本。
+
+
+class _Sandbox:
+    """沙箱仓库：临时 git repo + 真实可跑的 pytest 用例（隔离真实仓库）。"""
+
+    def __init__(self, root: str, gate):
+        self.root = root
+        self.gate = gate
+
+
+def _sandbox_repo(with_new_file: bool = False, failing: bool = False,
+                  skipped: bool = False) -> _Sandbox:
+    """建一个临时 git 仓库（含 state-secretary/tests），返回可用门禁。
+
+    Args:
+        with_new_file: 额外新增一个**未提交**测试文件（增量 = added）。
+        failing: 基础测试文件内含一个失败用例。
+        skipped: 基础测试文件内含一个跳过用例。
+    """
+    root = tempfile.mkdtemp(prefix="gate-sbx-")
+    pkg = os.path.join(root, "state-secretary")
+    tests = os.path.join(pkg, "tests")
+    os.makedirs(tests, exist_ok=True)
+    with open(os.path.join(pkg, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write("[pytest]\n")
+    body = ["def test_ok():", "    assert True", ""]
+    if failing:
+        body += ["def test_bad():", "    assert False", ""]
+    if skipped:
+        body += ["import pytest", "", "@pytest.mark.skip(reason='x')",
+                 "def test_skip():", "    assert True", ""]
+    with open(os.path.join(tests, "test_base.py"), "w", encoding="utf-8") as f:
+        f.write("\n".join(body) + "\n")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+
+    if with_new_file:
+        with open(os.path.join(tests, "test_new.py"), "w",
+                  encoding="utf-8") as f:
+            f.write("def test_new_a():\n    assert True\n\n"
+                    "def test_new_b():\n    assert True\n")
+
+    return _Sandbox(root, IncrementalGate(repo_root=root))
+
+
+def _plan_for(gate, nodeids, path):
+    plan = SweepPlan(base="HEAD")
+    for n in nodeids:
+        plan.targets.append(SweepTarget(nodeid=n, kind=INCREMENT_ADDED,
+                                        path=path, name=n.split("::")[-1]))
+    return plan
+
+
+class TestG10EndToEndDiscriminative:
+    """🔴-2：run() 核心路径真实覆盖（四类判别性场景）。"""
+
+    # ---- (b) selector 路径正确性 ----
+
+    def test_g10_selector_path_is_pytest_relative(self):
+        """**判别性（b）**：selector 须为 pytest 运行目录相对路径 → 命中 1 例。
+
+        反例（旧口径）：把仓库相对 nodeid 直接当 selector 喂给
+        ``cwd=state-secretary/`` 的子进程 → pytest rc=4（not found）。
+        """
+        sbx = _sandbox_repo()
+        nodeid = "state-secretary/tests/test_base.py::test_ok"
+        plan = _plan_for(sbx.gate, [nodeid], "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert report.exit_code == 0, (
+            f"selector 路径口径错误（rc={report.exit_code}）: "
+            f"{report.raw_output[-300:]}")
+        assert report.executed_count == 1, "须恰好命中 1 例"
+        assert report.passed_count == 1
+
+    def test_g10_repo_relative_selector_would_be_rc4(self):
+        """**判别性（b）反证**：旧口径（仓库相对 selector）确实 rc=4。
+
+        本断言证明 🔴-1 的 bug 类别真实存在，并锁定新口径的必要性。
+        """
+        sbx = _sandbox_repo()
+        pkg = os.path.join(sbx.root, "state-secretary")
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "state-secretary/tests/test_base.py::test_ok"],
+            cwd=pkg, capture_output=True, text=True)
+        assert out.returncode == 4, (
+            "仓库相对 selector 在 cwd=state-secretary/ 下应 rc=4（路径未找到）")
+        assert "not found" in (out.stdout + out.stderr)
+
+    def test_g10_file_level_target_also_relative(self):
+        """**判别性（b）**：文件级标的（无 ``::``）同口径 → 不得 rc=4。"""
+        sbx = _sandbox_repo()
+        plan = SweepPlan(base="HEAD")
+        plan.targets.append(SweepTarget(
+            nodeid="state-secretary/tests/test_base.py",
+            kind=INCREMENT_DISSOLVED, path="state-secretary/tests/test_base.py"))
+        report = sbx.gate.run(plan)
+        assert report.exit_code == 0, report.raw_output[-300:]
+        assert report.executed_count == 1
+
+    # ---- (a) 失败注入下不得 green ----
+
+    def test_g10_failure_injection_must_not_be_green(self):
+        """**判别性（a）**：真实失败注入 → green 必须 False（rc 参与判定）。"""
+        sbx = _sandbox_repo(failing=True)
+        plan = _plan_for(
+            sbx.gate,
+            ["state-secretary/tests/test_base.py::test_ok",
+             "state-secretary/tests/test_base.py::test_bad"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert report.exit_code == 1, report.raw_output[-300:]
+        assert report.failed_count == 1, "失败须被真实解析出来"
+        assert report.green is False, "有失败却报绿 = 假绿（🔴-1 判别点）"
+
+    def test_g10_rc_nonzero_never_green(self):
+        """**判别性（a）**：rc≠0 一律不得 green（即使失败列表为空）。"""
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        report.failed, report.errors = [], []
+        report.exit_code = 4
+        assert report.green is False, "rc=4 却报绿 = 假绿"
+
+    # ---- (c) 空计划不得退化为全量 ----
+
+    def test_g10_empty_plan_does_not_run_full_suite(self):
+        """**判别性（c）**：空计划 → 0 例（不得裸跑全量）。"""
+        sbx = _sandbox_repo()
+        plan = SweepPlan(base="HEAD")   # 无 targets
+        report = sbx.gate.run(plan)
+        assert report.executed_count == 0, (
+            f"空计划却实跑 {report.executed_count} 例 → 退化为全量")
+        assert report.exit_code == 0
+        assert report.command == "", "空计划不得生成任何 pytest 命令"
+
+    def test_g10_unresolvable_selector_fails_fast_not_full(self):
+        """**判别性（c）**：selector/files 皆空 → fail-fast，绝不裸跑全量。"""
+        sbx = _sandbox_repo()
+        plan = SweepPlan(base="HEAD")
+        plan.targets.append(SweepTarget(nodeid="ghost/path.py::test_ghost",
+                                        kind=INCREMENT_ADDED, path=""))
+        with pytest.raises(Exception) as ei:
+            sbx.gate.run(plan)
+        msg = str(ei.value)
+        assert "不存在" in msg or "退化为全量" in msg, msg
+        # 反证：裸跑会跑全量（沙箱里 1 例）
+        pkg = os.path.join(sbx.root, "state-secretary")
+        bare = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            cwd=pkg, capture_output=True, text=True)
+        assert bare.returncode == 0 and "1 passed" in bare.stdout
+
+    def test_g10_executed_comes_from_real_run_not_plan(self):
+        """**判别性**：``executed`` 取真实执行结果，而非计划构造式赋值。"""
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert report.executed_count == 1
+        assert report.counts_verified is True, "计数须来自 junitxml（可复核）"
+        assert report.summary_line, "须留 pytest 汇总行"
+        assert report.raw_output, "🟡3：原始输出不得丢失（事后可复核）"
+        assert report.command and "test_base.py::test_ok" in report.command
+
+    def test_g10_skipped_count_is_real_not_inferred(self):
+        """🟡2：``skipped`` 须真实填充（不再由 passed = 计划 − 失败 推断）。"""
+        sbx = _sandbox_repo(skipped=True)
+        plan = _plan_for(
+            sbx.gate,
+            ["state-secretary/tests/test_base.py::test_ok",
+             "state-secretary/tests/test_base.py::test_skip"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert report.skipped_count == 1, (
+            f"skip 须被真实统计，实测 skipped={report.skipped_count}")
+        assert report.passed_count == 1
+        assert report.executed_count == 2, "实跑 = 通过 + 跳过（真实口径）"
+
+    def test_g10_silent_drop_of_targets_must_fail_fast(self):
+        """**判别性（c）**：若标的被静默丢弃（selectors/files 皆空）→ fail-fast。
+
+        用 monkeypatch 模拟"静默丢弃缺失标的"的变异体（旧实现即如此：
+        路径不存在就跳过），证明第二道防线确实会拒绝裸跑全量。
+        """
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        monkey = sbx.gate._runnable
+        sbx.gate._runnable = lambda p: ([], [])   # 变异：静默丢弃全部标的
+        try:
+            with pytest.raises(Exception) as ei:
+                sbx.gate.run(plan)
+            assert "退化为全量" in str(ei.value) or "皆为空" in str(ei.value)
+        finally:
+            sbx.gate._runnable = monkey
+
+    def test_g10_plan_count_matches_pytest_collection(self):
+        """**判别性（🟡5）**：计划口径须 == pytest 收集口径（参数化逐项展开）。
+
+        变异体（计划回退 def 级、不展开参数化）→ 计划数 < 收集数 → 本用例失败。
+        """
         gate = _gate()
         plan = gate.plan_sweep(base=LEGACY_BASE)
-        from secretary.gate import SweepReport
+        rels = [gate._pytest_rel(f) for f in plan.planned_files]
+        collected = gate.collect("WORKTREE", rels)
+        assert plan.planned_count == len(collected), (
+            f"计划 {plan.planned_count} 例 ≠ pytest 收集 {len(collected)} 例 "
+            "→ 计划口径与收集口径不一致（🟡5 判别点）")
+        assert any("[" in c for c in collected), \
+            "前置：触及文件须含参数化用例（用于验证展开口径）"
+
+    # ---- (d) 守卫拒绝未含实跑数的文本 ----
+
+    def test_g10_guard_rejects_text_without_executed_count(self):
+        """**判别性（d）**：文本未含实跑数 → 拒绝（旧实现放行并返回 59）。"""
+        with pytest.raises(CounterWordingError):
+            assert_counter("本轮实跑 3 例", executed=59)
+
+    def test_g10_guard_rejects_forged_full_text(self):
+        """**判别性（d）**：伪造「全量 308 项全部通过（296 例已跑过）」
+        而实跑 12 → 拒绝（实跑数根本不在文本里）。"""
+        with pytest.raises(CounterWordingError):
+            assert_counter("全量 308 项全部通过（296 例已跑过）", 12,
+                           total_suite=308, deferred=296)
+
+    def test_g10_guard_accepts_true_full_run_text(self):
+        """反向失准修复：契约 15.6 的真全量文字按 executed=341 须通过。"""
+        assert assert_counter("全量 pytest：341 passed + 3 skipped", 341,
+                              total_suite=341) == 341
+
+    def test_g10_assert_report_binds_real_executed(self):
+        """🔴-3：``assert_report`` 须绑定**真实实跑数**（非计划数）。
+
+        判别方式：计划 2 例但只解析到 1 例真实执行结果时，传给守卫的
+        ``executed`` 必须是 1（真实），而不是 2（计划）。
+        """
+        import secretary.gate.incremental as inc
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate,
+            ["state-secretary/tests/test_base.py::test_ok",
+             "state-secretary/tests/test_base.py::test_ghost"],
+            "state-secretary/tests/test_base.py")
         report = SweepReport(plan)
-        report.executed = [t.nodeid for t in plan.targets]
-        assert report.executed_count == plan.planned_count == \
-            report.counter_claim.executed
+        report.executed = ["state-secretary/tests/test_base.py::test_ok"]
+        report.counts = {"passed": 1}
+        report.counts_verified = True
+        report.exit_code = 0
+        captured = {}
+        real = inc.assert_counter
+
+        def spy(text, executed, **kw):
+            captured["executed"] = executed
+            return real(text, executed, **kw)
+
+        inc.assert_counter = spy
+        try:
+            try:
+                sbx.gate.assert_report(report)
+            except CounterWordingError:
+                pass   # 计划 2 / 实跑 1 的不一致由守卫正常拒绝
+        finally:
+            inc.assert_counter = real
+        assert captured["executed"] == 1, (
+            f"守卫须绑定真实实跑数 1，实测绑定 {captured['executed']}（=计划数？）")
+        # 文本未含真实实跑数 → 拒绝（🔴-3 绕过路径）
+        with pytest.raises(CounterWordingError):
+            assert_counter("本轮实跑 7 例", executed=1)
+        # 反向：真全量文字（规模 == 实跑）不得被误拒
+        assert assert_counter("全量 pytest：1 passed", 1, total_suite=1) == 1

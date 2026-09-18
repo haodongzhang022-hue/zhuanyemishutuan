@@ -2,7 +2,7 @@
 
 > version: v1.0 · Issue #14
 > 模块：`state-secretary/src/secretary/gate/`
-> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（34 项）
+> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（51 项）
 > CLI：`state-secretary/poc/incremental_gate.py`
 
 ## 1. 用户口径（原文要点）
@@ -49,19 +49,27 @@
 
 ## 5. 有效覆盖面兜底（允许漏，但不漏有效面）
 
-剔除冗余后，须仍有用例覆盖各**有效面**（9 个测试文件各 ≥1 例）。
+剔除冗余后，须仍有用例覆盖各**有效面**。
 某面无覆盖时**只补 1 例**（`SweepRules.effective_coverage`），
 避免"兜底"再次退化为全量冗余。
 
+> **口径收敛（复评第 1 轮）**：兜底**只在 diff 触及的测试文件范围内**生效，
+> 不得把与增量无关的既有文件拉进计划——否则与不变量 5 互斥。
+> 原表述「9 个测试文件各 ≥1 例」作废（那是全量口径，非增量口径）。
+>
 > 无增量（计划 0 例）时**不兜底**——此时补跑属纯冗余（不变量 4）。
 
 ## 6. 计数口径守卫（权责一致）
 
 `assert_counter(text, executed, total_suite, deferred)` 拒绝：
 
-- 「全量/全部通过」等措辞**未标记**『已跑过/默认不重复』；
+- **文本未出现本轮实跑数** → 拒绝（守卫必须绑定真实实跑数，不得对
+  未含实跑数的文字放行——如 `assert_counter("本轮实跑 3 例", executed=59)`）；
+- 「全量/全部通过」等措辞 + 规模数 ≠ 实跑数却**未标记**『已跑过/默认不重复』；
 - 声明全量规模但**未给出**已跑过数（读者仍会误读）；
-- 出现**未声明**的计数（防台账漂移 / 拼凑数字）。
+- 出现**未声明**的计数（防台账漂移 / 拼凑数字）；
+- 例外：**真全量**（规模数 == 实跑数）放行——如「全量 pytest：359 passed」
+  按 `executed=359` 通过，不再误拒真实台账。
 
 合法写法由 `render_count()` 生成：
 
@@ -80,16 +88,17 @@
 
 ```
 == 全量跑测告警（已跑过项须标记）==
-  全量用例: 344 例
+  全量用例: 359 例
   已跑过（默认不重复）: 308 例 ← 须标记
-  本轮实跑: 34 例
-  未消解差异: 2 例
-  计数口径: 本轮实跑 34 例（计划 34）· 已跑过不重复 308 · 全量规模 344
+  本轮实跑: 51 例
+  未消解差异: 0 例
+  计数口径: 本轮实跑 51 例（计划 51）· 已跑过不重复 308 · 冗余剔除 0 · 全量规模 359
   ⚠ 不得把上述全量数当作「本轮实跑数」上报。
 ```
 
 逐项 `previously_run` 标记见 `to_dict()["items"]`。
-`assert_full_view()` 在全量数 > 1 却**未标记**已跑过项时拒绝。
+`assert_full_view()` 在全量数 > 1 却**未标记**已跑过项时拒绝；
+**首轮全量**（无历史基线、已跑过 0 且实跑 == 全量）放行（复评第 1 轮修 🟡7）。
 
 ## 8. CLI
 
@@ -100,9 +109,13 @@ python3 state-secretary/poc/incremental_gate.py plan --base a455608
 python3 state-secretary/poc/incremental_gate.py run  --base a455608
 # 全量告警视图（标记已跑过项）
 python3 state-secretary/poc/incremental_gate.py full --base a455608
-# 校验留痕文字计数口径
+# 校验留痕文字计数口径（合法写法；写法不合口径则 rc=1 并打印违规原因）
 python3 state-secretary/poc/incremental_gate.py counter \
-    --text "全量 308 项全部通过" --executed 34 --total 308 --deferred 274
+    --text "跑 51 个测试（全量 359 例中 308 例已跑过、默认不重复；本轮实跑 51 例）" \
+    --executed 51 --total 359 --deferred 308
+# 反例（会被拒绝）：文本未含实跑数 51 → rc=1
+python3 state-secretary/poc/incremental_gate.py counter \
+    --text "全量 308 项全部通过" --executed 51 --total 359 --deferred 308
 ```
 
 退出码：`0` 通过 / `1` 测试红或计数口径违规。
@@ -119,17 +132,21 @@ python3 state-secretary/poc/incremental_gate.py counter \
 
 ## 10. 跨版判别力（防恒真）
 
-| 场景 | 结果 |
+| 场景 | 结果（复评第 1 轮实测） |
 |---|---|
-| 当前 head（门禁实现 + 用例） | **34 passed**（3 skipped：历史节点相关，浅克隆时跳过） |
+| 当前 head（门禁实现 + 用例） | **51 passed**（0 skipped；历史节点改用真实修订） |
 | 移植到旧 head（未解决 Issue #14） | 收集期即失败（无 `secretary.gate` 模块） |
-| 变异体 **M1**：`plan_sweep` 退化为"总是全量" | **6 FAIL**（G1 范围/deferred 标记/无改动零计划/G8 增量远小于全量/计数守卫） |
-| 变异体 **M2**：把本轮实跑数写成全量 | 计数守卫 **CounterWordingError** |
-| 变异体 **M3**：计划数 ≠ 实跑数 | 不变量断言失败 |
+| 变异体 **M1**：`run()` selector 回退仓库相对口径 | **8 FAIL**（rc=4 / 假绿 / 路径口径） |
+| 变异体 **M2**：`green` 不纳入 `exit_code` | **1 FAIL**（rc≠0 报绿） |
+| 变异体 **M3**：计数守卫去掉"实跑数须出现" | **1 FAIL**（伪造文字被放行） |
+| 变异体 **M4**：空计划裸跑全量 | **1 FAIL**（退化为全量） |
+| 变异体 **M5**：静默丢弃标的（both-empty 不 fail-fast） | **1 FAIL**（裸跑全量） |
+| 变异体 **M6**：计划口径回退 def 级（参数化不展开） | **1 FAIL**（计划数 ≠ 收集数） |
+| 变异体 **M7**：`plan_sweep` 退化为"总是全量" | G1/G8 范围断言失败 |
 
 ## 11. 与既有门禁的关系
 
 - **不改变** `SecretarySession` / `HandoffBus` / `StateManager` 任何行为；
-- 复用 `state-secretary/tests/` 既有 308 项作为"已跑过"基线；
+- 复用 `state-secretary/tests/` 既有 308 项（`a455608` 基线）作为"已跑过"基线；
 - 与 Issue #4 验收矩阵（`test_acceptance_matrix_issue4.py`）互补：前者锁**实现
   不变量**，本门禁锁**跑测策略与计数口径**。

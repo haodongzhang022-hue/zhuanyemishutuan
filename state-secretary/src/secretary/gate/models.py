@@ -65,7 +65,12 @@ class SweepTarget:
 
     @property
     def is_redundant(self) -> bool:
-        """是否属「冗余」：非消解路径（risk 未标记消解）→ 不重复跑。"""
+        """是否属「冗余」：非消解路径（risk 未标记消解）→ 不重复跑。
+
+        🟡9：唯一语义源为 :attr:`SweepRules.redundant_labels`（见
+        :meth:`SweepRules.is_redundant`）；此处为**无规则集时**的便捷判定，
+        供外部/CLI 单点使用，不再是第二套独立实现。
+        """
         return self.risk not in ("", "dissolve")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -167,26 +172,63 @@ class SweepPlan:
 
 
 class SweepReport:
-    """一次增量跑测的结果（本轮**实际跑了什么**）。"""
+    """一次增量跑测的结果（本轮**实际跑了什么**）。
+
+    复评第 1 轮定点修复（🔴-1）：``executed`` 与各项计数**全部来自 pytest
+    真实执行**（junitxml 结构化结果；缺失时回退汇总行计数），不再由计划
+    构造式赋值；``green`` 纳入 ``exit_code``（rc≠0 不得为绿）。
+    """
 
     def __init__(self, plan: SweepPlan):
         self.plan = plan
-        self.executed: List[str] = []      # 实际执行的 nodeid
+        self.executed: List[str] = []      # 真实执行的 nodeid（junitxml 口径）
         self.passed: List[str] = []
         self.failed: List[str] = []
         self.errors: List[str] = []
         self.skipped: List[str] = []
+        self.counts: Dict[str, int] = {}   # 结构化汇总（权威计数）
+        self.counts_verified = False       # 是否来自 junitxml（可复核）
         self.duration_sec: float = 0.0
         self.exit_code: Optional[int] = None
+        self.raw_output: str = ""          # pytest 原始输出（事后可复核）
+        self.command: str = ""             # 实际执行的命令行
+        self.summary_line: str = ""        # pytest 汇总行（如 "36 passed in 1.2s"）
+        self.suite_total: int = 0          # 本轮 pytest 实收用例数（汇总口径）
+
+    # ---- 权威计数（真实实跑，非计划推断） ----
 
     @property
     def executed_count(self) -> int:
+        """本轮**真实实跑**用例数（通过+失败+错误+跳过）。"""
+        if self.counts_verified:
+            return sum(self.counts.values())
         return len(self.executed)
+
+    @property
+    def passed_count(self) -> int:
+        return self.counts.get("passed", len(self.passed))
+
+    @property
+    def failed_count(self) -> int:
+        return self.counts.get("failed", len(self.failed))
+
+    @property
+    def errors_count(self) -> int:
+        return self.counts.get("errors", len(self.errors))
+
+    @property
+    def skipped_count(self) -> int:
+        return self.counts.get("skipped", len(self.skipped))
+
+    @property
+    def collected_count(self) -> int:
+        """本轮 pytest 实收用例数（含 skip；无结构化结果时退化为实跑数）。"""
+        return self.suite_total or self.executed_count
 
     @property
     def redundant_saved(self) -> int:
         """本轮省下的重复跑测数（= 已跑过 + 冗余剔除）。"""
-        return self.plan.deferred_count + self.plan.excluded_count
+        return self.plan.deferred_count + len(self.plan.excluded)
 
     @property
     def counter_claim(self) -> "CounterClaim":
@@ -202,19 +244,30 @@ class SweepReport:
 
     @property
     def green(self) -> bool:
-        return not self.failed and not self.errors
+        """通过信号灯：**须同时**无失败/无错误 **且** ``exit_code == 0``。
+
+        🔴-1：旧实现只看 failed/errors 列表 → pytest rc=4（not found）时
+        列表为空即报 green=True（假绿）。rc 必须参与判定。
+        """
+        return (self.failed_count == 0 and self.errors_count == 0
+                and self.exit_code == 0)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "plan": self.plan.to_dict(),
             "executed": list(self.executed),
             "executed_count": self.executed_count,
-            "passed": len(self.passed),
+            "counts": dict(self.counts),
+            "counts_verified": self.counts_verified,
+            "suite_total": self.suite_total,
+            "passed": self.passed_count,
             "failed": list(self.failed),
             "errors": list(self.errors),
             "skipped": list(self.skipped),
             "duration_sec": round(self.duration_sec, 3),
             "exit_code": self.exit_code,
+            "summary_line": self.summary_line,
+            "command": self.command,
             "redundant_saved": self.redundant_saved,
             "counter": self.counter_claim.to_dict(),
             "green": self.green,
@@ -226,13 +279,15 @@ class SweepReport:
         lines = [
             "== 增量跑测结果 ==",
             f"  本轮实跑: {c.executed} 例"
-            f"（通过 {len(self.passed)} / 失败 {len(self.failed)}"
-            f" / 错误 {len(self.errors)}）",
-            f"  跳过重复: {self.redundant_saved} 例"
-            f"（已跑过 {self.plan.deferred_count} + 冗余 {len(self.plan.excluded)}）",
+            f"（通过 {self.passed_count} / 失败 {self.failed_count}"
+            f" / 错误 {self.errors_count} / 跳过 {self.skipped_count}）",
+            f"  跳过重复: {self.plan.deferred_count} 例已跑过 + "
+            f"{len(self.plan.excluded)} 例冗余（合计 {self.redundant_saved} 例省下）",
             f"  全量规模: {c.total_suite} 例"
             f"（如写全量须标记 {self.plan.deferred_count} 例已跑过）",
             f"  计数口径: {c.render()}",
+            f"  退出码  : {self.exit_code}（rc≠0 不得报绿）",
+            f"  pytest  : {self.summary_line or '(无汇总)'}",
             f"  信号灯  : {'🟢 通过' if self.green else '🔴 未通过'}",
         ]
         return "\n".join(lines)
@@ -273,6 +328,15 @@ class FullSweepReport:
         """已跑过（默认不重复）用例数——须被显式标注（用户口径 #4）。"""
         return 0 if self._unlabelled else len(self.previously_run)
 
+    @property
+    def is_first_full_run(self) -> bool:
+        """首轮全量（无历史基线）：已跑过 0 且本轮实跑 == 全量。
+
+        🟡7：首次接入门禁（``previously_run == 0``）不得被误拒。
+        """
+        return (not self._unlabelled and self.previously_run_count == 0
+                and self.total > 0 and self.executed_now_count == self.total)
+
     def mask_previously_run(self) -> "FullSweepReport":
         """**反例构造用**：抹掉"已跑过"标记（模拟未标记的全量上报）。
 
@@ -291,6 +355,7 @@ class FullSweepReport:
             executed=self.executed_now_count,
             planned=self.executed_now_count,
             deferred=self.previously_run_count,
+            redundant=len(self.remaining),
             total_suite=self.total,
         )
 
@@ -302,6 +367,8 @@ class FullSweepReport:
         ]
         if self._unlabelled:
             lines.append("  已跑过（默认不重复）: **未标记** ← 违规，须拒绝上报")
+        elif self.is_first_full_run:
+            lines.append("  已跑过（默认不重复）: 0 例（**首轮全量**：无历史基线）")
         else:
             lines.append(
                 f"  已跑过（默认不重复）: {self.previously_run_count} 例 ← 须标记")
@@ -335,10 +402,13 @@ class CounterClaim:
     - ``total_suite`` 全量规模。
     """
 
-    def __init__(self, executed: int, planned: int = 0, deferred: int = 0,
-                 redundant: int = 0, total_suite: int = 0):
+    def __init__(self, executed: int, planned: Optional[int] = None,
+                 deferred: int = 0, redundant: int = 0,
+                 total_suite: int = 0):
         self.executed = int(executed)
-        self.planned = int(planned) or int(executed)
+        # 🟡4：planned 显式传 0 不得被 `or` 静默改成 executed；
+        # 缺省（None）才回退为 executed。
+        self.planned = int(executed) if planned is None else int(planned)
         self.deferred = int(deferred)
         self.redundant = int(redundant)
         self.total_suite = int(total_suite) or (

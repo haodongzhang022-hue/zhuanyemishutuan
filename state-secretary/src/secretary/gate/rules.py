@@ -34,12 +34,12 @@ from .models import (
 # 每条规则 = (名称, 正则, 风险标签)。命中即标记为冗余（非消解路径）。
 DEFAULT_DISSOLVED_RATIO = 0.5  # 改动比例阈值（防"整文件重写"被当无关增量）
 
+# 🟢 优化：原 `doc-append` 与 `pure-markdown` 正则重叠（`\.md$` 双写）→ 合并为一条。
 REDUNDANT_RULES: Tuple[Tuple[str, re.Pattern, str], ...] = (
     ("doc-append", re.compile(r"留痕|台账|复测|复评|口径|文档|docs/|\.md$"),
      "doc-append"),
     ("count-sync", re.compile(r"计数|count.*sync|计数同步"), "count-sync"),
     ("cosmetic", re.compile(r"注释|错别字|typo|格式化|flake8|E501|空白"), "cosmetic"),
-    ("pure-markdown", re.compile(r"\.md$"), "doc-append"),
 )
 
 # 高风险（**非**冗余）：与审查/测试有效性直接相关，改动必须消解
@@ -151,6 +151,14 @@ class SweepRules:
             base = classify_changed_path(
                 path, bool(item.get("is_new")),
                 int(item.get("changed_lines", 0)))
+            # 整文件重写（改动比例 ≥ dissolve_ratio / 高风险关键词）→ 消解
+            if base.kind != INCREMENT_ADDED and self.is_whole_file_rewrite(item):
+                base = SweepTarget(
+                    nodeid=path, kind=INCREMENT_DISSOLVED, path=path,
+                    name=os.path.basename(path),
+                    reason=(f"整文件重写（改动比例 ≥ {self.dissolve_ratio}）"
+                            "→ 全文件消解（防当无关增量）"),
+                    risk="dissolve")
             added = list(item.get("added_tests") or [])
             changed = list(item.get("changed_tests") or [])
             if base.kind == INCREMENT_ADDED:
@@ -182,11 +190,25 @@ class SweepRules:
                     reason="用例已跑过但其主体已改 → 消解", risk=base.risk))
         return out
 
+    def is_whole_file_rewrite(self, item: dict) -> bool:
+        """改动比例 ≥ ``dissolve_ratio``（或命中高风险关键词）→ 整文件消解。"""
+        total = int(item.get("total_lines") or 0)
+        changed = int(item.get("changed_lines") or 0)
+        if total > 0 and changed / total >= self.dissolve_ratio:
+            return True
+        text = " ".join(str(item.get(k) or "")
+                        for k in ("path", "summary", "message"))
+        return bool(DISOLVE_KEYWORDS.search(text))
+
     @staticmethod
     def _nodeid(path: str, name: str) -> str:
         return f"{path}::{name}" if name else path
 
     # ---- 冗余剔除 ----
+
+    def is_redundant_label(self, label: str) -> bool:
+        """风险标签是否属冗余（🟡9：与 ``SweepTarget.is_redundant`` 同源）。"""
+        return bool(label) and label in self.redundant_labels
 
     def is_redundant(self, target: SweepTarget) -> bool:
         """该标的是否属"冗余"（默认不重复跑）。
@@ -245,11 +267,12 @@ def changed_test_files(diff_entries: Sequence[dict],
     """从 git diff --name-status 条目中挑出测试文件路径。"""
     out: List[str] = []
     for e in diff_entries:
-        path = e.get("path", "")
+        path = e.get("path", "") if isinstance(e, dict) else str(e)
         if not path:
             continue
         norm = path.replace(os.sep, "/")
-        if norm.startswith(test_root.rstrip("/") + "/") or looks_like_test_path(norm):
+        if norm.startswith(test_root.rstrip("/") + "/") \
+                or looks_like_test_path(norm):
             out.append(path)
     return out
 
