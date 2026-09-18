@@ -35,7 +35,15 @@ from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
 from ..loop import LoopDecision, LoopGuard
-from ..collab import CollabRules, StepBackoff, WaitPolicy, load_rules
+from ..collab import (
+    CollabRules,
+    CheckpointProbe,
+    ProbeEvent,
+    ProbeOutcome,
+    StepBackoff,
+    WaitPolicy,
+    load_rules,
+)
 from ..review import (
     ArbiterDecision,
     ConflictCard,
@@ -130,6 +138,8 @@ class SecretarySession:
         persistent_grace_sec: Optional[float] = None,
         collab_rules: Optional[CollabRules] = None,
         rules_path: Optional[str] = None,
+        probe_dir: Optional[str] = None,
+        max_checks: Optional[int] = None,
     ):
         """初始化一个会话秘书。
 
@@ -161,6 +171,9 @@ class SecretarySession:
                 规则包承载"agent 协同时的全局规则"：等待阶梯（
                 10s→30s→60s→3min→6min→10min 到顶即停）、锁/熔断/审查范围/计费口径。
             rules_path: 显式规则包路径（优先于自动查找）。
+            probe_dir: 检查点探测器数据目录（默认 ``<数据根>/probe``）。
+            max_checks: 检查点探测次数上界。不传取规则包（默认 6 = 阶梯档位数）；
+                **用尽即停止自动挂账**，交回人工/上游。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -259,6 +272,18 @@ class SecretarySession:
         )
         # 锁聚合台账（同一本，供总览/清扫/外部模块登记；卡片写租约也镜像到此）
         self.lock_registry = self.review_arbiter.lock_registry
+        # 检查点探测器（Issue #14 追问）：**非轮询**的"形成检查点 → 判断检查点 →
+        # 状态变化/到点再触发"。探测点一律落到**平台语义**（cnb:await / crontab /
+        # api_trigger），本地绝不 sleep；最多 6 次（= 等待阶梯档位数），用尽交回人工。
+        # 锁视图直接接**锁聚合台账**（探测只看可判定事实，不看 agent 自述）。
+        self.probe = CheckpointProbe(
+            session_id=session_id,
+            data_dir=probe_dir or os.path.join(self._session_root, "probe"),
+            backoff=self.backoff or self.collab_rules.backoff,
+            max_checks=(self.collab_rules.probe_max_checks
+                        if max_checks is None else max_checks),
+            lock_view=self.lock_registry.overview,
+        )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
         # 持久化记录为准，实例内存清单仅为会话内缓存镜像。
@@ -945,6 +970,12 @@ class SecretarySession:
             self.lock_registry.delete_state()
         except OSError:
             pass
+        # 8) 清理本会话检查点（Issue #14 追问）：同上，避免同一 session_id 复用时
+        #    带上陈旧检查点（"最多 6 次"的预算不得被上一轮继承）。
+        try:
+            self.probe.delete_state()
+        except OSError:
+            pass
         return ok
 
     # ------------------------------------------------------------------
@@ -1523,6 +1554,72 @@ class SecretarySession:
     def review_scope_commands(self, **kwargs) -> Dict[str, str]:
         """按范围档位给出构建/测试执行口径（``scan`` 档明确不跑全量）。"""
         return scan_commands(self.review_scope(**kwargs))
+
+    # ------------------------------------------------------------------
+    # 检查点探测器（Issue #14 追问：非轮询 → 检查点 → 状态变化再触发）
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        key: str,
+        kind: str = "lock",
+        holder: str = "",
+        scope: str = "",
+        await_key: str = "",
+        max_checks: Optional[int] = None,
+        note: str = "",
+    ):
+        """建一个**检查点**：等什么（``kind``）、等谁（``holder``）、还能探几次。
+
+        **幂等**：同键已存在即原样返回（不重置预算）——否则"每次遇到都重建"
+        等于把"最多 6 次"变成无限次，正是要治的循环。
+        """
+        return self.probe.create(key=key, kind=kind, holder=holder, scope=scope,
+                                 await_key=await_key, max_checks=max_checks,
+                                 note=note)
+
+    def checkpoint_plan(self, key: str = "", **kwargs) -> List[Dict[str, Any]]:
+        """六次探测**怎么等**：等待阶梯 + 平台落点（await / crontab），非轮询。"""
+        cp = self.probe.load(key) if key else None
+        return self.probe.delay_plan(cp)
+
+    def register_platform_wait(self, key: str, await_key: str = "", sn: str = "",
+                               driver: str = "platform_await", note: str = ""):
+        """登记"等待已挂到平台语义上"（``cnb:await``）→ 本地零占用，可被回收。"""
+        return self.probe.register_platform_wait(
+            key, await_key=await_key, sn=sn, driver=driver, note=note)
+
+    def probe_checkpoint(self, key: str, **kwargs) -> ProbeOutcome:
+        """**探测一次**（采集轻量事实 → 判断检查点 → 记预算 → 给下一步落点）。
+
+        ``our_need_satisfied=False`` 表示"我方已不需要这个锁" → 直接判 ``release``
+        （放锁、不再等），避免队头阻塞。
+        """
+        return self.probe.probe(key, **kwargs)
+
+    def dispatch_probe_event(self, event: ProbeEvent) -> Dict[str, Any]:
+        """把探测事件转成**给流水线的平台指令**（``cnb:await`` / ``cnb:apply`` /
+        ``crontab`` / 交回人工），并标明**是否允许据此唤醒下一轮**。"""
+        return self.probe.dispatch(event)
+
+    def checkpoints_overview(self) -> Dict[str, Any]:
+        """所有检查点总览（含"还剩几次探测、下一次等多久、挂在哪"）。"""
+        return self.probe.overview()
+
+    def probe_status(self) -> Dict[str, Any]:
+        """检查点探测的**生效口径快照**：次数上界、平台落点、判别式、计费口径。"""
+        rules = self.collab_rules
+        return {
+            "max_checks": self.probe.max_checks,
+            "waiting_plan": rules.waiting_plan(),
+            "probe_plan": rules.probe_plan(),
+            "drivers": list(rules.probe_drivers),
+            "checks": list(rules.probe_checks),
+            "await_max_sec": rules.probe_await_max_sec,
+            "crontab_min_interval_sec": rules.crontab_min_interval_sec,
+            "local_cpu_cost": "0（探测点挂平台语义；本地不 sleep、不轮询）",
+            "platform_cost": rules.platform.to_dict(),
+        }
 
     # ------------------------------------------------------------------
     # 进度统计

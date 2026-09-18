@@ -18,6 +18,21 @@ backoff:
   # 本地挂账次数硬上界（到顶后仍重复的兜底；≠"会一直等下去"）
   max_attempts: 6
 
+# ---- 探测：检查点 + 事件/委托驱动（**非轮询**，最多 6 次 = 阶梯档位数）----
+# Ref: #14 追问「非轮询 → 形成检查点 → webhook 触发再跑 → 等他的锁 → 边缘计算探测器」
+probe:
+  # 探测次数上界 = 等待阶梯档位数（6）；用尽即停止自动挂账，交回人工
+  max_checks: 6
+  # 平台落点（**永不本地空转**）：等锁/等状态变化优先挂平台等待语义
+  drivers: ["platform_await", "platform_crontab", "external_webhook",
+            "delegate_event", "handoff_resume"]
+  # ≤ 该时长 → 挂 cnb:await（零占用，状态一变即醒）；> 该时长 → 交平台定时任务
+  await_max_sec: 300
+  # 平台定时任务（crontab）最小间隔（官方文档：低于 5 分钟无法提交）
+  crontab_min_interval_sec: 300
+  # 判别式（只看可判定事实，不看 agent 自述）
+  checks: ["confirm", "lock", "version", "event", "resource"]
+
 # ---- 锁：延迟 → 持续 → 聚合台账 ----
 locks:
   # 首次遇到"正在编辑"的延迟窗（秒）

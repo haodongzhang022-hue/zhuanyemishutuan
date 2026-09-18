@@ -7,6 +7,9 @@
 - `rules`（`CollabRules`）：整包协同参数 + YAML 装载（仓库可覆写）
 - `wait_policy`（`WaitPolicy`）：把"等多久"翻译成"怎么等"——**等待交平台挂起，
   本地不做 CPU 轮询**（回答"等待会不会占用构建 CPU 计费"）
+- `probe`（`CheckpointProbe`）：**检查点探测器**——非轮询，"形成检查点 → 判断检查点 →
+  状态变化/到点再触发"，最多 6 次（= 等待阶梯档位数），平台落点仅 `cnb:await` /
+  `crontab` / `api_trigger`（webhook）/ 交回人工
 
 口径固化在仓库根 `shared/collab/*.yaml`（跨仓库共用一份），
 本包只做**解析与执行**，不重复定义数值（单一语义源）。
@@ -16,6 +19,30 @@ from .backoff import (
     DEFAULT_MAX_ATTEMPTS,
     BackoffStatus,
     StepBackoff,
+)
+from .probe import (
+    ALL_CHECKS,
+    ALL_DRIVERS,
+    ALL_VERDICTS,
+    CHECK_CONFIRM,
+    CHECK_EVENT,
+    CHECK_LOCK,
+    CHECK_RESOURCE,
+    CHECK_VERSION,
+    CRONTAB_MIN_INTERVAL_SEC,
+    DRIVER_AWAIT,
+    DRIVER_CRONTAB,
+    DRIVER_DELEGATE,
+    DRIVER_EXTERNAL,
+    DRIVER_HANDOFF,
+    PROCEED,
+    RELEASE,
+    UNKNOWN,
+    WAIT,
+    Checkpoint,
+    CheckpointProbe,
+    ProbeEvent,
+    ProbeOutcome,
 )
 from .rules import CollabRules, PlatformCostNote, load_rules
 from .wait_policy import (
@@ -43,4 +70,26 @@ __all__ = [
     "RESUME_REQUIRED",
     "ALL_WAIT_MODES",
     "cpu_cost_of_sleep",
+    "CheckpointProbe",
+    "Checkpoint",
+    "ProbeEvent",
+    "ProbeOutcome",
+    "CHECK_CONFIRM",
+    "CHECK_LOCK",
+    "CHECK_VERSION",
+    "CHECK_EVENT",
+    "CHECK_RESOURCE",
+    "ALL_CHECKS",
+    "PROCEED",
+    "WAIT",
+    "RELEASE",
+    "UNKNOWN",
+    "ALL_VERDICTS",
+    "DRIVER_AWAIT",
+    "DRIVER_CRONTAB",
+    "DRIVER_EXTERNAL",
+    "DRIVER_DELEGATE",
+    "DRIVER_HANDOFF",
+    "ALL_DRIVERS",
+    "CRONTAB_MIN_INTERVAL_SEC",
 ]

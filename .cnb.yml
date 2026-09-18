@@ -13,6 +13,12 @@
 #   等待一律走**平台等待/挂起**语义（如内置任务 cnb:await），本地严禁 sleep / 空转轮询
 #   （8 核空转 10 分钟 ≈ 1.33 核时）。落地：state-secretary/src/secretary/collab/
 #   （StepBackoff 阶梯 + WaitPolicy 等待策略）、shared/collab/collab-rules.yaml
+# 检查点探测（v0.6 · Issue #14 追问）：**非轮询**——
+#   形成检查点 → 判断检查点 → 锁/状态变化（cnb:resolve）或到点（平台 crontab）再触发；
+#   最多 6 次（= 等待阶梯档位数），用尽即停止自动挂账、交回人工。**永不本地 sleep**。
+#   落地：state-secretary/src/secretary/collab/probe.py（CheckpointProbe）
+#   平台落点：cnb:await（首选，零占用）/ crontab（长等待，≥5min，平台代跑）/
+#             api_trigger（外部 webhook 再跑）/ 交回人工（resume_required）
 # 角色定义见 .cnb/settings.yml（秘书· 命名空间）
 # ============================================================
 
@@ -35,8 +41,54 @@ main:
       options:
         role: "秘书·接待"   # 默认入口；按评论内 [触发:<角色>] 命中对应角色
 
+# 检查点探测的空跑占位（平台 **crontab** 触发时无需 Docker 化工作负载：
+# 探测判定由 npc:go 的秘书角色执行——读取检查点、采集轻量事实、给出下一步）。
+.probe_task: &probe_task
+  name: checkpoint probe
+  stages:
+    - name: probe checkpoint
+      type: npc:go
+      options:
+        role: "秘书·会话"
+        userPrompt: |
+          这是一次**检查点探测**（非轮询、非新需求）：
+          - 检查点 KEY：$CHECKPOINT_KEY（载荷：$PROBE_PAYLOAD）
+          - 只做三件事：① 读 `checkpoints_overview()`；② 用 `probe_checkpoint()`
+            采集轻量事实并判定；③ 按 `dispatch_probe_event()` 的落点执行下一步。
+          - 判定只看**可判定事实**（锁在不在 / 版本变没变 / 我方还等不等），
+            **不看自述、不做推测**；判不出就保持等待，不误判为"已完成"。
+          - 仍未满足 → 挂 `cnb:await` 或交 `crontab`；条件满足 → 触发一次真正干活的
+            流水线；预算用尽（最多 6 次）→ 停止自动挂账、交回人工。
+          - **严禁本地 sleep / 空转轮询**（等待一律走平台挂起语义，否则按 CPU 核时计费）。
+
+# 「等锁」的零占用等待：`cnb:await` 挂起，由对端 `cnb:resolve` 在锁释放时唤醒。
+# 说明：`cnb:await`/`cnb:resolve` 只能配合同一事件触发的 pipeline；
+#   跨事件（如 push 放锁）请用 `cnb:apply` / `cnb:trigger` 触发 `api_trigger_probe_*`。
+.await_lock_task: &await_lock_task
+  name: await lock release
+  stages:
+    - name: await lock
+      type: cnb:await
+      options:
+        key: $CHECKPOINT_AWAIT_KEY
+      exports:
+        verdict: PROBE_VERDICT
+    - name: resume work
+      type: npc:go
+      options:
+        role: "秘书·会话"
+        userPrompt: |
+          检查点 $CHECKPOINT_KEY 的等待已由 `cnb:resolve` 唤醒（对端状态已变化）。
+          只做一件事：`probe_checkpoint("$CHECKPOINT_KEY")` 复核一次；
+          判定 `proceed` 才继续干活，否则回到等待（不空转）。
+
 # $ 节点：仓库级事件绑定 + 云原生开发环境声明
 $:
+  # 外部 webhook / 平台定时任务驱动的**再触发入口**（承载"检查点再跑"）
+  api_trigger_probe_check:
+    - *probe_task
+  api_trigger_probe_resume:
+    - *probe_task
   issue.comment@npc:
     - *npc_task
   pull_request.comment@npc:

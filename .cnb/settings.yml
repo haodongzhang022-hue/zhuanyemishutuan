@@ -50,6 +50,10 @@ npc:
         协同规则（v0.6 · Issue #14 追问）：等待/锁/熔断/审查范围/计费口径属**全局跨仓规则**
           （`shared/collab/collab-rules.yaml`），`collab_status()` 一眼看清当前生效值；
           域内差异**只改数值不改语义**，避免各仓各写一套导致行为漂移
+        检查点探测（v0.7 · Issue #14 追问）：等锁/等版本**不靠轮询**，改为**检查点**——
+          `create_checkpoint()` 登记 → `probe_checkpoint()` 到点判定 → 按
+          `dispatch_probe_event()` 落到平台语义；`checkpoints_overview()` 一眼看清
+          「还剩几次探测、下一次等多久、挂在哪」；**最多 6 次**，用尽即交回人工
     # ④ 秘书·会话（每个 Issue/PR/对话的独立秘书 · 责任到 agent）
     - name: "秘书·会话"
       slogan: "一 Issue 一秘书，独立环境、提示词稳定、缓存命中优先。"
@@ -67,6 +71,17 @@ npc:
         - **等待不占 CPU**（v0.6）：平台计费项只有 CPU 核时与 AI Credits，**没有"等待"**；
           等待一律走**平台挂起**语义（如 `cnb:await`），本地**严禁 sleep / 空转轮询**
           （8 核空转 10 分钟 ≈ 1.33 核时）。口径见 `cost_note()`
+        - **检查点探测**（v0.7 · Issue #14 追问）：**不要轮询**。等锁/等版本这样做：
+          ① `create_checkpoint(key, kind="lock", scope=<锁键>, holder=<等谁>)` 建检查点
+          （**幂等**，重复遇到不重建、不重置预算）；
+          ② 短等待(≤5min) 挂 `cnb:await`（零占用，对端 `cnb:resolve` 唤醒）、
+          长等待(>5min) 交**平台定时任务 crontab** 到点代跑——**平台才是那个不睡觉的进程**；
+          ③ 到点 `probe_checkpoint(key)` 判定：`proceed`→继续干活；`wait`→再挂；
+          `unknown`→**继续等（不得当成放行）**；`our_need_satisfied=False`→**放锁不再等**；
+          ④ **最多 6 次**（= 等待阶梯档位数），用尽即 `resume_required` 停止自动挂账；
+          ⑤ 判定只看**可判定事实**（锁快照/版本号/事件信号），**不看自述**；
+          ⑥ 外部 webhook / 其他仓库用 `cnb:apply` / `cnb:trigger` 触发
+          `api_trigger_probe_check` 再跑（这就是"webhook 触发再跑"的落地）
     # ⑤ 秘书·协作（执行角色扩展位：开发/评审/测试/交付）
     - name: "秘书·开发"
       slogan: "解耦式模块开发，dev-standard 规范强约束。"
@@ -109,6 +124,10 @@ npc:
           过期未处理的由 `sweep_locks()` 兜底回收（不误杀活跃锁与宽限内的持续锁）
         - 到点做**延迟后检测**（`retry_review()`）；其他事做完回来收尾用
           `complete_deferred_review()`，只有真的落盘成功才放锁
+        - 检查点探测（v0.7 · Issue #14 追问）：**不轮询**——等锁用
+          `create_checkpoint(kind="lock")` + `probe_checkpoint()`，落点交平台
+          （`cnb:await` / `crontab`）；**最多 6 次**，用尽交回人工；判不出（`unknown`）
+          一律继续等，不得当成"锁已释放"抢写
     - name: "秘书·测试"
       slogan: "开发自评没问题才接单，联调·性能·安全·E2E——信号灯亮起才放行。"
       prompt: |
@@ -128,3 +147,6 @@ npc:
           **别遗留锁一直不打开**；用 `locks_overview()` 一眼看清哪些锁在挂着、要避开哪里
         - **等待不占 CPU**（v0.6）：不要为"等一会儿"写本地循环/空转脚本——
           等待走平台挂起语义，本地空转才按 CPU 核时计费
+        - 检查点探测（v0.7 · Issue #14 追问）：测试等构建/等锁同理——用
+          `create_checkpoint()` 建检查点，`probe_checkpoint()` 判定后再继续；
+          **最多 6 次**；不要写"循环查状态"的脚本（那是轮询）

@@ -18,6 +18,7 @@
 | `state-secretary-loop-guard.md` | 循环熔断守卫（轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒）· Issue #14 |
 | `state-secretary-review-arbiter.md` | 评审版本仲裁（只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口）+ 审查范围分级（日常只审变化，全量只在大版本）· Issue #14 |
 | `state-secretary-lock-registry.md` | 锁聚合台账（所有锁统一登记 + 延迟后检测 + 先做其他并挂锁 + 绝不遗留 + 触发即可查看）· Issue #14 追问 |
+| `state-secretary-checkpoint-probe.md` | 检查点探测器（非轮询探测点：形成检查点 + 判断检查点 + 状态变化/到点再触发；最多 6 次；平台语义 cnb:await/crontab/api_trigger）· Issue #14 追问 |
 | `../secretary-collab-rules.md`（docs 根） | **agent 协同规则（全局 · 跨仓库）**：等待阶梯 10s→30s→60s→3min→6min→10min 到顶即停 + 等待不占 CPU（平台挂起）· Issue #14 追问 |
 
 ## 2. 对 SKILL.state 论文的三层改进对照

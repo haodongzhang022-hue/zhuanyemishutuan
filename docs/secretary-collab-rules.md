@@ -91,6 +91,30 @@
 
 代码口径：`WaitPolicy.explain()` 直接给出上述结论（所有角色共用一段话，避免各说一套）。
 
+## 4.1 探测器（probe）：非轮询的检查点
+
+`probe` 段固化"最多 6 次 + 非轮询 + 等锁 + 判断检查点"的全局口径：
+
+```yaml
+probe:
+  max_checks: 6                 # = 等待阶梯档位数；用尽即停止自动挂账
+  drivers: [platform_await, platform_crontab, external_webhook,
+            delegate_event, handoff_resume]
+  await_max_sec: 300            # ≤5min 挂 cnb:await（零占用，状态一变即醒）
+  crontab_min_interval_sec: 300 # 平台定时任务最小间隔（官方文档下限）
+  checks: [confirm, lock, version, event, resource]
+```
+
+- **落点全是平台语义**，没有"本地 sleep / 空转轮询"这一种——那条路才按 CPU 核时计费；
+- **等锁**：判别式 `lock` 读锁聚合台账快照；锁表不可见 → `unknown`（继续等，不误判）；
+- **判断检查点**：只看可判定事实（`confirmed` / 锁快照 / 版本号 / 事件信号），
+  **不看 agent 自述**；
+- **反队头阻塞**：`our_need_satisfied=False` → 直接放锁、不再等。
+
+平台依据（best practice）：`cnb:await`/`cnb:resolve`（零占用唤醒）、`crontab`（≥5min，
+平台代跑）、`cnb:apply`/`cnb:trigger` 与 OPENAPI `StartBuild`（外部 webhook 再跑）。
+详见 `docs/secretary-gate-workflow.md` §2.2.2。
+
 ## 5. 怎么用
 
 ```python

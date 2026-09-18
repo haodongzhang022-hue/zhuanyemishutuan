@@ -1,6 +1,6 @@
 # 秘书协作门禁流转规范
 
-> version: v0.5（§2.2.1 等待阶梯改为「从少到多、10 分钟到顶即停」，并抽全局跨仓库规则 · Ref: #14 追问）
+> version: v0.6（新增 §2.2.2 检查点探测：非轮询、最多 6 次、平台语义触发 · Ref: #14 追问）
 > module: zhuanyemishutuan · docs
 > Ref: #1 · PR #2 · #14
 
@@ -155,6 +155,56 @@ v0.5（Ref: #14 追问）把**等待节奏**改为**阶梯**（10s→30s→60s�
 > 设计详见 `docs/design/state-secretary-lock-registry.md`。
 > 落地：`collab/backoff.py` + `collab/wait_policy.py` ＋ `state/lock_registry.py`
 > ＋ `review/review_arbiter.py`（阶梯接线）
+
+## 2.2.2 检查点探测（v0.6 新增 · Ref: #14 追问）
+
+> **最多 6 次就行**，再多就不适合等待了，不是这里的问题了，或者我们是否可以以
+> **非轮询**而是**形成检查点然后 webhook 触发再跑**，**等他的锁**，然后形成一个机制
+> **判断检查点**，类似于**边缘计算的探测器**这样的，会不会好点。怎么处理比较好，
+> 平台对这个有最佳实践吗。
+
+| # | 口径 | 落地 |
+|---|---|---|
+| 1 | **最多 6 次** | 探测上界 = 等待阶梯档位数（6）；用尽 → `resume_required`，**停止自动挂账** |
+| 2 | **非轮询** | 落点只有平台语义：`cnb:await`（≤5min，零占用）/ `crontab`（>5min，平台代跑）/ `api_trigger`（外部 webhook 再跑）/ 交回人工 |
+| 3 | **形成检查点 → 判断检查点** | `create_checkpoint(key, kind, holder, scope)` → `probe_checkpoint(key)` |
+| 4 | **等他的锁** | 判别式 `lock`：锁快照可见且被持有 → `wait`；锁释放 → `proceed`；**锁表不可见 → `unknown`**（不误判） |
+| 5 | **边缘计算的探测器** | 本地只做**轻量采集 + 判定**，产出 `ProbeEvent`（结构化事件）；重活（评审/构建/模型）只在 `proceed` 时才做 |
+| 6 | **反队头阻塞** | `our_need_satisfied=False`（我方已不需要）→ 直接 `release`：**放锁、不再等** |
+
+### 判别式与判定（确定性，不看 agent 自述）
+
+| `kind` | 事实 | `proceed` | `wait` | `unknown` |
+|---|---|---|---|---|
+| `confirm` | `confirmed` | True | False | 未给事实 |
+| `lock` | 锁表快照 | 锁已释放 | 锁仍被持有 | 锁表不可见（未接入台账） |
+| `version` | 版本号（**探测前快照**为参照） | 版本变化 | 版本未变 | 首次采集，无基线 |
+| `event` | `event_fired` / 平台 `resolve` | 事件已到达 | 尚未到达 | 无信号 |
+| `resource` | `resource_ready` | 已就绪 | 未就绪 | 信号缺失 |
+
+- 判定顺序：**我方是否还需要 → 判别式事实**；`unknown` 的处置恒为"继续等"，
+  **绝不**降级成"放行"；
+- **自述不入判定**：`agent_says_done` 之类字段既不采集也不采信。
+
+### 平台最佳实践（官方文档口径）
+
+| 能力 | 平台机制 | 文档 |
+|---|---|---|
+| 一次探测 = 一次事件，**零占用** | `cnb:await` / `cnb:resolve`：pipeline 执行到 await 即挂起，由**状态变化**唤醒（同一事件内配对） | `/zh/build/internal-steps/cnb/await-resolve.md` |
+| 延迟兜底（**平台是那个"不睡觉的进程"**） | `crontab` 定时任务，**最小间隔 5 分钟**，触发 `api_trigger_probe_check` | `/zh/build/crontab.md` |
+| 外部 webhook / 调度系统再跑 | OPENAPI `StartBuild` 触发 `api_trigger` 流水线（官方推荐跨根组织场景） | `/zh/build/trigger-rule.md` |
+| 跨流水线/跨仓再触发 | `cnb:apply`（同仓）/ `cnb:trigger`（跨仓）触发 `api_trigger_*` | `/zh/build/internal-steps/cnb/trigger.md` |
+| **等待不计费** | 计费只有 CPU 核时（实际运行时长）+ AI Credits（Token），**无"等待"项** | `/zh/pricing.md`、`/zh/build/timeout.md` |
+
+**结论（三条最佳实践）**：① 等锁首选 **`cnb:await` 平台挂起**——这才是"webhook
+触发再跑"在 CNB 上的原生形态；② 若锁由**仓库外**持有者（如正在编辑的真人）把持、
+平台内没有"锁释放事件"可等，就用**平台定时任务**到点代跑探测；③ **本地永不
+sleep/轮询**——那是唯一真正烧核时的做法。
+
+> 门面：`create_checkpoint() / checkpoint_plan() / register_platform_wait() /
+> probe_checkpoint() / dispatch_probe_event() / checkpoints_overview() / probe_status()`。
+> 规则包：`shared/collab/collab-rules.yaml` 的 `probe` 段；设计见
+> `docs/design/state-secretary-checkpoint-probe.md`；落地 `collab/probe.py`。
 
 ## 2.3 审查范围分级（v0.4 新增 · Ref: #14）
 

@@ -14,6 +14,7 @@
 |---|---|---|
 | 等待/退避 | `backoff.ladder`、`backoff.max_attempts` | 「10s → 30s → 60s → 3min → 6min → 10min 顶后停止」 |
 | 锁 | `locks.retry_delay_sec`、`locks.persistent_grace_sec`、是否聚合台账 | 「延迟 1 分钟、重触发持续到对方解决完、所有锁聚合管理」 |
+| 探测 | `probe.max_checks`、`probe.drivers`、`probe.crontab_min_interval_sec` | 「最多 6 次；非轮询，检查点 + webhook 再触发；等锁」 |
 | 循环熔断 | `loop.max_rounds` 等 | 「🔴 最多 3 轮 / 🟡 最多 1 次 / 总 5 / 停滞 2」 |
 | 审查范围 | `scan.major_version_tags` | 「日常只审变化，只有大版本全量」 |
 | 计费口径 | `platform.*` | 平台文档（等待是**挂起**，不按等待时长计 CPU） |
@@ -48,6 +49,18 @@ from .backoff import (
 )
 
 # 默认数（与既有实现同源，避免"规则包与代码各说一套"）
+DEFAULT_PROBE_MAX_CHECKS = 6                 # 「最多 6 次就行」= 阶梯档位数
+DEFAULT_PROBE_DRIVERS = [
+    "platform_await",        # 首选：挂 cnb:await，状态变化时 resolve 唤醒（零占用）
+    "platform_crontab",      # 次选：平台定时任务到点代跑（长等待；≥5 分钟）
+    "external_webhook",      # 外部 webhook / OPENAPI 触发 api_trigger 再跑
+    "delegate_event",        # 委托持有者完成时回调 api_trigger_* 事件
+    "handoff_resume",        # 预算用尽 → 交回人工/上游
+]
+DEFAULT_PROBE_AWAIT_MAX_SEC = 300.0          # ≤5 分钟挂 await，超过交 crontab
+DEFAULT_CRONTAB_MIN_INTERVAL_SEC = 300.0     # 平台定时任务最小间隔（官方文档）
+DEFAULT_PROBE_CHECKS = ["confirm", "lock", "version", "event", "resource"]
+
 DEFAULT_LOCK_RETRY_DELAY_SEC = 60.0
 DEFAULT_LOCK_PERSISTENT_GRACE_SEC = 180.0
 DEFAULT_MAX_ROUNDS = 3
@@ -142,6 +155,12 @@ class CollabRules:
     """
 
     backoff: StepBackoff = field(default_factory=StepBackoff)
+    probe_max_checks: int = DEFAULT_PROBE_MAX_CHECKS
+    probe_drivers: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PROBE_DRIVERS))
+    probe_await_max_sec: float = DEFAULT_PROBE_AWAIT_MAX_SEC
+    crontab_min_interval_sec: float = DEFAULT_CRONTAB_MIN_INTERVAL_SEC
+    probe_checks: List[str] = field(default_factory=lambda: list(DEFAULT_PROBE_CHECKS))
     lock_retry_delay_sec: float = DEFAULT_LOCK_RETRY_DELAY_SEC
     lock_persistent_grace_sec: float = DEFAULT_LOCK_PERSISTENT_GRACE_SEC
     lock_registry_shared: bool = True
@@ -171,10 +190,24 @@ class CollabRules:
         """一行人类可读的等待计划（文档/评论/角色提示词共用一句话）。"""
         return self.backoff.human()
 
+    def probe_plan(self) -> str:
+        """一行人类可读的探测计划（文档/评论/角色提示词共用一句话）。"""
+        return (f"检查点探测：最多 {self.probe_max_checks} 次（= 等待阶梯档位数）；"
+                f"落点 {self.probe_drivers[0]}（≤{self.probe_await_max_sec:.0f}s）→ "
+                f"{self.probe_drivers[1]}（≥{self.crontab_min_interval_sec:.0f}s）；"
+                "本地绝不 sleep/轮询")
+
     def to_dict(self) -> dict:
         return {
             "source": self.source,
             "backoff": self.backoff.to_dict(),
+            "probe": {
+                "max_checks": self.probe_max_checks,
+                "drivers": list(self.probe_drivers),
+                "await_max_sec": self.probe_await_max_sec,
+                "crontab_min_interval_sec": self.crontab_min_interval_sec,
+                "checks": list(self.probe_checks),
+            },
             "locks": {
                 "retry_delay_sec": self.lock_retry_delay_sec,
                 "persistent_grace_sec": self.lock_persistent_grace_sec,
@@ -219,6 +252,7 @@ class CollabRules:
         except ValueError:
             backoff = StepBackoff()
 
+        probe = data.get("probe") if isinstance(data.get("probe"), dict) else {}
         locks = data.get("locks") if isinstance(data.get("locks"), dict) else {}
         loop = data.get("loop") if isinstance(data.get("loop"), dict) else {}
         scan = data.get("scan") if isinstance(data.get("scan"), dict) else {}
@@ -230,9 +264,31 @@ class CollabRules:
             out = [x for x in v if isinstance(x, str) and x]
             return out or list(default)
 
+        def _str_list(src: Dict[str, Any], key: str,
+                      default: Sequence[str]) -> List[str]:
+            v = src.get(key)
+            if not isinstance(v, (list, tuple)):
+                return list(default)
+            out = [x for x in v if isinstance(x, str) and x]
+            return out or list(default)
+
+        probe_drivers = [d for d in _str_list(
+            probe, "drivers", DEFAULT_PROBE_DRIVERS)
+            if d in DEFAULT_PROBE_DRIVERS] or list(DEFAULT_PROBE_DRIVERS)
+        probe_checks = _str_list(probe, "checks", DEFAULT_PROBE_CHECKS)
+        crontab_min = max(
+            DEFAULT_CRONTAB_MIN_INTERVAL_SEC,
+            _as_float(probe.get("crontab_min_interval_sec"),
+                      DEFAULT_CRONTAB_MIN_INTERVAL_SEC))
         registry_shared = locks.get("registry_shared", True)
         return cls(
             backoff=backoff,
+            probe_max_checks=max(1, _as_int(probe.get("max_checks"),
+                                            DEFAULT_PROBE_MAX_CHECKS)),
+            probe_drivers=probe_drivers,
+            probe_await_max_sec=_as_float(probe.get("await_max_sec"),
+                                          DEFAULT_PROBE_AWAIT_MAX_SEC),
+            crontab_min_interval_sec=crontab_min,
             lock_retry_delay_sec=_as_float(
                 locks.get("retry_delay_sec"), DEFAULT_LOCK_RETRY_DELAY_SEC),
             lock_persistent_grace_sec=_as_float(
@@ -249,6 +305,7 @@ class CollabRules:
             major_version_tags=_strs("major_version_tags", cls.major_version_tags_default()),
             full_scan_keywords=_strs("full_scan_keywords", cls.full_scan_keywords_default()),
             scan_keywords=_strs("scan_keywords", cls.scan_keywords_default()),
+            probe_checks=probe_checks,
             platform=PlatformCostNote.from_dict(data.get("platform")),
             source=source,
         )

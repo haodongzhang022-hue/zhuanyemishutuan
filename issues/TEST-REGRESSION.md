@@ -1046,3 +1046,64 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - 全量 **445 passed** = 8 + 15 + 65 + 148 + 13 + 62 + **75** + 19 + 20 + 12 + 8（连跑 3 次稳定）。
 - `python3 -m pytest tests/ -q` → 445 passed。
 - `pyflakes`（新增/改动文件）0 告警；`compileall src tests` OK。
+
+---
+
+## 十七、Issue #14 追问：检查点探测（非轮询探测点，最多 6 次）
+
+> 需求（Issue #14 追问）：最多 6 次；**非轮询**而是**形成检查点 + webhook 触发再跑**；
+> **等他的锁**；**判断检查点**；类似**边缘计算的探测器**；平台有无最佳实践。
+
+### 17.1 新增门禁文件
+
+- `state-secretary/tests/test_checkpoint_probe_issue14.py`（**38 项**）
+
+| 组 | 用例数 | 判据 |
+|---|---|---|
+| ① 最多 6 次预算 | 5 | 默认上界 = 阶梯档位数 = 6；计划 = 6 次 + 1 条交回人工；**反向：第 1..5 次不判用尽**；用尽后再探不唤醒；**重建不清零预算** |
+| ② 非轮询落点 | 7 | 短等待挂 `cnb:await`（零占用）；长等待交 `crontab`（平台代跑）；**反向：cron 间隔不低于平台 5 分钟下限**；第 6 次 = 10min/**/10**；落点无 `local_loop`；等待中给的是**平台指令**；非法落点入口拒绝 |
+| ③ 等锁 + 判断检查点 | 9 | 锁在→`wait`、锁释放→`proceed`；**反向：锁表不可见→`unknown`，不得当"已释放"**；我方不需要→`release`（反队头阻塞）；确认型缺事实→`unknown`；版本变化→`proceed`（反向：未变→`wait`）；事件信号；**自述不采信**；`unknown` 处置 = 继续等 |
+| ④ 平台实践 + 计费 | 6 | 落点均为平台原生；crontab 下限来自平台文档；一行探测计划；`proceed` 触发**真正干活**（`cnb:apply api_trigger_probe_resume`）而非再等一轮；用尽不唤醒；等待零占用（反向：本地空转 10min ≈ 1.33 核时） |
+| ⑤ 观测与生命周期 | 7 | `checkpoints_overview` 给出剩余次数/下一次等待/避开清单；已决检查点退出未决清单；**`delete_session` 连带清理**；非法 session_id 拒绝；坏文件容错；预算与阶梯同源 |
+
+### 17.2 判别力（反向对照 / 边界佐证）
+
+| 断言 | 反向对照 / 佐证 |
+|---|---|
+| 最多 6 次 | 第 1..5 次 `resume_required=False`；第 6 次才 True 且 `checks_left=0` |
+| 幂等不重置预算 | 重建后 `checks_used` 保持 1（重置即把"6 次"变成无限次） |
+| 非轮询 | 计划里 `local_cpu` 全为 0；`local_loop`/`local_sleep` 都不在落点集里 |
+| cron 不低于下限 | 逐行解析 `*/N` 并断言 `N*60 ≥ 300` |
+| 等锁判定 | 锁表可见且持有→`wait`；不可见→`unknown`（**不得**判 `proceed`） |
+| 版本快照参照物 | 同样形状输入必须被区分：`1→2` 判 `proceed`，`1→1` 判 `wait` |
+| 下一次等待 | 第 N 次后的下一次取**下一档**（防回落重复档） |
+| 自述不入判定 | 传 `agent_says_done` 不进 `facts`、不改判定 |
+| 唤醒闸门 | `proceed` 才 `wake_allowed=True`；等待中/用尽恒 False |
+
+### 17.3 实缺陷修复留痕（本轮）
+
+1. **版本判别恒为"未变"**：原实现先把本次采集结果写进 `last_facts` 再比较，
+   `prev == cur` 恒成立 → "版本变了"永远判不出。改为判定使用**探测前快照**
+   （`prev_facts` 在采集前取），并加护栏用例 `test_version_reference_is_pre_probe_snapshot`
+   （同样输入 `1→2` 与 `1→1` 必须判出不同结果）。
+2. **下一次等待回落一档**：第 N 次探测后取 `ladder[N-1]`，等于把"刚等过的档"当下一次
+   （看起来像降级/重复）。改为取 `ladder[N]`，护栏用例 `test_next_wait_uses_next_ladder_step`
+   断言 `[30,60,180,360,600]` 且单调不减。
+
+### 17.4 平台依据（已查证官方文档）
+
+- `cnb:await` / `cnb:resolve`：**零占用挂起**，由状态变化唤醒（同一事件内配对）
+  —— `/zh/build/internal-steps/cnb/await-resolve.md`
+- `crontab`：最小间隔 **5 分钟**，执行身份 = 最后修改该配置的用户 —— `/zh/build/crontab.md`
+- `cnb:apply` / `cnb:trigger` / OPENAPI `StartBuild`：触发 `api_trigger` 流水线（外部 webhook 再跑）
+  —— `/zh/build/internal-steps/cnb/trigger.md`、`/zh/build/trigger-rule.md`
+- 计费：只有 CPU 核时（实际运行时长）+ AI Credits（Token），**无"等待"项**
+  —— `/zh/pricing.md`、`/zh/build/timeout.md`
+
+### 17.5 自测
+
+- 全量 **547 passed** = 445 + 62 + 35 + 29 分项（连跑 3 次稳定）；本轮新增 **38** 项。
+- `python3 -m pytest tests/ -q` → 547 passed。
+- `pyflakes`（新增/改动文件）0 告警；`compileall src tests` OK。
+- `.cnb.yml`：YAML 语法 ✅ / 语义 ✅（Schema 告警为 HEAD 既有，未新增）。
+
