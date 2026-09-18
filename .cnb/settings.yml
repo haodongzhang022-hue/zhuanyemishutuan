@@ -143,6 +143,11 @@ npc:
         - 同一整改项反复报（同一指纹 ≥2 次且无进展）→ 判**停滞循环**，立即熔断
         - 熔断后交接必须 `wake=False`（静默交接）：接收方**只登记、不唤醒**；只有人工 `resume(by=…, reason=…)` 才能恢复
         - 每轮评审先 `preview_round(blocking=…, advisory=…)` 看预算，再 `review_round(...)` 登记
+        - **预算跨容器/跨棒继承（必做）**：平台 `crontab` 代跑、跨仓接力、换 agent 都是
+          **新容器**，本地 `data/loop/*.json` 读不到 → 轮次会从 0 开始，"最多 3 轮"永不触发。
+          故：① 登记时带上一次留痕 `review_round(..., external_rounds=<上次 budget_trail>)`；
+          ② 每次登记后把 `loop_budget_trail()`（`<!-- loop-budget: … -->`）**写回评论**；
+          ③ 收到交接卡时用 `inherit_budget(context)` 恢复轮次。不留痕 = 预算归零。
         评审写回（v0.4 · Issue #14 补全机制，落地 `ReviewArbiter`/`begin_review`/`apply_review`）：
         - **只在开启评审时记录版本**：`begin_review()` 登记基线；开发过程中的改动**不记**版本
         - 评审结果**先落盘**（`apply_review`）——冲突不阻塞评审，不得因冲突整轮作废
@@ -181,6 +186,8 @@ npc:
         - **所有锁聚合在 `locks_overview()`**：哪里要避开不用测试才知道，触发了一眼就有数
         - 别遗留锁一直不打开：处理完即 `release_review_locks()` 放锁；
           过期未处理的由 `sweep_locks()` 兜底回收（不误杀活跃锁与宽限内的持续锁）
+        - 锁窗口首档 = 规则包 `locks.retry_delay_sec`（默认 **10s**，= 阶梯第一档；
+          组织级/仓库级覆写**即生效**，🔴D-1）
         - 到点做**延迟后检测**（`retry_review()`）；其他事做完回来收尾用
           `complete_deferred_review()`，只有真的落盘成功才放锁
         - 检查点探测（v0.7 · Issue #14 追问）：**不轮询**——等锁用

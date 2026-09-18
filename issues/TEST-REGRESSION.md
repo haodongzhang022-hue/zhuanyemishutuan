@@ -1166,3 +1166,43 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - `pyflakes`（改动文件）0 告警；`compileall src tests` OK。
 - 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
 - **本轮不连跑三次**：按新口径，同一口径第 2 次即跳过（自证口径生效）。
+
+---
+
+## 十九、PR #15 评审第 3 轮定点修复（🔴A–🔴D + 🟡1–🟡6）
+
+> 触发：架构·评审 复评「4 项 🔴 未清零 → `fix_bug`，不转测试」。
+> 评审基线：`2be6a3d`；修复提交见本 PR 最新 commit。
+
+### 19.1 四项 🔴（独立探针复现 → 定点修 → 判别性回归）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归护栏（含反向对照） |
+|---|---|---|---|
+| **🔴A** 预算不跨容器/不跨棒 → 「最多 3 轮 / 6 次」永不触发 | ① 8 次接力各自新数据根 → 序列恒为 `fix×8`，**从不 fuse**；② 7 次平台探测 → `checks_used` **恒为 1**；③ `probe(checks_used=5)` 入参预算**不被消费** | 预算**随载荷走**：`LoopGuard.budget_payload()/budget_trail()/adopt_budget()`、`probe(key, external_checks=…)`/`adopt_checks_budget()`，`max()` 合并（只增不减）；`from_handoff` **不论 wake 真假都先合并轮次**；`ProbeEvent.budget_trail` 随评论/交接卡/事件持久传递；`.cnb.yml` 的 `probe_task` 明列"取留痕 → 合并 → 写回评论"三步 | `test_eight_relays_in_new_containers_eventually_fuse`（序列**必须出现 fuse**，且第 4 次即拦）/ `test_seven_probes_in_new_containers_reach_the_ceiling`（`checks_used`→6 且 `resume_required`）/ **反向**：`test_without_payload_budget_resets_per_container`（不传载荷确实归零 → 证明前者有判别力）/ 三种载荷形态 / 单调性 / 端到端静默交接 → 新容器继承 |
+| **🔴B** 静默交接 `is not False` → `"false"/0/"no"` 被判「可唤醒」 | 三组非 bool 实测 `is_fused()=False`（未熔断），与 `create_handoff` 严格 bool **写出侧严、读入侧松**自相矛盾 | 新增 `parse_wake()` 三态（只认严格 bool）；**判不出 → 保守按静默**并留痕；无 `wake` 键的普通 context 仍走常规接力（不误熔断） | `test_non_bool_wake_is_conservatively_silent`（7 组参数化）/ **反向**：`test_strict_true_still_awake` / `test_missing_wake_key_is_not_unknown` / `test_write_side_and_read_side_same_bar` |
+| **🔴C** `Checkpoint`/`ProbeEvent` 缺字段级容错 → 合法 JSON 类型不符即裸抛并逃逸 | `{"checks_used":"NaN"}` 使 `load/list_open/overview/create` 与门面四入口、`dispatch_shared` **全部抛 `ValueError`** | 两个 `from_dict` **逐字段守卫**（`_as_int/_as_float/_as_str/_as_bool/_as_dict/_as_list`，与 `LoopGuard`/`LockRegistry` 同族）；`dispatch_shared` 包守卫 → `unknown`（继续等，绝不误放行） | `test_read_paths_do_not_raise` / `test_facade_does_not_raise` / `test_dispatch_shared_tolerates_bad_types` / **反向**：`test_bad_fields_degrade_to_defaults`（确实退化默认，不是被静默当有效值）/ `test_dispatch_shared_survives_garbage` / `test_same_bar_as_loop_guard_family` |
+| **🔴D** 规则包数值"被读但不生效" / 同一份规则出两套动作 | D-1 `locks.retry_delay_sec` 被读但**不生效**（`effective_delay` 取 `backoff.delay_for(0)`）；D-2 跨仓 `dispatch_shared` **不读** `crontab_interval_minutes`（硬编码 5）→ 本地 `*/15` / 跨仓 `*/5` | D-1：锁窗口/评审延迟窗改取 `rules.lock_retry_delay_sec`（默认 10s = 阶梯第一档）；D-2：`dispatch_shared` 缺省从 `rules` 取 cron 间隔（`crontab_minutes_from_rules`），并统一 `_driver_for_delay` 的默认值来源；`collab_status()["locks"]` 增 `rules_retry_delay_sec` / `explicit_override` | `test_lock_retry_delay_override_takes_effect`（30 → 生效值 30 且快照同步）/ `test_crontab_interval_local_and_cross_repo_agree`（本地与跨仓**同为 `*/15`**）/ **反向**：`test_explicit_param_still_wins` / `test_crontab_floor_still_clamped` / `test_split_threshold_from_rules_applies_cross_repo` |
+
+### 19.2 🟡1–🟡6 + 🟢
+
+| 项 | 修法 |
+|---|---|
+| 🟡1 恒真断言 | `assert got.probe_drivers[0] == "platform_await" or True` → 可失败断言（逐字段比对 + 长度 >1）；并加"源码里不得再有 `or True`"的护栏（**只扫代码行**，跳过注释） |
+| 🟡2 `dispatch_shared` 有 IO 副作用 | `CheckpointProbe(mkdir=False)` 惰性建目录：落点计算不再在 cwd 造 `data/probe/`（`_save` 前才 `_ensure_dir()`）；回归 `test_y2_dispatch_shared_has_no_io_side_effect` |
+| 🟡3 `.await_lock_task` 锚点无引用 | 新增 `api_trigger_probe_wait` 事件承载 `*await_lock_task`（await 行不带 cron，与 crontab 行**互斥不混用**）；回归 `test_y3_await_anchor_is_referenced` |
+| 🟡4 文档「延迟 1 分钟」口径冲突 | 三份文档 + 两份规则包 + 角色提示词统一为「**延迟首档 10s**（阶梯第一档，可达 1 分钟）」；回归 `test_y4_docs_single_lock_delay_claim` |
+| 🟡5 无 PyYAML 兜底解析读不全 | `_mini_yaml` 重写：支持**多行 inline list**（括号配平）、**折叠/字面块标量**（`>-`/`\|`）、块序列里的**嵌套映射兄弟键**、空值自动判 list/dict；回归用**真实规则包**验证（`waiting_note != ">-"`、drivers 5 项） |
+| 🟡6 死代码 | 删除 `probe._SAFE_ID`（未使用）与 `_cron_every` 别名；回归 `test_y6_dead_code_removed` |
+| 🟢 `checkpoint_plan(**kwargs)` 静默忽略 | 改具名形参 `checks=` 并**真透传**（未知关键字直接 `TypeError`）；回归 `test_checkpoint_plan_kwargs_now_named_and_real` |
+| 🟢 嵌套映射丢字段 | 见 🟡5（`test_y5_nested_map_inside_sequence_item`） |
+| 附带加固 | `dispatch_core` **按本地规则重算落点**（不轻信事件自带 `driver`，否则跨仓写 `driver=platform_await` 就能把 10 分钟等待挂成单 await = 死等）；`LoopGuard.from_dict` 的 `fused` 改**严格 bool**（与 🔴B 同族） |
+
+### 19.3 自测
+
+- `pytest -q`：**789 passed**（rebase 到 `89d48bd` 后：上游新增 127 项 + 本轮新增
+  `test_collab_round3_fixes_issue14.py` **46** 项），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- 独立探针（**非复用作者测试**）复现 → 修复后复测：🔴A 序列 `fix,fix,fix,fuse,...`、
+  `checks_used`→6 且 `resume_required=True`；🔴B `"false"/0/"no"` 全熔断；🔴C 全路径不抛；
+  🔴D 覆写 30 → 生效 30、cron 本地/跨仓同为 `*/15`。

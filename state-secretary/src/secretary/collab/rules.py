@@ -13,7 +13,7 @@
 | 域 | 参数 | 口径来源 |
 |---|---|---|
 | 等待/退避 | `backoff.ladder`、`backoff.max_attempts` | 「10s → 30s → 60s → 3min → 6min → 10min 顶后停止」 |
-| 锁 | `locks.retry_delay_sec`、`locks.persistent_grace_sec`、是否聚合台账 | 「延迟 1 分钟、重触发持续到对方解决完、所有锁聚合管理」 |
+| 锁 | `locks.retry_delay_sec`、`locks.persistent_grace_sec`、是否聚合台账 | 「延迟**首档 10s**（阶梯第一档，可达 1 分钟）、重触发持续到对方解决完、所有锁聚合管理」 |
 | 探测 | `probe.max_checks`、`probe.drivers`、`probe.crontab_min_interval_sec` | 「最多 6 次；非轮询，检查点 + webhook 再触发；等锁」 |
 | 循环熔断 | `loop.max_rounds` 等 | 「🔴 最多 3 轮 / 🟡 最多 1 次 / 总 5 / 停滞 2」 |
 | 审查范围 | `scan.major_version_tags` | 「日常只审变化，只有大版本全量」 |
@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -84,7 +85,12 @@ DEFAULT_BLOCKED_EVENTS = [
 #: 兜底逻辑一旦被用来"顺手改别的"，就等于把门禁重新放开——故只允许改规则文件。
 DEFAULT_PIPELINE_ALLOWLIST = ["shared/collab/"]
 
-DEFAULT_LOCK_RETRY_DELAY_SEC = 60.0
+# 锁窗口**首档**（秒）。口径与等待阶梯同源：**首档 = 阶梯第一档（10s）**
+# ——「大部分很快就没问题」，前两档短一点；用户原话「延迟可以到 1 分钟」
+# 指的是**阶梯中某档可达 1 分钟**（60s 档），不是"一上来就等 1 分钟"。
+# 🔴D-1 修复：这个值**必须真被消费**（`SecretarySession` 的锁窗口/评审延迟窗
+# 取它），否则"只改数值"的组织级/仓库级覆写对这一域失效（读了不生效）。
+DEFAULT_LOCK_RETRY_DELAY_SEC = 10.0
 DEFAULT_LOCK_PERSISTENT_GRACE_SEC = 180.0
 DEFAULT_MAX_ROUNDS = 3
 DEFAULT_MAX_ADVISORY_FIX_ROUNDS = 1
@@ -489,9 +495,23 @@ def _parse_yaml(text: str) -> Any:
 
 
 def _mini_yaml(text: str) -> Dict[str, Any]:
-    """极简 YAML 子集解析（无 PyYAML 时的兜底；失败返回空 dict）。"""
+    """极简 YAML 子集解析（无 PyYAML 时的兜底；失败返回空 dict）。
+
+    **覆盖规则包真实用到的形态**（🟡5：旧实现读不全 → 组织级自定义值被静默丢弃，
+    而 ``chain`` 仍把该文件标为来源，出现"来源可信但值其实是默认"）：
+
+    - 嵌套映射（缩进栈）；
+    - 块序列：``- item`` / ``- key: value``（含其**子键**继续缩进）；
+    - **多行 inline list**：``[a, b,\n  c]``（按括号配平跨行拼接）；
+    - **折叠/字面块标量**：``>-`` / ``>`` / ``|-`` / ``|``（读其缩进续行）；
+    - 标量：引号串、bool、int、float、``[]`` 内联列表、其余按字符串。
+
+    复杂 YAML 特性（锚点/多文档/流式映射）仍不在子集内——但**宁可读不出**，
+    也不静默读成半截字符串（那会让"规则写了却不生效"重新出现）。
+    """
     root: Dict[str, Any] = {}
-    stack: List[tuple] = [(-1, root)]
+    # 栈项：(缩进, 容器)。容器可为 dict 或 list
+    stack: List[Any] = [(-1, root)]
 
     def _scalar(raw: str) -> Any:
         s = raw.strip()
@@ -500,17 +520,12 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
         if (s[0] == s[-1]) and s[0] in ('"', "'") and len(s) >= 2:
             return s[1:-1]
         if s.startswith("[") and s.endswith("]"):
-            items = [x.strip() for x in s[1:-1].split(",")]
-            out: List[Any] = []
-            for it in items:
-                if not it:
-                    continue
-                val = _scalar(it)
-                out.append(val)
-            return out
+            return [_scalar(x) for x in s[1:-1].split(",") if x.strip()]
         low = s.lower()
         if low in ("true", "false"):
             return low == "true"
+        if low in ("null", "~"):
+            return None
         try:
             return int(s)
         except ValueError:
@@ -520,39 +535,135 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
         except ValueError:
             return s
 
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
+    def _container_for(indent: int, is_seq_item: bool = False) -> Any:
+        """找到该缩进应挂到的父容器。
+
+        弹出规则按容器类型区分（否则块序列会被自己的兄弟键"顶掉"）：
+
+        - 顶层是 **list** 且当前行是**序列项** → 只在 ``indent <`` 时弹出
+          （列表项与其父键**同缩进**是常见写法）；
+        - 其余（映射行 / 列表里的映射行）→ ``indent <=`` 弹出
+          （同级键属于同一层，必须回退到共同父级）。
+        """
+        while len(stack) > 1:
+            top_indent, top = stack[-1]
+            if isinstance(top, list) and is_seq_item:
+                if indent < top_indent:
+                    stack.pop()
+                    continue
+                break
+            if indent <= top_indent:
+                stack.pop()
+                continue
+            break
+        return stack[-1][1]
+
+    def _is_container(value: Any) -> bool:
+        return isinstance(value, (dict, list))
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
+        # 行内注释只在**非引号内**才剥离（粗判：无引号时才剥）
+        line = raw_line
+        if '"' not in line and "'" not in line:
+            line = line.split("#", 1)[0]
         if not line.strip():
+            i += 1
             continue
         indent = len(line) - len(line.lstrip(" "))
         body = line.strip()
-        while stack and indent <= stack[-1][0]:
-            stack.pop()
-        if not stack:
-            stack = [(-1, root)]
-        parent = stack[-1][1]
-        if body.startswith("- "):
-            item = body[2:].strip()
-            if isinstance(parent, list):
-                if ":" in item:
-                    k, _, v = item.partition(":")
-                    d: Dict[str, Any] = {k.strip(): _scalar(v)}
-                    parent.append(d)
-                    stack.append((indent, d))
-                else:
-                    parent.append(_scalar(item))
+
+        # ---- 折叠/字面块标量：`key: >-` / `key: |` 后跟缩进续行 ----
+        m_block = re.match(r'^([^:]+):\s*([>|][+-]?)\s*$', body)
+        if m_block:
+            key = m_block.group(1).strip()
+            parent = _container_for(indent)
+            if isinstance(parent, dict):
+                block_lines: List[str] = []
+                j = i + 1
+                while j < len(lines):
+                    nxt = lines[j]
+                    if not nxt.strip():
+                        block_lines.append("")
+                        j += 1
+                        continue
+                    n_indent = len(nxt) - len(nxt.lstrip(" "))
+                    if n_indent <= indent:
+                        break
+                    block_lines.append(nxt.strip())
+                    j += 1
+                parent[key] = " ".join(x for x in block_lines if x).strip()
+                i = j
+                continue
+
+        # ---- 多行 inline list：`[a, b,` … 直到括号配平 ----
+        m_inline = re.match(r'^([^:]+):\s*(\[.*)$', body)
+        if m_inline and m_inline.group(2).count("[") > m_inline.group(2).count("]"):
+            key = m_inline.group(1).strip()
+            acc = m_inline.group(2)
+            j = i + 1
+            while j < len(lines) and acc.count("[") > acc.count("]"):
+                nxt = lines[j]
+                if '"' not in nxt and "'" not in nxt:
+                    nxt = nxt.split("#", 1)[0]
+                acc += " " + nxt.strip()
+                j += 1
+            parent = _container_for(indent)
+            if isinstance(parent, dict):
+                parent[key] = _scalar(acc)
+            i = j
             continue
+
+        # ---- 块序列 ----
+        if body.startswith("- ") or body == "-":
+            item = body[2:].strip() if body.startswith("- ") else ""
+            parent = _container_for(indent, is_seq_item=True)
+            if not isinstance(parent, list):
+                # 序列挂在某个键下：把该键的空 dict 换成 list
+                i += 1
+                continue
+            if ":" in item and not item.startswith("["):
+                k, _, v = item.partition(":")
+                d: Dict[str, Any] = {k.strip(): _scalar(v)}
+                parent.append(d)
+                stack.append((indent, d))
+            else:
+                parent.append(_scalar(item))
+            i += 1
+            continue
+
         if ":" not in body:
+            i += 1
             continue
+
         key, _, val = body.partition(":")
         key = key.strip()
         val = val.strip()
+        parent = _container_for(indent)
+        if not isinstance(parent, dict):
+            i += 1
+            continue
         if val:
             parent[key] = _scalar(val)
         else:
-            child: Any = {}
+            # 空值：下一行若为同/更深缩进的 `- ` 则建 list，否则建 dict
+            nxt_body = ""
+            j = i + 1
+            while j < len(lines):
+                probe_line = lines[j]
+                if '"' not in probe_line and "'" not in probe_line:
+                    probe_line = probe_line.split("#", 1)[0]
+                if probe_line.strip():
+                    nxt_body = probe_line.strip()
+                    break
+                j += 1
+            child: Any = [] if nxt_body.startswith("- ") or nxt_body == "-" else {}
             parent[key] = child
+            # 列表的"基准缩进"记为**父键缩进**：列表项通常与其父键同缩进或更深。
             stack.append((indent, child))
+        i += 1
     return root
 
 

@@ -233,10 +233,16 @@ class SecretarySession:
             backoff=self.backoff or self.collab_rules.backoff,
             platform=self.collab_rules.platform,
         )
+        # 锁窗口 / 评审延迟窗的**首档**（🔴D-1：规则包数值必须真被消费）。
+        # 取值优先级：显式传参 → 规则包 `locks.retry_delay_sec`（组织级/仓库级
+        # 覆写**即生效**）→ 内置默认。
+        # 注意：**不**再直接取 `backoff.delay_for(0)`——那样 `locks.retry_delay_sec`
+        # 就只是"被读不生效"的装饰性数值（组织级改它对这一域无效）。
+        self._explicit_retry_delay = retry_delay_sec is not None
         if retry_delay_sec is not None:
             effective_delay = float(retry_delay_sec)
         else:
-            effective_delay = self.collab_rules.backoff.delay_for(0)
+            effective_delay = float(self.collab_rules.lock_retry_delay_sec)
         effective_grace = (float(persistent_grace_sec)
                            if persistent_grace_sec is not None
                            else self.collab_rules.lock_persistent_grace_sec)
@@ -1314,7 +1320,8 @@ class SecretarySession:
     # ------------------------------------------------------------------
 
     def review_round(self, blocking: int = 0, advisory: int = 0,
-                     note: str = "", signature: str = "") -> LoopDecision:
+                     note: str = "", signature: str = "",
+                     external_rounds: Any = None) -> LoopDecision:
         """登记一轮评审/复评结果，返回本轮处置与是否允许唤醒下一轮。
 
         Args:
@@ -1324,16 +1331,39 @@ class SecretarySession:
             signature: 本轮整改项**指纹**（如打回项集合的稳定摘要）。与上一轮
                 相同且达 ``max_stall_repeats`` → 判**停滞循环**直接熔断
                 （"感知循环"：同一问题反复报，不必等轮次预算耗尽）
+            external_rounds: **外部轮次预算载荷**（🔴A 修复：预算跨容器/跨棒不归零）。
+                平台 `crontab` 代跑、跨仓接力、换 agent 都是**新容器、新工作区**，
+                本地磁盘上的 ``round_no`` 从 0 开始 → "最多 3 轮"永不触发。
+                传入上一棒的 ``budget_trail()``（评论留痕/交接卡 context/事件载荷）
+                即 ``max()`` 合并；不传则只用本地磁盘状态（同容器内有效）。
 
         Returns:
             ``LoopDecision``：``action`` ∈ ``clear``（无需修复、不唤醒）/
             ``fix``（门禁，预算内）/ ``fix_last``（非必要，最多 1 次）/
             ``fuse``（熔断，不唤醒）；``fused_now=True`` 表示本次刚熔断，
-            调用方据此只建**一次**静默交接卡。
+            调用方据此只建**一次**静默交接卡；``budget_trail`` 为**可持久留痕**
+            （写进评论即完成跨容器继承，见 ``loop_budget_trail()``）。
         """
         return self.loop_guard.register_round(
             blocking=blocking, advisory=advisory, note=note,
-            signature=signature)
+            signature=signature, external_rounds=external_rounds)
+
+    def loop_budget_trail(self) -> str:
+        """轮次预算的**评论留痕**（``<!-- loop-budget: … -->``）。
+
+        容器会被回收、评论不会——把这一行写进 PR/Issue 评论，
+        下一棒（可能是新容器）用 ``inherit_budget(该段文本)`` 即恢复轮次。
+        """
+        return self.loop_guard.budget_trail()
+
+    def inherit_budget(self, payload: Any, source: str = "session") -> dict:
+        """**继承外部轮次预算**（🔴A：换容器/换棒不归零）。
+
+        ``payload`` 可以是 ``loop_budget_trail()`` 的输出、``budget_payload()``、
+        上一棒的 ``LoopDecision.budget_trail``、交接卡 ``context``，
+        或含 ``<!-- loop-budget: … -->`` 的评论正文（直接粘贴即可）。
+        """
+        return self.loop_guard.adopt_budget(payload, source=source)
 
     @staticmethod
     def review_signature(items) -> str:
@@ -1381,7 +1411,15 @@ class SecretarySession:
         """
         payload = self.loop_guard.silent_handoff_payload(
             open_items=open_items, target_unit=target_unit)
+        # 🔴A：静默交接载荷**自带轮次预算**（跨容器继承的唯一载体）——
+        # 接收方在新容器里读不到本容器的磁盘状态，只能靠载荷恢复轮次。
+        # `budget_trail` 是**评论留痕**形态（`<!-- loop-budget: … -->`），
+        # 接收方用 `inherit_budget(context)` / `LoopGuard.from_handoff(context)`
+        # 即可在**新容器**里恢复轮次（否则"最多 3 轮"会被每棒归零稀释成无限轮）。
         if not context:
+            # 预算留痕**内嵌**在载荷里（`budget_trail` 字段），不额外拼一段——
+            # 保持 `context` 是**合法 JSON**（既有调用方/审计直接 json.loads）。
+            payload["budget_trail"] = self.loop_guard.budget_trail()
             context = json.dumps(payload, ensure_ascii=False, indent=2)
         return self.create_handoff(
             source_unit=source_unit,
@@ -1500,9 +1538,13 @@ class SecretarySession:
             "waiting": (self.backoff.status(0).to_dict()
                         if self.backoff is not None else None),
             "locks": {
+                # **生效值**（= 规则包数值，除非显式传参覆写）：
+                # 组织级/仓库级改 `locks.retry_delay_sec` 必须在这里同步变化。
                 "retry_delay_sec": self.review_arbiter.retry_delay_sec,
                 "persistent_grace_sec": self.review_arbiter.persistent_grace_sec,
                 "registry_shared": rules.lock_registry_shared,
+                "rules_retry_delay_sec": rules.lock_retry_delay_sec,
+                "explicit_override": self._explicit_retry_delay,
             },
             "loop": {
                 "max_rounds": self.loop_guard.max_rounds,
@@ -1769,10 +1811,26 @@ class SecretarySession:
                                  await_key=await_key, max_checks=max_checks,
                                  note=note)
 
-    def checkpoint_plan(self, key: str = "", **kwargs) -> List[Dict[str, Any]]:
-        """六次探测**怎么等**：等待阶梯 + 平台落点（await / crontab），非轮询。"""
+    def checkpoint_plan(self, key: str = "",
+                        checks: Optional[int] = None) -> List[Dict[str, Any]]:
+        """六次探测**怎么等**：等待阶梯 + 平台落点（await / crontab），非轮询。
+
+        Args:
+            key: 检查点键（空 → 用本会话默认预算档位数）。
+            checks: 显式档位数（覆盖检查点自带 ``max_checks``）。
+
+        🟢：原签名为 ``**kwargs`` 但**静默忽略**（传 ``max_checks=99`` 无效，
+        形参存在却不生效 = 另一种"读了不生效"）。现改为**具名形参**并真透传；
+        传未知关键字会直接 ``TypeError``（暴露误用，而不是悄悄丢弃）。
+        """
         cp = self.probe.load(key) if key else None
-        return self.probe.delay_plan(cp)
+        if checks is None:
+            return self.probe.delay_plan(cp)
+        if not isinstance(checks, int) or isinstance(checks, bool) or checks < 1:
+            raise ValueError(f"非法 checks: {checks!r}（须为 >=1 的整数）。")
+        rows = self.probe.delay_plan(cp)
+        # 只保留前 `checks` 个探测档 + 末尾"预算用尽"行
+        return rows[:checks] + rows[-1:]
 
     def register_platform_wait(self, key: str, await_key: str = "", sn: str = "",
                                driver: str = "platform_await", note: str = ""):
@@ -1785,6 +1843,11 @@ class SecretarySession:
 
         ``our_need_satisfied=False`` 表示"我方已不需要这个锁" → 直接判 ``release``
         （放锁、不再等），避免队头阻塞。
+
+        ``external_checks=<上次 checks_used>``（🔴A）：平台 `crontab` 代跑是
+        **新容器**，本地预算从 0 开始 → 必须把上一次的轮次传进来合并，
+        否则"最多 6 次"永不触发。上一次的轮次从
+        ``dispatch_probe_event(...)["budget_trail"]``（评论留痕）里取。
         """
         return self.probe.probe(key, **kwargs)
 

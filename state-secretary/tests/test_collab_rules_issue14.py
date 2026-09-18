@@ -181,7 +181,8 @@ class TestGlobalRules:
             "loop": None,
         })
         assert rules.waiting_ladder() == list(DEFAULT_LADDER)
-        assert rules.lock_retry_delay_sec == 60.0
+        # 🔴D-1：锁窗口首档 = 阶梯第一档（10s），不再是"读了不生效"的 60s
+        assert rules.lock_retry_delay_sec == DEFAULT_LADDER[0] == 10.0
         assert rules.max_rounds == 3
 
     def test_session_uses_rule_package(self, env):

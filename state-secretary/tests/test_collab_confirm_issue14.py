@@ -423,7 +423,12 @@ class TestOrganizationLevelSharing:
                 f.write("probe:\n  drivers: [platform_await]\n")
             got = load_rules(search_from=d)
             assert set(got.probe_drivers) == set(CollabRules().probe_drivers)
-            assert got.probe_drivers[0] == "platform_await" or True
+            # 🟡1：原为 `... == "platform_await" or True`（**恒真**，护栏失效）。
+            # 改为可失败断言：仓库级**削减**落点不生效 → 顺序也沿用组织级
+            # （不是"过滤后只剩 await 所以它在第 0 位"这种伪通过）。
+            assert got.probe_drivers == list(CollabRules().probe_drivers), got.probe_drivers
+            assert got.probe_drivers[0] == "platform_await"
+            assert len(got.probe_drivers) == len(CollabRules().probe_drivers) > 1
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

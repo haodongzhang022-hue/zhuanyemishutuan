@@ -40,6 +40,27 @@
 - 状态**跨实例可读**：同一 ``session_id`` 的新秘书实例读回熔断态后仍熔断
   → 「会话换 agent 即复活循环」被堵死。
 
+## 跨容器 / 跨棒预算继承（**预算不归零**）
+
+磁盘状态只在**同一数据根**（同容器/同卷）内有效。平台 `crontab` 代跑、跨仓
+接力、换 agent 都会**开新容器、新工作区**——磁盘上的 ``round_no`` 读不到，
+"最多 3 轮"就永远不会触发（这正是"软约束换了个位置"）。
+
+因此预算必须**随载荷走**，落盘只是**同容器内的加速缓存**：
+
+- ``budget_payload()`` / ``budget_trail()``：把轮次快照导出为 dict / 评论留痕标记
+  （``<!-- loop-budget: {...} -->``），随交接卡 ``context``、探测事件载荷或
+  评论正文传递；
+- ``adopt_budget(payload)``：**``max()`` 合并**外部轮次（只增不减，不因新容器
+  重置），并保守继承载荷里的熔断标记；载荷可以是 dict / JSON 串 / 含标记的评论正文；
+- ``from_handoff()`` **不论 wake 真假都先合并预算**：静默交接继承熔断态，
+  常规接力也把轮次带过来（否则"换一棒重置一次预算"照样能把 3 轮变成 N 轮）。
+
+**边界（明示）**：若调用方**既不给载荷、又换数据根**，则预算只能从 0 开始——
+这是平台执行模型的边界，不是"实现疏忽"。故门禁方必须在交接/再触发时**带上载荷**：
+``SecretarySession.silent_handoff()`` / ``review_round(external_rounds=…)`` /
+``inherit_budget(…)`` 三个入口已接线。
+
 ## 判定口径（确定性，与调用顺序无关）
 
 ``preview()`` 为**纯函数**（不改状态、不落盘），``register_round()`` 才提交；
@@ -62,6 +83,77 @@ from typing import Any, Dict, List, Optional
 
 # 会话标识白名单（与 SecretarySession / HandoffBus 同族口径，尾锚 \Z 防尾换行）
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
+
+# 评论/正文里的预算留痕标记（跨容器传递轮次预算的**可持久载体**）：
+# 交接卡 context、PR/Issue 评论正文里带这一行即可被 `adopt_budget()` 识别。
+BUDGET_TRAIL_RE = re.compile(r'<!--\s*loop-budget:\s*(\{.*?\})\s*-->', re.S)
+
+# `wake` 的**严格**判定口径（与 HandoffBus.create_handoff 的写出侧一致）：
+#   显式静默（严格 False）→ 静默；显式唤醒（严格 True）→ 唤醒；
+#   其余（"false"/0/"no"/缺失…）→ **判不出** → 按**静默**处理并留痕。
+# 为什么判不出要取保守方向：读入侧放宽等于把熔断语义漏出去（写出侧严、读入侧松），
+# 一个 `wake="false"` 就能复活循环——比"误静默"更糟（误静默只多等一次人工）。
+WAKE_SILENT = "silent"
+WAKE_AWAKE = "awake"
+WAKE_UNKNOWN = "unknown"
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    """从正文里取出**第一个 JSON 对象**（宽进：取不到 → ``None``）。
+
+    静默交接的 ``context`` 形态是「JSON 载荷 + 预算留痕标记」拼接
+    （见 ``SecretarySession.silent_handoff``），直接 ``json.loads`` 整段会失败。
+    故这里按**括号配平**（跳过字符串内的括号）截出第一个对象再解析——
+    解析失败不抛，交由调用方按"判不出"走保守方向。
+    """
+    if not isinstance(text, str):
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    got = json.loads(text[start:i + 1])
+                except ValueError:
+                    return None
+                return got if isinstance(got, dict) else None
+    return None
+
+
+def parse_wake(value: Any) -> str:
+    """把载荷里的 ``wake`` 解析成三态（**只认严格 bool**）。
+
+    - 严格 ``False`` → ``WAKE_SILENT``（静默交接，不唤醒）；
+    - 严格 ``True`` → ``WAKE_AWAKE``（常规接力）；
+    - 缺失/字符串/数字/其它 → ``WAKE_UNKNOWN``（**判不出**，调用方取保守方向）。
+
+    与 ``HandoffBus.create_handoff`` 的 ``wake`` 严格 bool 校验**同口径**：
+    写出侧拒绝 ``"false"``，读入侧也不得把它当成真值。
+    """
+    if value is True:
+        return WAKE_AWAKE
+    if value is False:
+        return WAKE_SILENT
+    return WAKE_UNKNOWN
 
 DEFAULT_MAX_ROUNDS = 3
 DEFAULT_MAX_ADVISORY_FIX_ROUNDS = 1
@@ -94,6 +186,9 @@ class LoopDecision:
     fused_now: bool = False   # 本次调用**刚刚**触发熔断（供调用方只建一次静默交接卡）
     signature: str = ""       # 本轮整改项指纹（停滞感知）
     stall_count: int = 0      # 同一指纹连续出现次数
+    # 本轮结束后的**预算留痕**（``<!-- loop-budget: … -->``）：调用方把它写进
+    # 评论/交接卡 context，下一棒（可能是新容器）据此恢复轮次，不必共享磁盘。
+    budget_trail: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -109,6 +204,7 @@ class LoopDecision:
             "fused_now": self.fused_now,
             "signature": self.signature,
             "stall_count": self.stall_count,
+            "budget_trail": self.budget_trail,
         }
 
 
@@ -159,6 +255,12 @@ class LoopState:
             v = data.get(key, "")
             return v if isinstance(v, str) else ""
 
+        def _bool(key: str) -> bool:
+            # 严格 bool（与 🔴B 的 wake 判定同族口径）：``"yes"``/``1`` 这类
+            # 真值串不得被 ``bool()`` 当成"已熔断/已释放"，否则坏卡能改写熔断语义。
+            v = data.get(key, False)
+            return v if isinstance(v, bool) else False
+
         hist = data.get("history", [])
         if not isinstance(hist, list):
             hist = []
@@ -168,7 +270,7 @@ class LoopState:
             blocking_rounds=max(0, _int("blocking_rounds")),
             repair_rounds=max(0, _int("repair_rounds")),
             advisory_used=max(0, _int("advisory_used")),
-            fused=bool(data.get("fused", False)),
+            fused=_bool("fused"),
             fused_reason=_str("fused_reason"),
             fused_at=_str("fused_at"),
             resume_count=max(0, _int("resume_count")),
@@ -270,42 +372,57 @@ class LoopGuard:
         handoff_context: Any = "",
         **kwargs,
     ) -> "LoopGuard":
-        """从交接卡（``wake=False`` 的静默交接）**继承熔断态**。
+        """从交接卡**继承熔断态与轮次预算**（换 agent / 换容器不归零）。
 
         接收方（下一个 agent）用本方法起手即熔断，避免"换个 agent 就复活
         循环"：只登记事实、不再唤醒。``handoff_context`` 可为交接卡的
-        ``context`` 字段（JSON 字符串/已解析 dict）或交接卡的 ``to_dict()``。
+        ``context`` 字段（JSON 字符串/已解析 dict/含预算标记的正文）或交接卡的
+        ``to_dict()``。
 
-        - 载荷 ``wake`` 为 False → 新守卫直接落在熔断态（轮次计数继承）；
-        - 载荷缺失/非静默（``wake`` 为 True）→ 返回未熔断的新守卫（常规接力）；
-        - 载荷无法解析（坏 JSON/非 dict）→ 同样返回未熔断新守卫（宽进不炸）。
+        判定口径（**只认严格 bool**，与 ``HandoffBus.create_handoff`` 的写出侧一致）：
+
+        - 载荷带 ``wake`` 且严格 ``False`` → 落在熔断态，轮次计数一并继承；
+        - 载荷带 ``wake`` 且严格 ``True`` → 常规接力（不熔断），但**轮次预算
+          仍然合并**（否则"每棒从 0 开始"照样能把 3 轮稀释成 N 轮）；
+        - 载荷带 ``wake`` 但**非严格 bool**（``"false"``/``0``/``"no"``…）
+          → **判不出**，取**保守方向**：按静默处理（熔断 + 留痕）。
+          读入侧放宽等于把熔断语义漏出去——一个 ``wake="false"`` 就能复活循环；
+        - 载荷**不带** ``wake`` 键 / 无法解析 → 非静默交接（常规接力）；
+          静默交接载荷**必带** ``wake``（见 ``silent_handoff_payload``），
+          故"缺失"不构成"判不出"（不能对普通 context 误熔断）。
         """
         payload: Any = handoff_context
         if isinstance(payload, str) and payload.strip():
             try:
                 payload = json.loads(payload)
             except ValueError:
-                payload = None
+                # 常见形态：JSON 载荷 + `<!-- loop-budget: … -->` 留痕拼接
+                payload = extract_json_object(payload)
         if not isinstance(payload, dict):
             payload = None
 
         guard = cls(session_id=session_id, data_dir=data_dir, **kwargs)
-        if payload is None or payload.get("wake", True) is not False:
+        # 轮次预算**无条件合并**（常规接力也要带，见上"跨容器/跨棒预算继承"）。
+        if payload is not None:
+            guard.adopt_budget(payload, source="handoff", save=False)
+
+        has_wake = payload is not None and "wake" in payload
+        wake_state = parse_wake(payload.get("wake")) if has_wake else None
+        if wake_state == WAKE_AWAKE or not has_wake:
+            guard._save()
             return guard
 
+        # 严格 False（静默）与**非 bool**（判不出）都取保守方向：不唤醒。
         st = guard._state
-        rounds = payload.get("rounds", {})
-        if isinstance(rounds, dict):
-            def _n(key: str) -> int:
-                v = rounds.get(key, 0)
-                return v if isinstance(v, int) and not isinstance(v, bool) else 0
-            st.round_no = max(st.round_no, _n("total"))
-            st.blocking_rounds = max(st.blocking_rounds, _n("blocking_rounds"))
-            st.repair_rounds = max(st.repair_rounds, _n("repair_rounds"))
-            st.advisory_used = max(st.advisory_used, _n("advisory_used"))
-            st.stall_count = max(st.stall_count, _n("stall_count"))
+        if wake_state == WAKE_UNKNOWN:
+            detail = (f"载荷 wake 非严格 bool（{payload.get('wake')!r}）→ "
+                      "保守按静默处理（不得默认「可唤醒」）")
+        else:
+            detail = "继承静默交接（wake=False）"
         st.fused = True
-        st.fused_reason = str(payload.get("reason") or "继承静默交接（wake=False）")
+        reason = payload.get("reason")
+        st.fused_reason = (reason if isinstance(reason, str) and reason
+                           else detail)
         st.fused_at = time.strftime("%Y-%m-%d %H:%M:%S")
         st.history.append({
             "round_no": st.round_no,
@@ -313,11 +430,147 @@ class LoopGuard:
             "advisory": 0,
             "action": LoopAction.FUSE.value,
             "wake": False,
-            "note": f"继承静默交接：{st.fused_reason}",
+            "note": f"继承静默交接：{detail}｜{st.fused_reason}",
             "at": st.fused_at,
         })
         guard._save()
         return guard
+
+    # ---- 预算载荷（跨容器 / 跨棒继承：预算不归零） ----
+
+    def budget_payload(self) -> dict:
+        """导出**轮次预算快照**（随交接卡/事件载荷/评论留痕走的那一份）。
+
+        与 ``silent_handoff_payload()`` 的区别：本方法只带**预算与熔断事实**，
+        不带静默交接的 ``wake=False`` 语义——常规接力也应当带上它，
+        否则"换一棒重置一次预算"照样能把 3 轮稀释成 N 轮。
+        """
+        st = self._state
+        return {
+            "session_id": st.session_id,
+            "rounds": {
+                "total": st.round_no,
+                "blocking_rounds": st.blocking_rounds,
+                "repair_rounds": st.repair_rounds,
+                "advisory_used": st.advisory_used,
+                "stall_count": st.stall_count,
+            },
+            "fused": st.fused,
+            "reason": st.fused_reason,
+            "budget": {
+                "max_rounds": self.max_rounds,
+                "max_advisory_fix_rounds": self.max_advisory_fix_rounds,
+                "max_total_rounds": self.max_total_rounds,
+                "max_stall_repeats": self.max_stall_repeats,
+            },
+        }
+
+    def budget_trail(self) -> str:
+        """**评论/正文留痕**形态的预算载荷（``<!-- loop-budget: {...} -->``）。
+
+        可持久载体 = 评论正文 / 交接卡 context：容器会被回收，评论不会。
+        接收方（新容器）用 ``adopt_budget(该段文本)`` 即恢复轮次，不必共享磁盘。
+        """
+        return ("<!-- loop-budget: "
+                + json.dumps(self.budget_payload(), ensure_ascii=False,
+                             sort_keys=True)
+                + " -->")
+
+    @staticmethod
+    def _coerce_budget_payload(payload: Any) -> Optional[dict]:
+        """把任意形态的载荷解析成预算 dict（宽进：解析不出 → None，不炸）。
+
+        接受：dict / JSON 串 / 含 ``<!-- loop-budget: … -->`` 标记的正文
+        （评论、交接卡 context、事件 ``facts`` 都能直接喂进来）。
+        """
+        if isinstance(payload, dict):
+            return payload
+        if not isinstance(payload, str) or not payload.strip():
+            return None
+        m = BUDGET_TRAIL_RE.search(payload)
+        if m:
+            try:
+                got = json.loads(m.group(1))
+            except ValueError:
+                got = None
+            if isinstance(got, dict):
+                return got
+        try:
+            got = json.loads(payload)
+        except ValueError:
+            got = extract_json_object(payload)
+        if not isinstance(got, dict):
+            return None
+        # 载荷内嵌的 `budget_trail`（`<!-- loop-budget: … -->` 形态）：递归取内层。
+        nested = got.get("budget_trail")
+        if isinstance(nested, str):
+            inner = LoopGuard._coerce_budget_payload(nested)
+            if inner is not None:
+                return inner
+        return got
+
+    def adopt_budget(self, payload: Any, source: str = "",
+                     save: bool = True) -> dict:
+        """**合并外部轮次预算**（``max()`` 只增不减）→ 换容器/换棒不归零。
+
+        Args:
+            payload: ``budget_payload()`` 的 dict / JSON 串 / 含
+                ``<!-- loop-budget: … -->`` 的评论正文；``None``/解析失败 → 空操作。
+            source: 留痕来源（如 ``"handoff"`` / ``"review_round"`` / ``"comment"``）。
+            save: 是否立即落盘（``from_handoff`` 内部合并时由调用方统一落盘）。
+
+        Returns:
+            合并结果摘要 ``{"merged": bool, "adopted": {...}, "reason": str}``。
+            载荷里带 ``fused=True`` 时**保守继承熔断**（宁多一次人工解锁，
+            也不放一个可能已超预算的循环继续跑）。
+        """
+        data = self._coerce_budget_payload(payload)
+        if data is None:
+            return {"merged": False, "adopted": {}, "reason": "载荷无法解析（无操作）"}
+
+        st = self._state
+        fields = ("round_no", "blocking_rounds", "repair_rounds",
+                  "advisory_used", "stall_count")
+        before = {k: getattr(st, k) for k in fields}
+        rounds = data.get("rounds")
+        if not isinstance(rounds, dict):
+            rounds = {}
+
+        def _n(key: str) -> int:
+            v = rounds.get(key, 0)
+            return max(0, v) if isinstance(v, int) and not isinstance(v, bool) else 0
+
+        st.round_no = max(st.round_no, _n("total"))
+        st.blocking_rounds = max(st.blocking_rounds, _n("blocking_rounds"))
+        st.repair_rounds = max(st.repair_rounds, _n("repair_rounds"))
+        st.advisory_used = max(st.advisory_used, _n("advisory_used"))
+        st.stall_count = max(st.stall_count, _n("stall_count"))
+
+        fused_from_payload = data.get("fused") is True
+        if fused_from_payload and not st.fused:
+            st.fused = True
+            reason = data.get("reason")
+            st.fused_reason = (reason if isinstance(reason, str) and reason
+                               else "继承外部预算载荷（fused=True）")
+            st.fused_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        adopted = {k: getattr(st, k) for k in fields}
+        changed = {k: v for k, v in adopted.items() if v != before[k]}
+        note = (f"合并外部预算（source={source or '未标注'}）："
+                f"rounds={adopted}，fused={st.fused}")
+        st.history.append({
+            "round_no": st.round_no,
+            "blocking": 0,
+            "advisory": 0,
+            "action": "adopt_budget",
+            "wake": not st.fused,
+            "note": note,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        if save:
+            self._save()
+        return {"merged": True, "adopted": adopted, "changed": changed,
+                "fused": st.fused, "reason": note}
 
     # ---- 状态读取 ----
 
@@ -471,14 +724,24 @@ class LoopGuard:
         return _d(LoopAction.CLEAR.value, False, "无必修/建议项：无需修复")
 
     def register_round(self, blocking: int = 0, advisory: int = 0,
-                       note: str = "", signature: str = "") -> LoopDecision:
+                       note: str = "", signature: str = "",
+                       external_rounds: Any = None) -> LoopDecision:
         """登记一轮评审/复评结果并提交状态（含落盘）。
+
+        Args:
+            external_rounds: **外部轮次预算载荷**（``budget_payload()`` /
+                ``budget_trail()`` / 含 ``<!-- loop-budget: … -->`` 的评论正文）。
+                登记前先 ``max()`` 合并——跨容器/跨棒接力时，本容器磁盘上的
+                轮次从 0 开始，若不合并外部载荷，「最多 3 轮」永远不会触发。
 
         Returns:
             LoopDecision：``action`` 为 ``clear``/``fix``/``fix_last``/``fuse``；
             ``fused_now=True`` 表示本次调用**刚刚**熔断（调用方据此只建一次
-            静默交接卡，避免重复建卡）。
+            静默交接卡，避免重复建卡）；``budget_trail`` 为本轮结束后的
+            **可持久留痕**（写进评论即完成跨容器继承）。
         """
+        if external_rounds is not None:
+            self.adopt_budget(external_rounds, source="review_round", save=False)
         decision = self.preview(blocking, advisory, signature=signature)
         st = self._state
         st.round_no += 1
@@ -516,6 +779,7 @@ class LoopGuard:
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         self._save()
+        decision.budget_trail = self.budget_trail()
         return decision
 
     def fuse(self, reason: str) -> bool:

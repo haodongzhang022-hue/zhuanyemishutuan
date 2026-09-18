@@ -62,7 +62,10 @@ probe:
 
 # ---- 锁：延迟 → 持续 → 聚合台账（组织级统一） ----
 locks:
-  retry_delay_sec: 60
+  # 首次"正在编辑"的延迟窗（秒）= **等待阶梯第一档**（10s）。
+  # 用户原话「延迟可以到 1 分钟」指**阶梯中可达 1 分钟**（60s 档），不是首档 1 分钟。
+  # 🔴D-1：此数值**真被消费**（SecretarySession 的锁窗口/评审延迟窗取它）。
+  retry_delay_sec: 10
   persistent_grace_sec: 180
   registry_shared: true
 

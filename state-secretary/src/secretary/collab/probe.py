@@ -48,6 +48,25 @@
 阶梯（`StepBackoff`）只回答**"下一次什么时候看"**；本模块回答**"到点后怎么再看、
 以及看什么"**。两者共用同一个次数上界（6 次），到顶即停 → 交回人工（`resume_required`）。
 
+## 探测预算的**跨容器继承**（🔴A：预算不归零）
+
+「最多 6 次」不能只落在 ``<数据根>/probe/*.json``：平台 `crontab` 代跑是
+**新容器、新工作区**，磁盘上的 ``checks_used`` 从 0 开始 → 上界永不触发
+（等于"软约束换了个位置"）。
+
+故预算必须**随载荷走**：
+
+- ``probe(key, external_checks=…)`` / ``adopt_checks_budget()``：``max()`` 合并
+  外部轮次（只增不减），在"是否用尽"判定**之前**合并；
+- ``ProbeEvent.budget_trail`` / ``budget_trail_of()``：``<!-- probe-budget: … -->``
+  留痕形态，随**评论正文 / 交接卡 context / 事件载荷**持久传递
+  （容器会被回收，评论不会）；
+- ``dispatch()`` 的返回值统一带 ``budget_trail``，接收方**写回评论**即完成继承。
+
+**边界（明示）**：调用方既不给载荷、又换数据根 → 预算只能从 0 开始。
+这是平台执行模型的边界，不是"实现疏忽"；故 ``.cnb.yml`` 的探测任务里
+"取上次留痕 → 合并 → 写回评论"三步是**必做项**（见该文件 `probe_task` 注释）。
+
 ## 用法
 
     probe = CheckpointProbe("i14", data_dir="<数据根>/probe")
@@ -78,8 +97,9 @@ from .platform import (  # noqa: E402  （同包内相对导入，放这里保�
     resolve_driver,
 )
 
-# 会话/检查点标识白名单（与 LockRegistry / LoopGuard 同族口径，尾锚 \Z）
-_SAFE_ID = re.compile(r'^[A-Za-z0-9_.:-]+\Z')
+# 会话/检查点标识的**安全校验**统一走 `_safe_shared_id()`（见文件末尾）：
+# 跨仓标识（`org/repo#14`）与本地标识共用同一条判定，不再保留第二份正则
+# （🟡6：原先的 `_SAFE_ID` 定义后无人使用，死代码会被误读为"已校验"）。
 
 # ---- 探测维度（判别式）：只看"可判定事实"，不看 agent 自述 ----
 CHECK_CONFIRM = "confirm"      # 人工/上游确认（人说的话才算数）
@@ -112,6 +132,63 @@ ALL_DRIVERS = (DRIVER_AWAIT, DRIVER_CRONTAB, DRIVER_EXTERNAL,
 CRONTAB_MIN_INTERVAL_SEC = 300.0
 
 
+# ---- 字段级容错守卫（与 LoopGuard / LockRegistry 同族口径） ----
+# 「损坏/缺失 → 视为不存在，不炸」只覆盖**非法 JSON**是不够的：合法 JSON 但
+# **类型不符**（如 ``{"checks_used": "NaN"}``）在 ``int()`` 处直接裸抛，且会
+# 一路逃逸到门面（``checkpoints_overview()``）与跨仓入口（``dispatch_shared()``）。
+# 故逐字段守卫：类型不符 → 退化默认（宽进），绝不把坏字段变成异常。
+
+def _as_int(value: Any, default: int) -> int:
+    """宽进读整数（bool / 字符串 / 非数字 → 默认值）。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) \
+        else default
+
+
+def _as_float(value: Any, default: float) -> float:
+    """宽进读数字（bool / 字符串 / 非数字 → 默认值）。"""
+    return float(value) if isinstance(value, (int, float)) \
+        and not isinstance(value, bool) else default
+
+
+def _as_str(value: Any, default: str = "") -> str:
+    """宽进读字符串（非 str → 默认值；不用 ``str()`` 强转，避免把坏值当内容）。"""
+    return value if isinstance(value, str) else default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """宽进读布尔（**只认严格 bool**；``"false"``/``0`` 一律回落默认值）。"""
+    return value if isinstance(value, bool) else default
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """宽进读映射（非 dict → 空 dict）。"""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    """宽进读列表（非 list → 空列表）。"""
+    return list(value) if isinstance(value, list) else []
+
+
+# 探测预算的**可持久留痕**标记（评论正文 / 交接卡 context / 事件载荷共用）：
+# 容器会被回收，评论不会 —— 跨容器"最多 6 次"只能靠载荷走，不能靠本地磁盘。
+PROBE_BUDGET_TRAIL_RE = re.compile(r'<!--\s*probe-budget:\s*(\{.*?\})\s*-->', re.S)
+
+
+def crontab_minutes_from_rules(rules: Optional[Any]) -> int:
+    """从规则包取平台定时任务间隔（分钟）——**跨仓与本地共用同一条取值路径**。
+
+    规则包缺失/形状不符 → 回落平台下限 5 分钟（宽进，不炸）。
+    """
+    every = getattr(rules, "crontab_every_minutes", None)
+    if callable(every):
+        try:
+            return max(1, int(every()))
+        except Exception:      # pragma: no cover - 宽进：异常回落默认档
+            return CRON_EVERY_MINUTES
+    return CRON_EVERY_MINUTES
+
+
 # 等待时长 → 平台落点的分工阈值（= 平台定时任务下限 5 分钟）
 AWAIT_MAX_SEC = CRONTAB_MIN_INTERVAL_SEC
 
@@ -129,8 +206,21 @@ def _driver_for_delay(delay_sec: float,
     超过平台定时下限的等待若仍挂在单个 await 上，就等于把"到点必看"押在
     对端一定会 resolve 上；对端不 resolve（人没编辑完 / 外部系统不回调）就是死等。
     故分工按阈值自动进行，且**两个落点不得混用**（见 `TWO_WAY_SPLIT_NOTE`）。
+
+    **宽进**：阈值或时长不是数字（坏载荷/坏规则包）→ 回落平台下限 300s；
+    仍判不出时取**保守落点** `crontab`（"到点必看"由平台兜底，不押注对端一定 resolve）。
     """
-    return DRIVER_AWAIT if float(delay_sec) <= float(await_max_sec) else DRIVER_CRONTAB
+    try:
+        limit = float(await_max_sec)
+    except (TypeError, ValueError):
+        limit = AWAIT_MAX_SEC
+    if limit <= 0:
+        limit = AWAIT_MAX_SEC
+    try:
+        delay = float(delay_sec)
+    except (TypeError, ValueError):
+        return DRIVER_CRONTAB
+    return DRIVER_AWAIT if delay <= limit else DRIVER_CRONTAB
 
 
 # 分工口径一句话（文档/评论/角色提示词共用，避免各说一套）
@@ -153,7 +243,8 @@ CRON_EVERY_MINUTES = 5
 CRON_FIXED_EXPR = "*/5 * * * *"      # 固定表达式（单一语义源，测试直接断言它）
 
 
-def _cron_fixed_5min(_delay_sec: float = 0.0, base_minutes: int = 5) -> str:
+def _cron_fixed_5min(_delay_sec: float = 0.0,
+                     base_minutes: int = CRON_EVERY_MINUTES) -> str:
     """**固定一档扫**：所有平台定时探测点用**同一个** cron 表达式。
 
     第一个参数（原等待时长）**保留但不使用**——签名兼容旧调用点，语义上
@@ -172,18 +263,8 @@ def cron_expr_for(rules: Optional[Any] = None) -> str:
     规则包里的 `probe.crontab_interval_minutes` **是真读的**（不是装饰性文档）：
     调大即有意疏化扫描，调小会被平台下限夹住。
     """
-    minutes = 5
-    every = getattr(rules, "crontab_every_minutes", None)
-    if callable(every):
-        try:
-            minutes = int(every())
-        except Exception:      # pragma: no cover - 宽进：异常回落默认档
-            minutes = 5
+    minutes = crontab_minutes_from_rules(rules)
     return _cron_fixed_5min(0.0, minutes)
-
-
-# 向后兼容别名（旧名 `_cron_every` 在既有代码/文档里出现过）
-_cron_every = _cron_fixed_5min
 
 
 @dataclass
@@ -211,6 +292,9 @@ class ProbeEvent:
     reason: str = ""
     action: str = ""            # 给接收方的**明确指令**（resume / keep_waiting / sweep_lock / human）
     wake_allowed: bool = True   # 是否允许据此唤醒下一轮（防"探测自己变成新循环"）
+    # **探测预算留痕**（``<!-- probe-budget: … -->``）：随评论/交接卡/事件载荷走，
+    # 下一棒（可能是新容器）据此恢复 ``checks_used``，不必共享磁盘。
+    budget_trail: str = ""
     at: float = 0.0
 
     def to_dict(self) -> dict:
@@ -229,29 +313,37 @@ class ProbeEvent:
             "reason": self.reason,
             "action": self.action,
             "wake_allowed": self.wake_allowed,
+            "budget_trail": self.budget_trail,
             "at": self.at,
         }
 
     @classmethod
     def from_dict(cls, data: Any) -> Optional["ProbeEvent"]:
+        """字段级容错恢复（**合法 JSON + 类型不符也不炸**）。
+
+        与 ``LoopGuard.from_dict`` / ``LockRegistry.from_dict`` **同族口径**：
+        坏字段退化为默认值，只有"根本不是对象"才返回 ``None``。
+        跨仓载荷（``dispatch_shared``）走的正是这条路径，不得裸抛。
+        """
         if not isinstance(data, dict):
             return None
         ev = cls()
-        ev.checkpoint_key = str(data.get("checkpoint_key") or "")
-        ev.kind = str(data.get("kind") or CHECK_EVENT)
-        ev.waiter_event = str(data.get("waiter_event") or "")
-        ev.resolver_event = str(data.get("resolver_event") or "")
-        ev.verdict = str(data.get("verdict") or UNKNOWN)
-        ev.facts = data.get("facts") if isinstance(data.get("facts"), dict) else {}
-        ev.driver = str(data.get("driver") or DRIVER_AWAIT)
-        ev.next_delay_sec = float(data.get("next_delay_sec") or 0.0)
-        ev.checks_used = int(data.get("checks_used") or 0)
-        ev.checks_left = int(data.get("checks_left") or 0)
-        ev.resume_required = bool(data.get("resume_required") or False)
-        ev.reason = str(data.get("reason") or "")
-        ev.action = str(data.get("action") or "")
-        ev.wake_allowed = bool(data.get("wake_allowed", True))
-        ev.at = float(data.get("at") or 0.0)
+        ev.checkpoint_key = _as_str(data.get("checkpoint_key"))
+        ev.kind = _as_str(data.get("kind"), CHECK_EVENT) or CHECK_EVENT
+        ev.waiter_event = _as_str(data.get("waiter_event"))
+        ev.resolver_event = _as_str(data.get("resolver_event"))
+        ev.verdict = _as_str(data.get("verdict"), UNKNOWN) or UNKNOWN
+        ev.facts = _as_dict(data.get("facts"))
+        ev.driver = _as_str(data.get("driver"), DRIVER_AWAIT) or DRIVER_AWAIT
+        ev.next_delay_sec = _as_float(data.get("next_delay_sec"), 0.0)
+        ev.checks_used = max(0, _as_int(data.get("checks_used"), 0))
+        ev.checks_left = max(0, _as_int(data.get("checks_left"), 0))
+        ev.resume_required = _as_bool(data.get("resume_required"), False)
+        ev.reason = _as_str(data.get("reason"))
+        ev.action = _as_str(data.get("action"))
+        ev.wake_allowed = _as_bool(data.get("wake_allowed"), True)
+        ev.budget_trail = _as_str(data.get("budget_trail"))
+        ev.at = _as_float(data.get("at"), 0.0)
         return ev
 
 
@@ -317,29 +409,35 @@ class Checkpoint:
 
     @classmethod
     def from_dict(cls, data: Any) -> Optional["Checkpoint"]:
+        """字段级容错恢复（**合法 JSON + 类型不符也不炸**）。
+
+        坏字段退化默认值（同 ``LoopGuard`` / ``LockRegistry`` 族口径）；
+        只有"不是对象"或"缺 key"才返回 ``None``（= 视为不存在）。
+        """
         if not isinstance(data, dict) or not data.get("key"):
             return None
-        cp = cls(key=str(data["key"]))
-        cp.session_id = str(data.get("session_id") or "")
-        cp.kind = str(data.get("kind") or CHECK_EVENT)
-        cp.holder = str(data.get("holder") or "")
-        cp.scope = str(data.get("scope") or "")
-        cp.await_key = str(data.get("await_key") or "")
-        cp.resolve_status = str(data.get("resolve_status") or "")
-        cp.sn = str(data.get("sn") or "")
-        cp.waiter_event = str(data.get("waiter_event") or "")
-        cp.resolver_event = str(data.get("resolver_event") or "")
-        cp.checks_used = int(data.get("checks_used") or 0)
-        cp.max_checks = int(data.get("max_checks") or DEFAULT_MAX_ATTEMPTS)
-        cp.next_delay_sec = float(data.get("next_delay_sec") or 0.0)
-        cp.last_verdict = str(data.get("last_verdict") or "")
-        cp.last_facts = (data.get("last_facts")
-                         if isinstance(data.get("last_facts"), dict) else {})
-        cp.created_at = float(data.get("created_at") or 0.0)
-        cp.updated_at = float(data.get("updated_at") or 0.0)
-        cp.released = bool(data.get("released") or False)
-        cp.resume_required = bool(data.get("resume_required") or False)
-        cp.history = data.get("history") if isinstance(data.get("history"), list) else []
+        cp = cls(key=_as_str(data.get("key")))
+        cp.session_id = _as_str(data.get("session_id"))
+        cp.kind = _as_str(data.get("kind"), CHECK_EVENT) or CHECK_EVENT
+        cp.holder = _as_str(data.get("holder"))
+        cp.scope = _as_str(data.get("scope"))
+        cp.await_key = _as_str(data.get("await_key"))
+        cp.resolve_status = _as_str(data.get("resolve_status"))
+        cp.sn = _as_str(data.get("sn"))
+        cp.waiter_event = _as_str(data.get("waiter_event"))
+        cp.resolver_event = _as_str(data.get("resolver_event"))
+        cp.checks_used = max(0, _as_int(data.get("checks_used"), 0))
+        cp.max_checks = max(1, _as_int(data.get("max_checks"),
+                                       DEFAULT_MAX_ATTEMPTS))
+        cp.next_delay_sec = max(0.0, _as_float(data.get("next_delay_sec"), 0.0))
+        cp.last_verdict = _as_str(data.get("last_verdict"))
+        cp.last_facts = _as_dict(data.get("last_facts"))
+        cp.created_at = _as_float(data.get("created_at"), 0.0)
+        cp.updated_at = _as_float(data.get("updated_at"), 0.0)
+        cp.released = _as_bool(data.get("released"), False)
+        cp.resume_required = _as_bool(data.get("resume_required"), False)
+        cp.history = [h for h in _as_list(data.get("history"))
+                      if isinstance(h, dict)]
         return cp
 
 
@@ -381,9 +479,10 @@ class CheckpointProbe:
         clock: Optional[Callable[[], float]] = None,
         lock_view: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
         version_view: Optional[Callable[[], Optional[int]]] = None,
-        crontab_base_minutes: int = 5,
+        crontab_base_minutes: int = CRON_EVERY_MINUTES,
         await_max_sec: float = AWAIT_MAX_SEC,
         rules: Optional[Any] = None,
+        mkdir: bool = True,
     ):
         # 会话号可能来自**跨仓事件**（如 `dongdongxiaozu/zhuanyemishutuan#14`）——
         # 因此这里接受"仓/号"这类正常写法；危险形态（路径穿越/控制字符）仍拒绝。
@@ -404,7 +503,7 @@ class CheckpointProbe:
         self._version_view = version_view
         # 规则包里的固定间隔（若给了规则包且未显式传 base_minutes，则以规则包为准）
         self.crontab_base_minutes = int(crontab_base_minutes)
-        if rules is not None and int(crontab_base_minutes) == 5:
+        if rules is not None and int(crontab_base_minutes) == CRON_EVERY_MINUTES:
             every = getattr(rules, "crontab_every_minutes", None)
             if callable(every):
                 try:
@@ -419,6 +518,15 @@ class CheckpointProbe:
             if isinstance(await_max_sec, (int, float))
             and not isinstance(await_max_sec, bool) and float(await_max_sec) > 0
             else AWAIT_MAX_SEC)
+        # 目录**惰性创建**（🟡2）：`dispatch()` 是"只算落点"的纯函数，
+        # 不该在 cwd 下凭空造出 `data/probe/`（污染新容器/流水线工作区）。
+        # 需要落盘的路径（create/_save）会自行 `_ensure_dir()`。
+        self._mkdir = bool(mkdir)
+        if self._mkdir:
+            self._ensure_dir()
+
+    def _ensure_dir(self) -> None:
+        """确保数据目录存在（落盘前调用；纯计算路径不调用）。"""
         os.makedirs(self.data_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -451,6 +559,7 @@ class CheckpointProbe:
         return Checkpoint.from_dict(data)
 
     def _save(self, cp: Checkpoint) -> None:
+        self._ensure_dir()
         cp.updated_at = self._clock()
         data = json.dumps(cp.to_dict(), ensure_ascii=False, indent=2)
         fd, tmp = tempfile.mkstemp(dir=self.data_dir, suffix=".tmp")
@@ -468,6 +577,87 @@ class CheckpointProbe:
     # ------------------------------------------------------------------
     # 建 / 查 / 列
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 跨容器 / 跨棒预算继承（**探测预算不归零**）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def budget_trail_of(cp: Checkpoint) -> str:
+        """检查点预算的**留痕**形态（写进评论/交接卡 context 即可跨容器继承）。"""
+        return ("<!-- probe-budget: "
+                + json.dumps({"checkpoint_key": cp.key,
+                              "checks_used": cp.checks_used,
+                              "max_checks": cp.max_checks},
+                             ensure_ascii=False, sort_keys=True)
+                + " -->")
+
+    @staticmethod
+    def _coerce_checks_used(value: Any) -> Optional[int]:
+        """从任意形态的载荷里取外部探测轮次（宽进：取不到 → ``None``）。
+
+        接受：int / 数字串 / 字典（``checks_used`` 或 ``rounds.checks_used``）/
+        含 ``<!-- probe-budget: … -->`` 的正文 / ``ProbeEvent.to_dict()``。
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return max(0, value)
+        if isinstance(value, float):
+            return max(0, int(value))
+        if isinstance(value, str):
+            text = value.strip()
+            m = PROBE_BUDGET_TRAIL_RE.search(text)
+            if m:
+                try:
+                    got = json.loads(m.group(1))
+                except ValueError:
+                    got = None
+                if isinstance(got, dict):
+                    return CheckpointProbe._coerce_checks_used(got)
+            try:
+                return max(0, int(text))
+            except ValueError:
+                return None
+        if isinstance(value, dict):
+            for key in ("checks_used", "external_checks", "used"):
+                if key in value:
+                    got = CheckpointProbe._coerce_checks_used(value[key])
+                    if got is not None:
+                        return got
+            rounds = value.get("rounds")
+            if isinstance(rounds, dict):
+                return CheckpointProbe._coerce_checks_used(rounds)
+        return None
+
+    def adopt_checks_budget(self, cp: Checkpoint, payload: Any = None,
+                            save: bool = True) -> dict:
+        """**合并外部探测轮次**（``max()`` 只增不减）→ 换容器不归零。
+
+        Args:
+            cp: 目标检查点（原地更新）。
+            payload: 外部轮次（int / 数字串 / ``{"checks_used": n}`` /
+                ``ProbeEvent.to_dict()`` / 含 ``<!-- probe-budget: … -->`` 的正文）；
+                也可直接传探测 kwargs（含 ``checks_used``/``external_checks``）。
+            save: 是否落盘。
+
+        Returns:
+            ``{"merged": bool, "checks_used": int, "max_checks": int}``。
+        """
+        external = self._coerce_checks_used(payload)
+        if external is None or external <= cp.checks_used:
+            return {"merged": False, "checks_used": cp.checks_used,
+                    "max_checks": cp.max_checks}
+        cp.checks_used = external
+        cp.history.append({
+            "at": self._clock(), "action": "adopt_budget",
+            "checks_used": external,
+            "note": "合并外部探测轮次（跨容器/跨棒继承，只增不减）",
+        })
+        if save:
+            self._save(cp)
+        return {"merged": True, "checks_used": cp.checks_used,
+                "max_checks": cp.max_checks}
 
     def create(
         self,
@@ -730,10 +920,16 @@ class CheckpointProbe:
             our_need_satisfied: **我方是否还等这件事**。False 表示"我已不需要这个锁/
                 这个版本了" → 直接 `release`（放锁、不再等），**避免队头阻塞**。
             confirmed / version_changed / event_fired / resource_ready: 各判别式的事实
+            checks_used / external_checks: **外部探测轮次**（跨容器/跨棒继承用）。
+                平台 `crontab` 代跑是**新容器、新数据根**，本地磁盘上
+                ``checks_used`` 从 0 开始 → "最多 6 次"永不触发。故此处接受
+                外部轮次并 ``max()`` 合并（只增不减），使预算**随载荷走**。
         """
         cp = self.load(key)
         if cp is None:
             cp = self.create(key)
+        # 跨容器预算继承（**在"是否用尽"判定之前**合并，否则永远判不出用尽）。
+        self.adopt_checks_budget(cp, kwargs, save=False)
         if cp.used_up():
             return self._outcome(cp, WAIT,
                                  reason="探测预算已用尽（最多 %d 次）" % cp.max_checks,
@@ -854,7 +1050,9 @@ class CheckpointProbe:
         elif resume_required:
             driver, act = DRIVER_HANDOFF, "human_resume"
         else:
-            driver = _driver_for_delay(cp.next_delay_sec)
+            # 与本实例的分工阈值同源（否则同一实例会在 delay_plan/overview 与
+            # 探测产出里给出两套落点——那正是"同一份规则出两套动作"的形态）。
+            driver = _driver_for_delay(cp.next_delay_sec, self.await_max_sec)
             act = "keep_waiting"
         if action:
             act = action
@@ -873,6 +1071,7 @@ class CheckpointProbe:
             reason=reason,
             action=act,
             wake_allowed=(verdict == PROCEED) and not resume_required,
+            budget_trail=self.budget_trail_of(cp),
             at=self._clock(),
         )
         return ProbeOutcome(verdict=verdict, event=event, checkpoint=cp)
@@ -912,7 +1111,29 @@ class CheckpointProbe:
         Args:
             event: 探测产出的结构化事件（跨仓时由对端序列化而来）
             checkpoint: 可选上下文（跨仓纯函数路径用；给了就不读本地磁盘）
+
+        返回值统一带 ``budget_trail``（探测预算留痕，🔴A）：接收方把它写进
+        评论/交接卡，下一棒（可能是**新容器**）据此 ``max()`` 恢复
+        ``checks_used``——否则平台 crontab 每次新容器都从 0 开始，
+        "最多 6 次"永不触发。
         """
+        out = self._dispatch_core(event, checkpoint=checkpoint)
+        trail = event.budget_trail
+        if not trail:
+            cp = checkpoint
+            if cp is None and event.checkpoint_key:
+                cp = self.load(event.checkpoint_key)
+            trail = self.budget_trail_of(cp) if cp is not None else ""
+        if trail:
+            out["budget_trail"] = trail
+        return out
+
+    def _dispatch_core(
+        self,
+        event: ProbeEvent,
+        checkpoint: Optional[Checkpoint] = None,
+    ) -> Dict[str, Any]:
+        """落点判定的**纯逻辑**（``dispatch_core`` 负责附加预算留痕）。"""
         if event.verdict == PROCEED:
             return {
                 "action": "resume",
@@ -944,7 +1165,13 @@ class CheckpointProbe:
                 "wake_allowed": False,
                 "reason": event.reason + "｜需人工 resume(by=…, reason=…) 留痕解锁",
             }
-        if event.driver == DRIVER_AWAIT:
+        # 落点**按本地规则重算**（同一份规则 → 同一套动作，🔴D 同族加固）：
+        # 不轻信事件自带的 `driver` 字段——否则跨仓发送方只要写
+        # `driver=platform_await`，就能把 10 分钟的等待也挂成单个 await
+        # （= 押注对端一定会 resolve 的死等）。
+        driver = _driver_for_delay(event.next_delay_sec, self.await_max_sec)
+        v = None
+        if driver == DRIVER_AWAIT:
             # 平台语义校验：await 必须**同一事件**配对，且 key 仅能 resolve 一次。
             # 配不上对就降级 crontab——不硬上一个"一定会等不到"的 await。
             # 上下文来源：显式传入（跨仓）→ 本地检查点（本地）。
@@ -974,8 +1201,6 @@ class CheckpointProbe:
                     "wake_allowed": False,
                     "reason": event.reason,
                 }
-        else:
-            v = None
         downgrade_reason = (
             v.reason if v is not None and v.downgraded else event.reason)
         return {
@@ -1015,7 +1240,7 @@ class CheckpointProbe:
                 "checks_used": c.checks_used,
                 "checks_left": c.checks_left(),
                 "next_delay_sec": c.next_delay_sec,
-                "driver": _driver_for_delay(c.next_delay_sec)
+                "driver": _driver_for_delay(c.next_delay_sec, self.await_max_sec)
                 if c.next_delay_sec else DRIVER_HANDOFF,
                 "last_verdict": c.last_verdict,
                 "platform_wait": c.resolve_status or "未挂",
@@ -1059,7 +1284,7 @@ class CheckpointProbe:
 def _safe_shared_id(value: Any) -> bool:
     """跨仓标识是否可用作落点键的**安全**前缀。
 
-    与本地 `session_id` 白名单（``_SAFE_ID``，禁 ``/``）**不同**：跨仓协作里
+    与本地各模块的 ``_SAFE_ID`` 白名单（``[A-Za-z0-9_-]+``，禁 ``/``）**不同**：跨仓协作里
     `dongdongxiaozu/zhuanyemishutuan#14` 这类"仓/号"写法是**正常标识**，
     不能因为带 `/` 就丢掉它（丢了就等于把落点错标成本地会话）。
     这里只挡**真正危险**的形态：路径穿越、路径分隔、空白与控制字符、超长。
@@ -1106,7 +1331,7 @@ def _dispatch_for_session(
     event: ProbeEvent,
     session_id: str,
     clock: Optional[Callable[[], float]] = None,
-    crontab_base_minutes: int = 5,
+    crontab_base_minutes: int = CRON_EVERY_MINUTES,
     await_max_sec: float = AWAIT_MAX_SEC,
     checkpoint: Optional[Checkpoint] = None,
 ) -> Dict[str, Any]:
@@ -1120,9 +1345,12 @@ def _dispatch_for_session(
     """
     if session_id == "":
         session_id = "shared"
+    # `mkdir=False`：本函数**只算落点**（声明为纯函数），不得在 cwd 下造目录
+    # ——新容器/流水线里凭空出现 `data/probe/` 是污染工作区的副作用。
     probe = CheckpointProbe(
         session_id, backoff=None, clock=clock,
-        crontab_base_minutes=crontab_base_minutes, await_max_sec=await_max_sec)
+        crontab_base_minutes=crontab_base_minutes, await_max_sec=await_max_sec,
+        mkdir=False)
     return probe.dispatch_core(event, checkpoint=checkpoint)
 
 
@@ -1130,7 +1358,7 @@ def dispatch_shared(
     event: Any,
     rules: Optional[Any] = None,
     session_id: str = "shared",
-    crontab_base_minutes: int = 5,
+    crontab_base_minutes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """**跨仓共享**的落点判定：同一份规则包 → 同一套动作（不依赖本地实例）。
 
@@ -1138,39 +1366,69 @@ def dispatch_shared(
         event: `ProbeEvent`（本仓）或跨仓传来的**字典**（键名口径同源）
         rules: `CollabRules`（组织级/仓库级规则包）；缺省用内置默认口径
         session_id: 兜底会话标识（事件里带 `session_id` 时以事件为准）
+        crontab_base_minutes: cron 间隔（分钟）。**缺省从 `rules` 取**
+            （`probe.crontab_interval_minutes`）——否则同一份规则包会在
+            「本地 `cron_expr_for(rules)`」与「跨仓 `dispatch_shared`」出**两套落点**，
+            正是要消灭的跨仓漂移。
 
     Returns:
-        `{"verdict", "action", "driver", "trigger", "wake_allowed", "reason"}`
-        —— 跨仓接收方据此执行即可，**不必**、也**不该**再按自己的本地会话号重算。
+        `{"verdict", "action", "driver", "trigger", "wake_allowed", "reason",
+        "budget_trail"}`——跨仓接收方据此执行即可，**不必**、也**不该**再按
+        自己的本地会话号重算。
+
+    **宽进不炸**：载荷是合法 JSON 但字段类型不符（如
+    ``{"next_delay_sec": "soon"}``）时，逐字段守卫已把它退化为默认；
+    极端情况下（守卫之外仍抛）一律回落 ``unknown`` → 继续等，**绝不误放行**。
     """
-    ev = (event if isinstance(event, ProbeEvent)
-          else ProbeEvent.from_dict(event) or ProbeEvent())
-    sid = session_id
-    raw = ev.facts.get("session_id") if isinstance(ev.facts, dict) else None
-    if _safe_shared_id(raw):
-        sid = raw
-    await_max = getattr(rules, "probe_await_max_sec", AWAIT_MAX_SEC)
-    if not isinstance(await_max, (int, float)) or isinstance(await_max, bool):
-        await_max = AWAIT_MAX_SEC
-    # 跨仓上下文：**只能由事件自带**（对方的检查点不在本地磁盘上，
-    # 也不能按本地会话号去读——那会读到别人的/读不到）。
-    # 事件没带侧边事件名时 → 两侧均不可判定 → 落点保守降级 crontab（平台兜底）。
-    ctx = None
-    facts = ev.facts if isinstance(ev.facts, dict) else {}
-    if ev.waiter_event or ev.resolver_event or facts.get("waiter_event")             or facts.get("resolver_event") or facts.get("checks_used"):
-        ctx = Checkpoint(
-            key=str(event.get("checkpoint_key") if isinstance(event, dict)
-                    else ev.checkpoint_key or "shared"),
-            waiter_event=str(ev.waiter_event or facts.get("waiter_event") or ""),
-            resolver_event=str(ev.resolver_event
-                               or facts.get("resolver_event") or ""),
-        )
-        try:
-            ctx.checks_used = int(facts.get("checks_used") or 0)
-        except (TypeError, ValueError):
-            ctx.checks_used = 0
-    out = _dispatch_for_session(ev, sid, None, crontab_base_minutes, await_max,
-                                checkpoint=ctx)
+    try:
+        ev = (event if isinstance(event, ProbeEvent)
+              else ProbeEvent.from_dict(event) or ProbeEvent())
+        sid = session_id
+        raw = ev.facts.get("session_id") if isinstance(ev.facts, dict) else None
+        if _safe_shared_id(raw):
+            sid = raw
+        await_max = getattr(rules, "probe_await_max_sec", AWAIT_MAX_SEC)
+        if not isinstance(await_max, (int, float)) or isinstance(await_max, bool):
+            await_max = AWAIT_MAX_SEC
+        # 🔴D-2：cron 间隔**缺省从规则包取**（不再硬编码 5）——
+        # 否则同一份规则包会在「本地 cron_expr_for(rules)」与「跨仓 dispatch_shared」
+        # 出两套落点，正是要消灭的跨仓漂移。
+        minutes = (crontab_minutes_from_rules(rules)
+                   if crontab_base_minutes is None else int(crontab_base_minutes))
+        # 跨仓上下文：**只能由事件自带**（对方的检查点不在本地磁盘上，
+        # 也不能按本地会话号去读——那会读到别人的/读不到）。
+        # 事件没带侧边事件名时 → 两侧均不可判定 → 落点保守降级 crontab（平台兜底）。
+        ctx = None
+        facts = ev.facts if isinstance(ev.facts, dict) else {}
+        if ev.waiter_event or ev.resolver_event or facts.get("waiter_event") \
+                or facts.get("resolver_event") or facts.get("checks_used"):
+            ctx = Checkpoint(
+                key=str(event.get("checkpoint_key") if isinstance(event, dict)
+                        else ev.checkpoint_key or "shared"),
+                waiter_event=str(ev.waiter_event or facts.get("waiter_event") or ""),
+                resolver_event=str(ev.resolver_event
+                                   or facts.get("resolver_event") or ""),
+            )
+            try:
+                ctx.checks_used = int(facts.get("checks_used") or 0)
+            except (TypeError, ValueError):
+                ctx.checks_used = 0
+        out = _dispatch_for_session(ev, sid, None, minutes, await_max,
+                                    checkpoint=ctx)
+    except Exception:          # pragma: no cover - 兜底：坏载荷不得炸跨仓入口
+        ev = ProbeEvent()
+        sid = session_id
+        out = {
+            "action": "platform_await",
+            "driver": DRIVER_AWAIT,
+            "trigger": {
+                "type": "cnb:await",
+                "key": f"{session_id}-unknown",
+                "note": "载荷无法解析 → 保守继续等（绝不误放行）",
+            },
+            "wake_allowed": False,
+            "reason": "载荷解析失败：判不出 → unknown → 继续等",
+        }
     out["verdict"] = probe_verdict_of(ev)
     out["session_id"] = sid          # 归属会话随事件流转（接收方据此知道是谁的检查点）
     out["shared"] = True

@@ -23,7 +23,7 @@
 | 域 | 参数 | 口径 |
 |---|---|---|
 | 等待/退避 | `backoff.ladder` = `[10, 30, 60, 180, 360, 600]`、`max_attempts` | 「从少到多，持续增加到 10 分钟就停止」（§3） |
-| 锁 | `locks.retry_delay_sec` / `persistent_grace_sec` / `registry_shared` | 延迟首档 10s；重触发转持续锁；所有锁进一本台账 |
+| 锁 | `locks.retry_delay_sec` / `persistent_grace_sec` / `registry_shared` | 延迟首档 10s（**覆写即生效**，🔴D-1）；重触发转持续锁；所有锁进一本台账 |
 | 循环熔断 | `loop.max_rounds`=3 / `max_advisory_fix_rounds`=1 / `max_total_rounds`=5 / `max_stall_repeats`=2 | §2.1 |
 | 审查范围 | `scan.major_version_tags` / `full_scan_keywords` / `scan_keywords` | 日常只审变化，全量只在大版本 |
 | 增量执行 | `scan.default_mode` / `max_identical_repeats` / `repeat_keys` / `allow_stability_repeats` / `stability_via` | §2.4（**同一口径只跑一次**；禁连跑当稳定性论证） |
@@ -153,6 +153,19 @@
 新增数值字段若忘登记，仓库级覆写会被**静默丢弃** —— 表现为"规则文件里明明写了，
 跑起来还是默认值"。现已加自检 `_audit_overridable_fields()`（漏登记即断言失败）。
 
+### 2.5 规则包数值的**消费点**（"一处定义"必须真被读）
+
+> 🔴D 修复：数值**被读**不等于**生效**。本轮补全两处消费点，并加回归用例。
+
+| 数值 | 消费点 | 覆写效果 |
+|---|---|---|
+| `locks.retry_delay_sec` | `SecretarySession` 的锁窗口 / 评审延迟窗（`review_arbiter.retry_delay_sec`、`lock_registry.ttl_sec`） | 组织级/仓库级改 30 → 生效值即 30（`collab_status()["locks"]` 同步）；显式传参仍优先 |
+| `probe.crontab_interval_minutes` | `cron_expr_for(rules)` **与** `dispatch_shared(event, rules)` | 改 15 → **本地与跨仓**同为 `*/15 * * * *`（旧实现跨仓硬编码 `*/5` → 同一份规则出两套动作） |
+| `probe.await_max_sec` | `_driver_for_delay()`（本地/跨仓共用） | 改 120 → 180s 等待在**两侧**都判 `crontab` |
+
+`collab_status()["locks"]` 额外给出 `rules_retry_delay_sec`（规则包原值）与
+`explicit_override`（是否被显式传参覆写）——"生效值从哪来"一眼可见。
+
 ## 3. 等待阶梯：从少到多，到顶即停
 
 > 从少到多符合逻辑，因为**大部分都是很快就没问题了**，所以要不第一次的设计到
@@ -233,6 +246,26 @@ probe:
 平台代跑）、`cnb:apply`/`cnb:trigger` 与 OPENAPI `StartBuild`（外部 webhook 再跑）。
 详见 `docs/secretary-gate-workflow.md` §2.2.2。
 
+### 4.1.1 探测预算的**跨容器继承**（🔴A：不归零）
+
+「最多 6 次」不能只落在 `<数据根>/probe/*.json`：平台 `crontab` 代跑是
+**新容器、新工作区**，磁盘上的 `checks_used` 从 0 开始 → 上界**永不触发**
+（等于"软约束换了个位置"）。故预算随**载荷**走：
+
+| 环节 | 机制 |
+|---|---|
+| 合并 | `probe(key, external_checks=…)` / `adopt_checks_budget()`：`max()` 只增不减，且在"是否用尽"判定**之前**合并 |
+| 留痕 | `ProbeEvent.budget_trail` = `<!-- probe-budget: {…} -->`，可贴进**评论正文** / 交接卡 `context` / 事件载荷（容器会被回收，评论不会） |
+| 回写 | `dispatch()` 返回值统一带 `budget_trail`；接收方**写回评论**，下一棒据此恢复 |
+| 接线 | `.cnb.yml` 的 `probe_task` 明列三步：取上次留痕 → 合并 → 写回评论 |
+
+**边界（明示）**：调用方既不给载荷、又换数据根 → 预算只能从 0 开始。
+这是平台执行模型的边界，不是"实现疏忽"；故上表"回写"一步是**必做项**。
+
+同族口径见 §2.1（熔断轮次）：`LoopGuard.budget_payload()` / `budget_trail()` /
+`adopt_budget()`，门面入口 `review_round(external_rounds=…)` /
+`inherit_budget(…)` / `loop_budget_trail()`。
+
 **接线**：长等待由 `.cnb.yml` 顶层的 `crontab` 配置真正接到平台
 （`cron: "*/5 * * * *"` + `event: api_trigger_probe_check`；平台约束：仅支持明确
 单一分支，故 `branch: main`）。**固定 `*/5` 一档扫**，与阶梯时间表解耦。
@@ -278,6 +311,9 @@ wp.explain()                             # "等待是否占 CPU"的完整口径
 | `probe_status()` | 探测口径快照（含分工阈值、固定 cron、规则来源层级 `chain`） |
 | `organization_probe_rules()` | **组织级共享**口径快照（跨仓同一份） |
 | `dispatch_probe_event_shared()` | **跨仓**落点判定（同一份规则 → 同一套动作） |
+| `review_round(..., external_rounds=…)` | 登记一轮并**合并外部轮次预算**（跨容器/跨棒不归零） |
+| `loop_budget_trail()` / `inherit_budget(payload)` | 轮次预算的**评论留痕** / 从留痕**恢复**轮次（🔴A） |
+| `probe_checkpoint(key, external_checks=…)` | 探测一次并**合并外部探测轮次**（同上） |
 
 ## 6. 覆写与校验
 
