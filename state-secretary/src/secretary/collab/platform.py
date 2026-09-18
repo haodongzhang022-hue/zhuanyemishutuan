@@ -253,6 +253,87 @@ def local_cpu_note() -> str:
     )
 
 
+def full_run_eligible(
+    event: Any,
+    blocked_events: Any = None,
+) -> Dict[str, Any]:
+    """**这个事件下能不能跑全量**——目录/评论/定时类事件一律不允许。
+
+    这是"一次污染了很多仓库"的直接堵口：全量回归只有在**代码推进**类事件
+    （`push` / `pull_request` 等真正与变更绑定的事件）下才有意义。
+    评论、打开/更新 Issue、平台定时任务这些**不含有测试阶段**的事件，
+    既没有明确基线、也没有变更集，跑全量只是空烧。
+
+    判定是**保守的**（判不出事件就拦）：`blocked_events` 命中或事件不可判定 → 不允许。
+    """
+    ev = norm_event(event)
+    if blocked_events is None:
+        try:
+            from .rules import DEFAULT_BLOCKED_EVENTS as blocked_events  # type: ignore
+        except Exception:  # pragma: no cover - 兜底
+            blocked_events = ["issue.comment", "pull_request.comment",
+                              "crontab", "api_trigger", "web_trigger"]
+    block = [str(e).strip().lower() for e in (blocked_events or []) if str(e).strip()]
+    if not ev:
+        return {"eligible": False, "blocked": True,
+                "reason": "触发事件不可判定 → 不得跑全量（拿不准就不全量）",
+                "event": ev}
+    if ev in block:
+        return {"eligible": False, "blocked": True,
+                "reason": f"事件 `{ev}` 不含有测试阶段（非代码推进）→ 不得跑全量",
+                "event": ev}
+    return {"eligible": True, "blocked": False,
+            "reason": f"事件 `{ev}` 为代码推进类 → 可（在大版本条件下）跑全量",
+            "event": ev}
+
+
+def pipeline_change_allowed(
+    changed_paths: Any,
+    allowlist: Any = None,
+) -> Dict[str, Any]:
+    """**流水线兜底变更的路径白名单**（最小权限）。
+
+    背景：为了让存量仓库真的生效，需要一条带自校验的兜底路径。兜底一旦能被用来
+    "顺手改点别的"，就把它变成了**绕过门禁的后门** —— 恶意/误用输入可能通过兜底
+    写进任意文件（路径穿越、绝对路径、改流水线本身）。
+
+    判定（任一不满足即拒）：
+
+    - 路径必须是**相对路径**（拒绝绝对路径与 `..` 穿越）；
+    - 必须以白名单里的某个前缀开头（默认只允许 `shared/collab/`）。
+
+    判定是**保守的**（判不出就拒）：拿不准的输入一律拒绝，
+    让调用方走正常 PR 路径，而不是靠兜底。
+    """
+    if allowlist is None:
+        try:
+            from .rules import DEFAULT_PIPELINE_ALLOWLIST as allowlist  # type: ignore
+        except Exception:  # pragma: no cover - 兜底
+            allowlist = ["shared/collab/"]
+    prefixes = [str(p) for p in (allowlist or []) if str(p).strip()]
+    raw = changed_paths if isinstance(changed_paths, (list, tuple, set)) \
+        else ([changed_paths] if isinstance(changed_paths, str) else [])
+    paths = [str(x).strip() for x in raw if str(x).strip()]
+    if not paths:
+        return {"allowed": False, "reason": "变更路径为空 → 拒绝（兜底不认无路径变更）",
+                "paths": []}
+    for path in paths:
+        if path.startswith("/") or "\\" in path.replace("/", ""):
+            return {"allowed": False,
+                    "reason": f"路径 `{path}` 为绝对路径/非法分隔符 → 拒绝",
+                    "paths": paths}
+        if ".." in path.split("/"):
+            return {"allowed": False,
+                    "reason": f"路径 `{path}` 含 `..` 穿越 → 拒绝", "paths": paths}
+        if not any(path.startswith(p) for p in prefixes):
+            return {"allowed": False,
+                    "reason": (f"路径 `{path}` 超出允许范围 "
+                               f"（仅 {prefixes}）→ 拒绝（兜底不得改规则之外的文件）"),
+                    "paths": paths}
+    return {"allowed": True, "reason": f"变更均在允许范围内（{prefixes}）",
+            "paths": paths}
+
+
 def official_capabilities() -> Dict[str, Any]:
     """**官方最佳实践对照表**——"别人怎么做的"（Issue #14 要求检索）。
 
@@ -324,6 +405,8 @@ def platform_report() -> Dict[str, Any]:
         "downgrade_policy": "await 不可用 → crontab（平台代跑 + 平台死锁检测）；永不降级到本地空转",
         "local_cpu_note": local_cpu_note(),
         "official_capabilities": official_capabilities(),
+        "full_run": ("全量仅大版本；**非代码推进事件（评论/目录/定时/触发）一律不得跑全量**"
+                     "——防跨仓污染"),
     }
 
 # ------------------------------------------------------------------

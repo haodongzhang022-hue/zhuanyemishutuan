@@ -74,6 +74,22 @@ scan:
   repeat_keys: ["mode", "revision", "impact", "command"]
   allow_stability_repeats: false    # 禁止"连跑 N 次"当稳定性论证
   stability_via: ["targeted_probe", "mutation_probe", "independent_scenario"]
+  # ---- 全量门禁（Issue #14 本轮追问：**默认全量根本不跑**）----
+  # 去升级口：判重时版本字段怎么算。
+  #   `content`（默认）= 按**受审内容**归一（同一份变更集在不同 revision 下重跑
+  #   → 判为重复）。这才是"同口径"的真实含义：
+  #   若按 `revision` 算，**改一行代码 revision 就变** → 每次都算新口径 →
+  #   每次都放行 → 就变成"每开发一步跑一次 600 多项验证"（用户看到的现象）。
+  #   `revision` = 旧行为（保留是留给"每个提交都必须跑一次"的特殊仓，但**默认不这样**）。
+  repeat_scope: "content"
+  # **不含有测试阶段**的触发事件：这些事件下一律**不得跑全量**（防跨仓污染）。
+  # 评论/目录/定时/触发类事件既没有基线、也没有变更集，跑全量只是纯空烧。
+  blocked_events: ["issue.comment", "pull_request.comment", "issue.open",
+                   "issue.update", "crontab", "api_trigger", "web_trigger"]
+  # 流水线兜底变更的**路径白名单**（最小权限）。
+  # 兜底一旦能被用来"顺手改别的"，就把它变成绕过门禁的后门；
+  # 故只允许改规则文件本身，其余走正常 PR。
+  pipeline_allowlist: ["shared/collab/"]
 
 # ---- 平台计费口径（回答"等待会不会占用 CPU 计费"） ----
 # 依据 CNB 官方文档：/zh/pricing.md、/zh/build/timeout.md、

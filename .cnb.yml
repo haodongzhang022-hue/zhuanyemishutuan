@@ -46,6 +46,21 @@
 #   执行侧**能力降级保守放行**（判不出受影响面就不做增量判重；漏跑比多跑危险）。
 # 组织级分发（v0.10）：`scripts/distribute-collab-rules.sh`（默认 dry-run，`--apply` 才写；
 #   只铺组织级基线，**不覆盖**各仓已有的数值覆写）——各仓库通用。
+# 全量门禁（v0.11 · Issue #14 本轮追问）：**默认全量根本不跑**，不是"默认不跑"。
+#   上一轮只做了 `default_mode: scan`（= **默认值**，不是门禁：调用方显式给
+#   `CNB_SCOPE=full` 就绕过）与 `RunScopeGuard` 判重（判重键含 `revision`，
+#   **每改一行代码 revision 就变 → 每次都算新口径 → 每次都放行**）。
+#   本轮补两道硬闸：
+#   ① `decide_full()` 门禁：`full` 必须同时满足「大版本事实 + 可采信来源
+#      （action / tag / operator，**agent 自述不算**）+ 代码推进类事件」，
+#      否则 `blocked_full` 并给出**可直接跑**的增量命令（拦了但给路）。
+#      ⚠️ 方向与判重相反：判重判不出 → **保守放行**；全量判不出 → **保守拦截**。
+#   ② 去升级口径 `scan.repeat_scope: content`：同一份**受审内容**跨版本只跑一次
+#      （修掉"每开发一步就跑一次 600 多项验证"）。
+#   对外只暴露一条命令 `scripts/ci-dispatch.sh`：不接收"全量"参数，
+#   没有 `run:` 输入 → 恶意/误用输入改不了执行路径。
+#   规则：`shared/collab/*.yaml` 的 `scan.repeat_scope / blocked_events /
+#   pipeline_allowlist`；落地：`collab/full_gate.py` + `collab/platform.py`。
 # 角色定义见 .cnb/settings.yml（秘书· 命名空间）
 # ============================================================
 
@@ -65,7 +80,30 @@ main:
         # "连跑 N 次"当稳定性论证 → blocked_stability + 替代口径
         # （定点/变异探针、独立场景）。规则见 shared/collab/*.yaml。
         - python3 --version || true
-        - ./scripts/ci-incremental-test.sh
+        # **唯一的执行入口**：不接收"全量"参数（全量只能由大版本流程显式触发），
+        # 因此不存在"通过传参绕过全量门禁"的路径。
+        # `utils:params` 只用于**观测**（打印本次拿到的参数），不参与执行。
+        - ./scripts/ci-dispatch.sh
+
+# Issue / PR 评论触发（**只做秘书接待，不做测试**）
+# —— 防跨仓污染的直接堵口：评论类事件**没有基线、也没有变更集**，
+#    在这里跑任何测试（尤其全量回归）都是纯空烧，且会污染所有接了这套配置的仓库。
+.npc_comment_task: &npc_comment_task
+  name: secretary npc comment
+  stages:
+    - name: npc go
+      type: npc:go
+      options:
+        role: "秘书·接待"
+        userPrompt: |
+          这是一次**评论触发的秘书接待**（不是一次验证/回归）。
+          - 日常一律**只跑增量**（变更相关用例 + 受影响面），**不得跑全量**；
+          - 需要判断"能不能跑全量"时用 `full_decision(major_version=…, source=…, event=…)`：
+            只有【大版本事实 + 可采信来源（action/tag/operator）+ 代码推进类事件】
+            三者同时成立才放行，否则会被判 `blocked_full` 并给出可直接跑的增量命令；
+            **不得把"我觉得这是大版本"当事实**（agent 自述不构成凭据）。
+          - 评论/目录/定时/触发类事件**不得**跑全量；
+          - 同一份**受审内容**跨版本只跑一次（去升级口径 `content`）。
 
 # NPC 任务兜底（Issue/PR 评论 @NPC 触发）
 .npc_task: &npc_task
@@ -139,13 +177,13 @@ $:
   api_trigger_probe_resume:
     - *probe_task
   issue.comment@npc:
-    - *npc_task
+    - *npc_comment_task
   pull_request.comment@npc:
-    - *npc_task
+    - *npc_comment_task
   issue.open:
-    - *npc_task
+    - *npc_comment_task
   issue.update:
-    - *npc_task
+    - *npc_comment_task
   vscode:
     - docker:
         image: node:20

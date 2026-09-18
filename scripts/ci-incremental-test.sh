@@ -8,14 +8,19 @@
 #
 # 口径（Issue #14 追问 / 本轮对齐官方）：
 #   - 日常只跑增量（`scan`）；全量（`full`）只在**大版本**；
-#   - 同一口径（范围/版本/受影响面/命令）只跑一次，第 2 次起跳过；
-#   - "连跑 N 次同一命令"当稳定性论证 → 拒绝，改走定点/变异探针/独立场景；
+#   - **全量门禁（本轮加固）**：`CNB_SCOPE=full` **不再等于可以跑**——
+#     必须同时满足"大版本 + 可采信来源 + 代码推进类事件"，否则**按增量改跑**
+#     （拦住空烧全量；用户口径："他不然我们新开发一步，他就要跑一次 600 多次的验证"）；
+#   - 同一**受审内容**（范围/受影响面/命令）只跑一次，**跨版本**也算同一口径
+#     （修掉"每改一行 revision 就变 → 每次都放行"）；
+#   - "连跑 N 次同一命令"当稳定性论证 → 拒绝（不受任何口径字段影响）；
 #   - **能力降级**：算不出受影响面时**保守放行**（判不出就不增量；
 #     漏跑比多跑危险——官方 SCA 增量规则同源）。
 #
 # 用法：
 #   ./scripts/ci-incremental-test.sh                      # 增量（默认）
-#   CNB_SCOPE=full ./scripts/ci-incremental-test.sh       # 全量（仅大版本）
+#   CNB_MAJOR_VERSION=1 CNB_SCOPE=full CNB_TRIGGER_SOURCE=operator \
+#     CNB_EVENT=push ./scripts/ci-incremental-test.sh     # 全量（仅大版本 + 凭据）
 #   CNB_WINDOW_REPEATS=3 ./scripts/ci-incremental-test.sh # 会被拒绝
 # ============================================================
 set -euo pipefail
@@ -25,6 +30,12 @@ PKG="$ROOT/state-secretary"
 
 SCOPE="${CNB_SCOPE:-scan}"
 WINDOW_REPEATS="${CNB_WINDOW_REPEATS:-1}"
+# 全量**凭据**（Issue #14 本轮）：只有可采信来源 + 大版本事实 + 代码推进事件
+# 三者同时成立，`full` 才真的跑；否则**自动改跑增量**（拦了但给路）。
+MAJOR_VERSION="${CNB_MAJOR_VERSION:-}"      # 非空且非 0 → 大版本（可判定事实）
+TRIGGER_SOURCE="${CNB_TRIGGER_SOURCE:-agent_claim}"
+# 触发事件：平台内置变量优先（CI 里由平台给出），否则退化为"不可判定"
+EVENT="${CNB_EVENT:-${CNB_PIPELINE_EVENT:-}}"
 
 # 版本 = 被测提交（判"同一口径"的关键字段之一）
 REVISION="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -42,6 +53,47 @@ BASE_SHA="$(git -C "$ROOT" rev-parse --verify -q "$BASE_REF" 2>/dev/null || true
 CHANGED="$(git -C "$ROOT" diff --name-only "$BASE_REF"..."$REVISION" 2>/dev/null \
   || git -C "$ROOT" show --name-only --pretty=format: "$REVISION" 2>/dev/null \
   || true)"
+
+# ---- 全量门禁（**跑之前先过闸**）：不满足大版本条件 → 自动改跑增量 ----
+# 这道闸放在最前面：`CNB_SCOPE=full` 只是"想跑全量"，**不等于**可以跑。
+if [ "$SCOPE" = "full" ]; then
+  GATE_OUT="$(python3 - "$MAJOR_VERSION" "$TRIGGER_SOURCE" "$EVENT" "$ROOT" <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.join(sys.argv[4], "state-secretary", "src"))
+try:
+    from secretary.collab import decide_full, full_run_eligible
+    from secretary.collab.rules import load_rules
+except Exception as exc:
+    print("ALLOW")
+    print("[full-gate] 无法装载门禁（%s）→ 不因门禁坏了挡住干活" % exc)
+    raise SystemExit(0)
+mv_raw, src, event = sys.argv[1:4]
+rules = load_rules(search_from=os.path.join(sys.argv[4], "state-secretary"))
+mv = mv_raw.strip() not in ("", "0", "false", "False", "no") if mv_raw.strip() else None
+d = decide_full(rules, major_version=mv, source=src or "agent_claim",
+                event=event)
+if d.should_run and d.mode == "full":
+    ev = full_run_eligible(event, blocked_events=rules.blocked_events)
+    if ev["blocked"]:
+        d = decide_full(rules, major_version=False, source=src or "agent_claim",
+                        event=event)
+        d.reason = "%s；%s" % (ev["reason"], d.reason)
+if d.should_run and d.mode == "full":
+    print("ALLOW")
+    print("[full-gate] 大版本 + 可采信来源 + 代码推进事件 → 允许全量")
+else:
+    print("BLOCK")
+    print("[full-gate] action=%s(blocked_full) :: %s" % (d.action, d.reason))
+    print("[full-gate] 改跑增量 → %s" % d.scan_command)
+PYEOF
+)"
+  GATE_VERDICT="$(printf '%s\n' "$GATE_OUT" | head -1)"
+  printf '%s\n' "$GATE_OUT" | tail -n +2
+  if [ "$GATE_VERDICT" != "ALLOW" ]; then
+    echo "[scope=full→scan] 全量门禁拦截：本次**改跑增量**（不跑全量回归）"
+    SCOPE="scan"
+  fi
+fi
 
 if [ "$SCOPE" = "full" ]; then
   echo "[scope=full] 大版本：跑全量（非日常路径）"
@@ -101,18 +153,25 @@ try:
     wr = int(window)
 except ValueError:
     wr = 1
-d = guard.decide(mode=scope, revision=revision, impact=targets,
-                 command=cmd, window_repeats=wr,
-                 base=(base_sha or None), event=event)
+# **去升级口径**（本轮加固）：按"受审内容"判重——同一份变更集在**新版本**下
+# 重跑同样算重复（修掉"每改一行 revision 就变 → 每次都放行"）。
+d = guard.decide_repeat(mode=scope, revision=revision, impact=targets,
+                        command=cmd, window_repeats=wr,
+                        base=(base_sha or None), event=event)
 print("[guard] action=%s :: %s" % (d.action, d.reason))
+print("[guard] 口径去升级=%s（同一受审内容历史版本数=%s）"
+      % (getattr(d, "repeat_scope", "revision"),
+         getattr(d, "content_revisions", 0)))
 if getattr(d, "degraded", False):
     print("[guard] 能力降级 → 保守放行（%s）" % d.degrade_reason)
 if not d.should_run:
+    if d.action == "blocked_stability":
+        print("[guard] **拒绝连跑**：跑法固定，重复跑不产生判别力")
     if d.alternatives:
         print("[guard] 稳定性论证请改用：%s" % ", ".join(d.alternatives))
-    print("[guard] 跳过执行（同一口径重复跑无判别力）")
+    print("[guard] 跳过执行（同一受审内容重复跑无判别力）")
     sys.exit(10)
-guard.record(mode=scope, revision=revision, impact=targets, command=cmd)
+guard.record_repeat(mode=scope, revision=revision, impact=targets, command=cmd)
 print("[guard] 已登记本次执行")
 PYEOF
 )"

@@ -68,6 +68,22 @@ DEFAULT_MAX_IDENTICAL_REPEATS = 1            # 同一口径只跑一次；第 2 
 DEFAULT_REPEAT_KEYS = ["mode", "revision", "impact", "command"]
 DEFAULT_STABILITY_VIA = ["targeted_probe", "mutation_probe", "independent_scenario"]
 
+# ---- 全量门禁（Issue #14 本轮：**默认全量根本不跑**，而不是"默认不跑"）----
+#: 去升级口：判重时版本字段怎么算。`content` = 按**受审内容**归一
+#: （同一份变更集在不同 revision 下重跑 → 判为重复）；`revision` = 旧行为。
+DEFAULT_REPEAT_SCOPE = "content"
+
+#: **不含有测试阶段的触发事件**（这些事件下"全量"是无意义空烧）。
+#: 「一次污染很多仓库」的污染源就是：目录/评论类事件也能触发全量回归。
+DEFAULT_BLOCKED_EVENTS = [
+    "issue.comment", "pull_request.comment", "issue.open",
+    "issue.update", "crontab", "api_trigger", "web_trigger",
+]
+
+#: **流水线兜底变更**允许触碰的路径前缀（最小权限）。
+#: 兜底逻辑一旦被用来"顺手改别的"，就等于把门禁重新放开——故只允许改规则文件。
+DEFAULT_PIPELINE_ALLOWLIST = ["shared/collab/"]
+
 DEFAULT_LOCK_RETRY_DELAY_SEC = 60.0
 DEFAULT_LOCK_PERSISTENT_GRACE_SEC = 180.0
 DEFAULT_MAX_ROUNDS = 3
@@ -215,6 +231,16 @@ class CollabRules:
     allow_stability_repeats: bool = False
     # 稳定性论证的正规替代路径
     stability_via: List[str] = field(default_factory=lambda: list(DEFAULT_STABILITY_VIA))
+    # **去升级口**（Issue #14 本轮追问）：判重时 `revision` 字段怎么算。
+    # `content`（默认）= 按受审内容归一 —— 修掉"每改一行 revision 就变、
+    # 每次都算新口径、于是每次都放行"这个真缺陷。
+    repeat_scope: str = DEFAULT_REPEAT_SCOPE
+    # 不含有测试阶段的触发事件：这些事件下一律**不得跑全量**（防跨仓污染）
+    blocked_events: List[str] = field(
+        default_factory=lambda: list(DEFAULT_BLOCKED_EVENTS))
+    # 流水线兜底变更的路径白名单（最小权限；防"兜底"变成绕过门禁的后门）
+    pipeline_allowlist: List[str] = field(
+        default_factory=lambda: list(DEFAULT_PIPELINE_ALLOWLIST))
     platform: PlatformCostNote = field(default_factory=PlatformCostNote)
     source: str = "default"
     # 规则作用域（organization / repo / default）——一眼看出数值来自哪一级
@@ -290,6 +316,9 @@ class CollabRules:
                 "repeat_keys": list(self.repeat_keys),
                 "allow_stability_repeats": self.allow_stability_repeats,
                 "stability_via": list(self.stability_via),
+                "repeat_scope": self.repeat_scope,
+                "blocked_events": list(self.blocked_events),
+                "pipeline_allowlist": list(self.pipeline_allowlist),
             },
             "platform": self.platform.to_dict(),
         }
@@ -396,6 +425,13 @@ class CollabRules:
             allow_stability_repeats=_as_bool(
                 scan.get("allow_stability_repeats"), False),
             stability_via=_str_list(scan, "stability_via", DEFAULT_STABILITY_VIA),
+            repeat_scope=(
+                scan.get("repeat_scope")
+                if scan.get("repeat_scope") in ("content", "revision")
+                else DEFAULT_REPEAT_SCOPE),
+            blocked_events=_str_list(scan, "blocked_events", DEFAULT_BLOCKED_EVENTS),
+            pipeline_allowlist=_str_list(scan, "pipeline_allowlist",
+                                         DEFAULT_PIPELINE_ALLOWLIST),
             probe_checks=probe_checks,
             platform=PlatformCostNote.from_dict(data.get("platform")),
             source=source,
@@ -630,6 +666,8 @@ _OVERRIDABLE_FIELDS = (
     # 审查范围：日常只跑增量、同口径不重复（Issue #14 追问）
     "scan_default_mode", "max_identical_repeats", "repeat_rerun_on_failure",
     "repeat_keys", "allow_stability_repeats", "stability_via",
+    # 全量门禁（Issue #14 本轮）
+    "repeat_scope", "blocked_events", "pipeline_allowlist",
 )
 
 # 白名单**自检**：新增数值字段若忘了登记进 `_OVERRIDABLE_FIELDS`，覆写会被

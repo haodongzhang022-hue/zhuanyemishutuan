@@ -342,6 +342,41 @@ commit / 受影响面为空），空 impact **本身是一个合法指纹** → 
 - 落地：`collab/run_guard.py`；门面 `run_decision` / `record_run` / `run_repeats_of` /
   `run_scope_overview` / `run_scope_note`；执行入口 `scripts/ci-incremental-test.sh`。
 
+## 2.5 全量门禁（v0.11 新增 · Ref: #14 本轮追问）
+
+> 这里我要求过不跑全量，他怎么还在一直连续跑三次稳定这种事情？…他不然我们新开发一步，
+> 他就要跑一次 600 多次的验证。甚至还要跑三倍，这太过分了。…处理完这个让他合理起来，
+> 我们再通用，不然相当于一次污染了很多仓库。
+
+**根因（两条都是"看起来做了、实际拦不住"）**：
+
+| # | 上一轮的做法 | 为什么没拦住 |
+|---|---|---|
+| 1 | `scan.default_mode: scan` | 是**默认值**，不是**门禁**——显式给 `mode="full"` 直接绕过 |
+| 2 | `RunScopeGuard` 判重 | 比较键含 **`revision`**：**改一行代码 revision 就变** → 次次算新口径 → 次次放行 |
+| 3 | 各事件共用一套流水线 | 评论/目录/定时类事件也跑测试 → 无基线、无变更集，纯空烧 + 跨仓污染 |
+
+**三道硬闸**：
+
+1. **`decide_full()`**：`full` 必须同时满足「大版本事实 + 可采信来源（action/tag/operator）
+   + 代码推进类事件」，否则 `blocked_full` 并给出**可直接跑**的增量命令；
+   **agent 自述不算凭据**（否则"喊一声大版本"就能解锁）。
+2. **去升级口径 `repeat_scope: content`**：按**受审内容**判重（跨版本），
+   修掉"每开发一步重跑一遍"。
+3. **事件侧 + 单入口 + 兜底白名单**：评论类事件走接待任务不做测试；
+   `scripts/ci-dispatch.sh` 不接收全量参数；兜底只允许改 `shared/collab/`。
+
+**⚠️ 方向性**（必须写进角色口径，否则会被"保守"两个字带偏）：
+
+| 判定 | 判不出 | 安全侧 |
+|---|---|---|
+| `run_decision`（跳过重复） | **放行** | 漏跑比多跑危险 |
+| `full_decision`（全量门禁） | **拦截** | 空烧全量比少跑危险 |
+
+- 落地：`collab/full_gate.py` + `collab/platform.py`；
+  门面 `full_decision` / `full_run_eligible` / `pipeline_change_allowed` /
+  `full_gate_note` / `decide_repeat` / `record_repeat` / `content_repeats_of`。
+
 ## 3. 角色职责与交接卡
 
 | 角色 | 职责 | 交接/回转条件 |

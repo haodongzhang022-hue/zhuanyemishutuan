@@ -42,6 +42,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# `full_gate` 需要复用本模块的归一化/判红工具（单一语义源），
+# 故此处**延迟导入**避免成环（与 `platform`/`probe` 的既有处理一致）。
 from .platform import impact_available
 from .rules import CollabRules
 
@@ -104,6 +106,12 @@ def _is_green(verdict: Any) -> bool:
     return any(g in v for g in _GREEN)
 
 
+def _repeat_scope_of(rules: "CollabRules") -> str:
+    """当前生效的**去升级口**（`content` / `revision`）；导入延迟以避成环。"""
+    from .full_gate import repeat_scope_of
+    return repeat_scope_of(rules)
+
+
 @dataclass
 class RunRecord:
     """一次执行的留痕（用于后续判重）。"""
@@ -158,6 +166,10 @@ class RunDecision:
     # 不静默跳过（漏跑比多跑危险）。
     degraded: bool = False
     degrade_reason: str = ""
+    # 去升级口径留痕（Issue #14 本轮追问）：`content` / `revision`，
+    # 以及"同一受审内容下出现过的历史 revision 数"（>1 = 改一行就重跑过一次）。
+    repeat_scope: str = "revision"
+    content_revisions: int = 0
 
     @property
     def should_run(self) -> bool:
@@ -179,6 +191,8 @@ class RunDecision:
             "alternatives": list(self.alternatives),
             "degraded": self.degraded,
             "degrade_reason": self.degrade_reason,
+            "repeat_scope": self.repeat_scope,
+            "content_revisions": self.content_revisions,
         }
 
 
@@ -197,6 +211,12 @@ class RunScopeGuard:
         self.data_dir = data_dir
         self._lock = threading.Lock()
         self._records: Dict[str, RunRecord] = {}
+        # 受审内容台账（Issue #14 本轮）：**跨 revision** 统计"同一份变更集跑了几遍"。
+        # 与 `_records` 并存是刻意的——`_records` 回答"这个版本跑过几次"，
+        # `_content_records` 回答"这份**内容**被跑了几遍"（后者才是"每开发一步
+        # 重跑一遍"的真面目）。
+        self._content_records: Dict[str, RunRecord] = {}
+        self._content_revisions: Dict[str, set] = {}
         self._load()
 
     # ------------------------------------------------------------------
@@ -247,6 +267,10 @@ class RunScopeGuard:
             wr = 1
         # 判据只看"想连跑同一口径"本身，**不因上轮不绿而放行**——
         # "上一轮不绿"是"允许重跑一次同口径"的例外（见 ③），不是"允许连跑 3 次"的理由。
+        #
+        # 本轮加固（Issue #14）：这条判定**不受任何口径字段影响**——
+        # 它压根不是一个"可以靠换口径绕过"的东西，所以放在最前面、只做**参数合法性**
+        # 的宽松处理（非法值按 1 处理，不因参数写错就拦），其余一律以 `wr` 为准。
         if wr > 1 and not rules.allow_stability_repeats:
             return RunDecision(
                 action=BLOCKED_STABILITY,
@@ -320,6 +344,90 @@ class RunScopeGuard:
         )
 
     # ------------------------------------------------------------------
+    # 重复执行（**去升级**口径：Issue #14 本轮）
+    # ------------------------------------------------------------------
+
+    def decide_repeat(self, mode: str = "", revision: Any = "",
+                      impact: Any = "", command: str = "",
+                      last_verdict: Any = "", window_repeats: int = 1,
+                      base: Optional[str] = None, event: str = "") -> RunDecision:
+        """**该不该跑**——按"受审内容"而非"每次 revision"判重（去升级）。
+
+        与 `decide()` 的差别只有一处，但正是用户看到的现象的根因：
+
+        | 口径 | 比较键 | 后果 |
+        |---|---|---|
+        | `decide()`（旧） | 范围 + **版本** + 受影响面 + 命令 | 每改一行 → revision 变 → 每次都算新口径 → **每开发一步跑一次** |
+        | `decide_repeat()`（新） | 范围 + 受影响面 + 命令 + **受审内容** | 同一份变更集在新提交下重跑 → 判为重复 → **跳过** |
+
+        去升级由规则包 `scan.repeat_scope` 控制（默认 `content`；设成 `revision`
+        即退回旧行为——保留这条是因为**方向性**：若某仓的业务确实"每个提交都必须跑一次"，
+        它可以显式选择，但**默认不这样**）。
+        """
+        from .full_gate import content_key_of, repeat_scope_of
+        decision = self.decide(
+            mode=mode, revision=revision, impact=impact, command=command,
+            last_verdict=last_verdict, window_repeats=window_repeats,
+            base=base, event=event)
+        scope = repeat_scope_of(self.rules)
+        decision.repeat_scope = scope
+        if scope != "content":
+            return decision
+        eff_mode = mode if mode in ("scan", "full") else self.rules.scan_default_mode
+        ckey = content_key_of(eff_mode, impact, command)
+        with self._lock:
+            revisions = sorted(self._content_revisions.get(ckey, set()))
+            crec = self._content_records.get(ckey)
+        decision.content_revisions = len(revisions)
+        if decision.action != RUN:
+            return decision
+        # 同一份受审内容**已跑过**且这次换了个 revision → 正是"改一行重跑一遍"
+        if crec is not None and _norm_revision(revision) != crec.revision:
+            return RunDecision(
+                action=SKIP_DUPLICATE,
+                reason=(f"受审内容未变（受影响面/命令一致）但版本变了（{crec.revision} → "
+                        f"{_norm_revision(revision)}）：跑法固定，新版本不构成新口径"
+                        f"（同一受审内容只跑一次）"),
+                key=decision.key, prior_count=crec.count + 1,
+                max_identical_repeats=1,
+                alternatives=list(self.rules.stability_via),
+                repeat_scope=scope, content_revisions=max(1, len(revisions)),
+            )
+        return decision
+
+    def record_repeat(self, mode: str = "", revision: Any = "",
+                      impact: Any = "", command: str = "",
+                      verdict: str = "") -> RunRecord:
+        """登记一次**实际执行**（同时更新"受审内容 → 历史 revision 数"台账）。"""
+        from .full_gate import content_key_of
+        rec = self.record(mode=mode, revision=revision, impact=impact,
+                          command=command, verdict=verdict)
+        eff_mode = mode if mode in ("scan", "full") else self.rules.scan_default_mode
+        ckey = content_key_of(eff_mode, impact, command)
+        rev = _norm_revision(revision)
+        with self._lock:
+            self._content_revisions.setdefault(ckey, set())
+            if rev:
+                self._content_revisions[ckey].add(rev)
+            prior = self._content_records.get(ckey)
+            self._content_records[ckey] = RunRecord(
+                key=ckey, mode=eff_mode, revision=rev,
+                impact=rec.impact, command=rec.command, verdict=rec.verdict,
+                count=(prior.count + 1) if prior else 1)
+        self._persist()
+        return rec
+
+    def content_repeats_of(self, mode: str = "", impact: Any = "",
+                           command: str = "") -> int:
+        """同一份**受审内容**已跑了几遍（跨 revision 累计）。"""
+        from .full_gate import content_key_of
+        eff_mode = mode if mode in ("scan", "full") else self.rules.scan_default_mode
+        ckey = content_key_of(eff_mode, impact, command)
+        with self._lock:
+            rec = self._content_records.get(ckey)
+            return rec.count if rec else 0
+
+    # ------------------------------------------------------------------
     # 留痕
     # ------------------------------------------------------------------
 
@@ -358,14 +466,24 @@ class RunScopeGuard:
         """口径台账总览：哪些口径跑了几次（**重复加倍的会显出来**）。"""
         with self._lock:
             recs = [r.to_dict() for r in self._records.values()]
+        with self._lock:
+            content = [r.to_dict() for r in self._content_records.values()]
+            revs = {k: sorted(v) for k, v in self._content_revisions.items()}
         recs.sort(key=lambda r: (-r["count"], r["key"]))
         over = [r for r in recs if r["count"] > self.rules.max_identical_repeats]
+        for row in content:
+            row["revisions"] = revs.get(row["key"], [])
+            row["revision_count"] = len(row["revisions"])
+        content.sort(key=lambda r: (-r["count"], r["key"]))
         return {
             "max_identical_repeats": self.rules.max_identical_repeats,
             "allow_stability_repeats": self.rules.allow_stability_repeats,
+            "repeat_scope": _repeat_scope_of(self.rules),
             "total": len(recs),
             "over_budget": over,
             "records": recs,
+            # 跨 revision 的"同一受审内容"视图：**改一行重跑一遍**会在这里显形
+            "content_records": content,
             "guidance": (
                 "同一口径（范围/版本/受影响面/命令）只跑一次；"
                 "想论证稳定性请换口径（定点/变异探针、独立场景），不要连跑同一命令"
@@ -395,11 +513,21 @@ class RunScopeGuard:
             return
         raw = data.get("records")
         items = raw if isinstance(raw, list) else []
+        citems = data.get("content_records")
+        crevs = data.get("content_revisions")
         with self._lock:
             for item in items:
                 rec = RunRecord.from_dict(item)
                 if rec is not None:
                     self._records[rec.key] = rec
+            for item in (citems if isinstance(citems, list) else []):
+                crec = RunRecord.from_dict(item)
+                if crec is not None:
+                    self._content_records[crec.key] = crec
+            if isinstance(crevs, dict):
+                for k, v in crevs.items():
+                    if isinstance(k, str) and isinstance(v, list):
+                        self._content_revisions[k] = {str(x) for x in v}
 
     def _persist(self) -> None:
         path = self._path()
@@ -409,7 +537,13 @@ class RunScopeGuard:
             import json
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with self._lock:
-                payload = {"records": [r.to_dict() for r in self._records.values()]}
+                payload = {
+                    "records": [r.to_dict() for r in self._records.values()],
+                    "content_records": [r.to_dict()
+                                        for r in self._content_records.values()],
+                    "content_revisions": {k: sorted(v) for k, v
+                                          in self._content_revisions.items()},
+                }
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

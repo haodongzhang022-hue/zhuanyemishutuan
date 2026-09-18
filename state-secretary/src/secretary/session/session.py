@@ -37,12 +37,17 @@ from ..handoff.models import HandoffCard
 from ..loop import LoopDecision, LoopGuard
 from ..collab import (
     TWO_WAY_SPLIT_NOTE,
+    FullGateDecision,
+    SOURCE_AGENT_CLAIM,
     await_eligible,
     await_key_for,
     capability_report,
     impact_available,
     platform_report,
     resolve_driver,
+    decide_full,
+    full_run_eligible,
+    pipeline_change_allowed,
     cron_expr_for,
     CollabRules,
     CheckpointProbe,
@@ -1590,6 +1595,96 @@ class SecretarySession:
     def review_scope_commands(self, **kwargs) -> Dict[str, str]:
         """按范围档位给出构建/测试执行口径（``scan`` 档明确不跑全量）。"""
         return scan_commands(self.review_scope(**kwargs))
+
+    # ------------------------------------------------------------------
+    # 全量门禁（Issue #14 本轮追问：**默认全量根本不跑**）
+    # ------------------------------------------------------------------
+
+    def full_decision(
+        self,
+        major_version: Optional[bool] = None,
+        tags: Any = None,
+        source: str = SOURCE_AGENT_CLAIM,
+        impact: Any = None,
+        command: str = "",
+        event: str = "",
+        tests_dir: str = "tests/",
+    ) -> FullGateDecision:
+        """**能不能跑全量**：只有大版本（且来源可采信、事件为代码推进类）才放行。
+
+        与 `run_decision()` 的**方向相反**，两者不可混用：
+
+        - `run_decision`（跳过重复）：判不出 → **保守放行**（宁可多跑，不可漏跑）；
+        - `full_decision`（全量门禁）：判不出 → **保守拦截**（宁可少跑全量，
+          不可空烧全量构建/测试）。
+
+        `major_version` 是**可判定事实**：`True`/`False`/`None`（不知道）。
+        **不要把 agent 的自述当事实**——自述走 `source="agent_claim"`，
+        门禁会直接拒（否则"谁喊一声大版本就能解锁全量"）。
+        拦截时会给出**可直接跑的增量命令**（`scan_command`），拦了但给路。
+        """
+        # 事件侧门禁在 `decide_full` 内部完成（三条件的一次性判定），
+        # 门面不再做二次改写——避免"两层各判一遍、口径可能不一致"。
+        return decide_full(
+            self.collab_rules, major_version=major_version, tags=tags,
+            source=source, impact=impact, command=command, event=event,
+            tests_dir=tests_dir)
+
+    def full_run_eligible(self, event: str = "") -> Dict[str, Any]:
+        """只回答"这个事件能不能跑全量"（不涉及大版本判定）。"""
+        return full_run_eligible(
+            event, blocked_events=self.collab_rules.blocked_events)
+
+    def pipeline_change_allowed(self, changed_paths: Any,
+                                allowlist: Any = None) -> Dict[str, Any]:
+        """流水线兜底变更的**路径白名单**校验（最小权限；兜底不是后门）。"""
+        return pipeline_change_allowed(
+            changed_paths,
+            allowlist=(allowlist if allowlist is not None
+                       else self.collab_rules.pipeline_allowlist))
+
+    def full_gate_note(self) -> str:
+        """一行口径（评论/文档/角色提示词共用）：**默认全量不跑，只有大版本才跑**。"""
+        r = self.collab_rules
+        return (f"日常一律增量（默认 {r.scan_default_mode}）；**全量只在大版本**，"
+                f"且须由可采信来源（大版本 action / 标签 / 人工指令）判定；"
+                f"评论/目录/定时/触发类事件**不得**跑全量；"
+                f"去升级口 {r.repeat_scope}（同一份受审内容跨版本只跑一次）")
+
+    def decide_repeat(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        last_verdict: str = "",
+        window_repeats: int = 1,
+        base: Optional[str] = None,
+        event: str = "",
+    ) -> RunDecision:
+        """**重复执行判定（去升级口径）**：同一份受审内容跨版本重跑 → 跳过。
+
+        与 `run_decision()` 的差别只在 `revision` 怎么算：`content` 档下
+        版本变化**不**构成新口径（修掉"每改一行代码就重跑一遍 600 多项"）。
+        """
+        return self.run_guard.decide_repeat(
+            mode=mode, revision=revision, impact=impact, command=command,
+            last_verdict=last_verdict, window_repeats=window_repeats,
+            base=base, event=event)
+
+    def record_repeat(self, mode: str = "", revision: str = "",
+                      impact: Any = None, command: str = "",
+                      verdict: str = ""):
+        """登记一次实际执行（同时更新"受审内容 → 历史版本数"台账）。"""
+        return self.run_guard.record_repeat(
+            mode=mode, revision=revision, impact=impact, command=command,
+            verdict=verdict)
+
+    def content_repeats_of(self, mode: str = "", impact: Any = None,
+                           command: str = "") -> int:
+        """同一份**受审内容**已跑了几遍（跨版本累计）。"""
+        return self.run_guard.content_repeats_of(
+            mode=mode, impact=impact, command=command)
 
     # ------------------------------------------------------------------
     # 同口径重复执行守卫（Issue #14 本次追问：只跑增量、不连跑同一口径）

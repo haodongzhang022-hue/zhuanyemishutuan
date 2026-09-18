@@ -1,6 +1,6 @@
 # agent 协同规则（全局 · 跨仓库）
 
-> version: v0.2 · Ref: #14 追问（三点确认）
+> version: v0.3 · Ref: #14 追问（三点确认 + **全量门禁**）
 > 载体：`shared/collab/collab-rules.yaml`（规则包）＋ `state-secretary/src/secretary/collab/`（解析执行）
 > 定位：**agent ↔ agent 的协同礼仪**，与具体仓库业务无关 → **一处定义、全域生效**
 
@@ -27,6 +27,7 @@
 | 循环熔断 | `loop.max_rounds`=3 / `max_advisory_fix_rounds`=1 / `max_total_rounds`=5 / `max_stall_repeats`=2 | §2.1 |
 | 审查范围 | `scan.major_version_tags` / `full_scan_keywords` / `scan_keywords` | 日常只审变化，全量只在大版本 |
 | 增量执行 | `scan.default_mode` / `max_identical_repeats` / `repeat_keys` / `allow_stability_repeats` / `stability_via` | §2.4（**同一口径只跑一次**；禁连跑当稳定性论证） |
+| **全量门禁** | `scan.repeat_scope` / `blocked_events` / `pipeline_allowlist` | §2.5（**默认全量根本不跑**；去升级口径；事件侧禁跑；兜底白名单） |
 | 探测 | `probe.*` | §4.1（非轮询检查点、固定 `*/5`、落点分工） |
 | 计费口径 | `platform.*` | §4（等待不计 CPU） |
 
@@ -67,6 +68,82 @@
 3. 同口径次数 < 上界 → `run`；
 4. 达上界 + 上一轮**明确红** → `run`（红→修→再跑有新信息）；
 5. 达上界 + 其余（含**没给结论**）→ `skip_duplicate`。
+
+### 2.5 全量门禁：**默认全量根本不跑**（v0.3 新增）
+
+> 这里我要求过不跑全量，他怎么还在一直连续跑三次稳定这种事情？…他不然我们新开发一步，
+> 他就要跑一次 600 多次的验证。甚至还要跑三倍，这太过分了。…处理完这个让他合理起来，
+> 我们再通用，**不然相当于一次污染了很多仓库**，那不更完蛋了。
+
+**先回答"是我们新配置的那个规则现在有问题吗"**：规则本身没错，但**只做了一半**——
+是"默认值"，不是"门禁"；而且判重的比较键**含 revision**：
+
+| 上一轮的做法 | 为什么没拦住 | 本轮硬闸 |
+|---|---|---|
+| `scan.default_mode: scan` | 只是**默认值**：调用方显式给 `mode="full"`（"跑个全量回归验证一下"）就直接绕过 | `decide_full()`：`full` 必须过**三重条件**，否则 `blocked_full` |
+| `RunScopeGuard` 判重 | 比较键含 **`revision`**：**每改一行代码 revision 就变** → 每次都算"新口径" → 每次都放行 | 去升级口径 `repeat_scope: content`：按**受审内容**判重（**跨版本**） |
+| `.cnb.yml` 各事件共用一套 | 评论/目录/定时类事件**也**触发测试 → 没有基线、没有变更集，纯空烧 | `full_run_eligible()`：这些事件**一律不得跑全量** |
+
+#### 三道硬闸
+
+**① 全量三重条件**（`decide_full`，缺一不可）
+
+| 条件 | 判定依据 | 说明 |
+|---|---|---|
+| **大版本事实** | `major_version=True` **或** 大版本标签 | `None`（不知道）→ **拦** |
+| **可采信来源** | `action` / `tag` / `operator` | `agent_claim`（**agent 自述**）→ **拦**：否则"谁喊一声大版本就能解锁全量" |
+| **代码推进类事件** | 不在 `blocked_events`（评论/目录/定时/触发） | 事件不可判定 → **拦** |
+
+拦截时**必须给出可直接跑的增量命令**（`scan_command`）——拦了但给路，
+避免"被拦住之后又绕回全量"。
+
+**② 去升级口径**（`repeat_scope`，默认 `content`）
+
+| 档 | 比较键 | 后果 |
+|---|---|---|
+| `content`（默认） | 范围 + **受影响面** + 命令 | 同一份变更集在**新版本**下重跑 → **判为重复 → 跳过** |
+| `revision`（旧） | 范围 + **版本** + 受影响面 + 命令 | 改一行代码 = 新口径 → 每次放行（就是用户看到的现象） |
+
+保留 `revision` 档是因为**方向性**：若某仓业务确实"每个提交都必须跑一次"，可以显式选它，
+但**默认不这样**。
+
+**③ 事件侧 + 单入口 + 兜底白名单**
+
+- 评论/目录/定时/触发事件 → `.cnb.yml` 里走**秘书接待**任务（**不做测试**）；
+- **唯一执行入口** `scripts/ci-dispatch.sh`：**不接收"全量"参数**，
+  因此不存在"通过传参绕过门禁"的路径（也没有"拿输入拼命令"的注入面）；
+- 流水线兜底变更只允许碰 `pipeline_allowlist`（默认 `shared/collab/`），
+  绝对路径 / `..` 穿越 / 改源码一律拒——**兜底不是后门**。
+
+#### ⚠️ 方向性：门禁与判重**方向相反**，不可混用
+
+| 判定 | 判不出时 | 取的安全侧 |
+|---|---|---|
+| 跳过重复（`run_decision`） | **放行** | 宁可多跑，不可漏跑 |
+| 全量门禁（`full_decision`） | **拦截** | 宁可少跑全量，不可空烧全量回归 |
+
+两者混用过的后果，正是"每开发一步就跑一次 600 多项全量验证"。
+
+#### 落地
+
+- 代码：`collab/full_gate.py`（`FullGateDecision` / `decide_full` / `incremental_command`）、
+  `collab/platform.py`（`full_run_eligible` / `pipeline_change_allowed`）、
+  `collab/run_guard.py`（`decide_repeat` / `record_repeat` / `content_repeats_of`）
+- 门面：`full_decision` / `full_run_eligible` / `pipeline_change_allowed` /
+  `full_gate_note` / `decide_repeat` / `record_repeat` / `content_repeats_of`
+- 执行入口：`scripts/ci-dispatch.sh` → `scripts/ci-incremental-test.sh`
+- 规则：`shared/collab/*.yaml` 的 `scan.repeat_scope / blocked_events / pipeline_allowlist`
+
+#### 端到端实测
+
+| 调用 | 结果 |
+|---|---|
+| `./scripts/ci-dispatch.sh`（默认） | `run` → **601 passed**（只跑变更相关，非全量） |
+| 再调一次（同受审内容） | `skip_duplicate` → **跳过** |
+| `CNB_SCOPE=full`（无凭据） | `blocked_full` → **改跑增量** 601 passed |
+| `CNB_SCOPE=full` + 大版本 + `operator` + `push` | 允许 → 684 passed（全量，大版本专用） |
+| `CNB_WINDOW_REPEATS=3`（想连跑三次） | `blocked_stability` → **跳过** |
+| 换受影响面（真新工作） | `run` → 正常放行 |
 
 **"没给结论 ≠ 跑红了"**：这是实现中抓到的真缺陷——原用 `not _is_green(...)`
 把"未知/空"也当成红，等于**默认放行**（台账里只要没结论，同口径就能无限重跑）。
