@@ -17,8 +17,17 @@
 #   形成检查点 → 判断检查点 → 锁/状态变化（cnb:resolve）或到点（平台 crontab）再触发；
 #   最多 6 次（= 等待阶梯档位数），用尽即停止自动挂账、交回人工。**永不本地 sleep**。
 #   落地：state-secretary/src/secretary/collab/probe.py（CheckpointProbe）
-#   平台落点：cnb:await（首选，零占用）/ crontab（长等待，≥5min，平台代跑）/
+#   平台落点：cnb:await（**≤5min**，零占用）/ crontab（**>5min**，平台代跑）/
 #             api_trigger（外部 webhook 再跑）/ 交回人工（resume_required）
+# 三点已确认（v0.8 · Issue #14：用户「好的，做吧，都做」）：
+#   ① 落点分工**固定不可混用**：≤5min 挂 cnb:await、>5min 交 crontab；
+#      **不存在"一律挂 await"**——长等待挂在单个 await 上等于押注对端一定会 resolve，
+#      对端不 resolve（人没编辑完/外部系统不回调）就是死等；
+#   ② crontab 间隔**固定 */5 一档扫**，**不随阶梯档位放大**（旧 */6、*/10 作废）：
+#      与阶梯时间表解耦——阶梯回答"我们何时再看"，cron 只回答"平台多久代跑一次"；
+#   ③ 这套 probe 口径在**组织级共享**（shared/collab/organization.yaml，全组织一份），
+#      仓库级 shared/collab/collab-rules.yaml **只覆写数值**；跨仓接力**只传判定**，
+#      接收方按同一份规则出同一套动作（dispatch_probe_event_shared），不按本地会话号重算
 # 角色定义见 .cnb/settings.yml（秘书· 命名空间）
 # ============================================================
 
@@ -57,8 +66,12 @@ main:
             采集轻量事实并判定；③ 按 `dispatch_probe_event()` 的落点执行下一步。
           - 判定只看**可判定事实**（锁在不在 / 版本变没变 / 我方还等不等），
             **不看自述、不做推测**；判不出就保持等待，不误判为"已完成"。
-          - 仍未满足 → 挂 `cnb:await` 或交 `crontab`；条件满足 → 触发一次真正干活的
-            流水线；预算用尽（最多 6 次）→ 停止自动挂账、交回人工。
+          - 仍未满足 → **按固定分工**挂 `cnb:await`（≤5min）或交 `crontab`（>5min，
+            **固定 `*/5` 一档扫**）；条件满足 → 触发一次真正干活的流水线；
+            预算用尽（最多 6 次）→ 停止自动挂账、交回人工。
+          - **跨仓接力只传判定**（wait/proceed/release/unknown），接收方按组织级同一份规则
+            算落点（`dispatch_probe_event_shared()`），**不按自己的本地会话号重算**；
+            判不出/非法判定一律 `unknown` → 继续等，**不得当成放行**。
           - **严禁本地 sleep / 空转轮询**（等待一律走平台挂起语义，否则按 CPU 核时计费）。
 
 # 「等锁」的零占用等待：`cnb:await` 挂起，由对端 `cnb:resolve` 在锁释放时唤醒。
@@ -84,6 +97,14 @@ main:
 
 # $ 节点：仓库级事件绑定 + 云原生开发环境声明
 $:
+  # **平台定时任务（crontab）一档扫**：固定 `*/5`（= 平台 5 分钟下限），
+  # 承载"长等待(>5min)交平台代跑一次探测"——平台才是那个"不睡觉的进程"。
+  # 口径固定：不随等待阶梯档位放大（否则换阶梯就改了平台的代跑节奏）。
+  crontab:
+    - cron: "*/5 * * * *"
+      # 仅支持**明确单一分支**（平台约束）
+      branch: main
+      event: api_trigger_probe_check
   # 外部 webhook / 平台定时任务驱动的**再触发入口**（承载"检查点再跑"）
   api_trigger_probe_check:
     - *probe_task

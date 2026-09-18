@@ -47,13 +47,20 @@ npc:
         - 锁聚合（v0.5 · Issue #14 追问）：域内**所有锁统一登记在台账**，用 `locks_overview()`
           一眼看清「哪里要避开」（谁锁的、锁什么、还有多久）；**别遗留锁一直不打开**，
           过期未处理的用 `sweep_locks()` 兜底回收；排除阻塞不必靠测试去试
-        协同规则（v0.6 · Issue #14 追问）：等待/锁/熔断/审查范围/计费口径属**全局跨仓规则**
-          （`shared/collab/collab-rules.yaml`），`collab_status()` 一眼看清当前生效值；
+        协同规则（v0.6 · Issue #14 追问）：等待/锁/熔断/审查范围/计费口径属**全局跨仓规则**，
+          层级为 **组织级 `shared/collab/organization.yaml`（全组织一份）→ 仓库级
+          `shared/collab/collab-rules.yaml`（只覆写数值）**；`collab_status()` 一眼看清
+          当前生效值与来源层级（`rules_scope` / `rules_chain`）；
           域内差异**只改数值不改语义**，避免各仓各写一套导致行为漂移
         检查点探测（v0.7 · Issue #14 追问）：等锁/等版本**不靠轮询**，改为**检查点**——
           `create_checkpoint()` 登记 → `probe_checkpoint()` 到点判定 → 按
           `dispatch_probe_event()` 落到平台语义；`checkpoints_overview()` 一眼看清
           「还剩几次探测、下一次等多久、挂在哪」；**最多 6 次**，用尽即交回人工
+        三点已确认（v0.8）：① **落点分工固定**——≤5min 挂 `cnb:await`、>5min 交 `crontab`，
+          **不存在"一律挂 await"**（长等待挂单个 await = 押注对端一定 resolve，不 resolve 即死等）；
+          ② `crontab` 间隔**固定 `*/5` 一档扫**，不随阶梯档位放大（与阶梯时间表解耦）；
+          ③ 这套 probe 口径在**组织级共享**（跨仓同一份），仓库级只能改数值——
+          跨仓接力**只传判定字符串**，接收方用 `dispatch_probe_event_shared()` 出同一套动作
     # ④ 秘书·会话（每个 Issue/PR/对话的独立秘书 · 责任到 agent）
     - name: "秘书·会话"
       slogan: "一 Issue 一秘书，独立环境、提示词稳定、缓存命中优先。"
@@ -74,14 +81,20 @@ npc:
         - **检查点探测**（v0.7 · Issue #14 追问）：**不要轮询**。等锁/等版本这样做：
           ① `create_checkpoint(key, kind="lock", scope=<锁键>, holder=<等谁>)` 建检查点
           （**幂等**，重复遇到不重建、不重置预算）；
-          ② 短等待(≤5min) 挂 `cnb:await`（零占用，对端 `cnb:resolve` 唤醒）、
-          长等待(>5min) 交**平台定时任务 crontab** 到点代跑——**平台才是那个不睡觉的进程**；
+          ② 落点**固定分工、不混用**：短等待(≤5min) 挂 `cnb:await`（零占用，对端
+          `cnb:resolve` 唤醒）；长等待(>5min) 交**平台定时任务 crontab** 到点代跑
+          ——**平台才是那个不睡觉的进程**。**没有"一律挂 await"这个选项**：
+          长等待挂在单个 await 上就是押注对端一定会 resolve，不 resolve 即死等；
+          `crontab` 用**固定 `*/5` 一档扫**（不随阶梯档位放大）；
           ③ 到点 `probe_checkpoint(key)` 判定：`proceed`→继续干活；`wait`→再挂；
           `unknown`→**继续等（不得当成放行）**；`our_need_satisfied=False`→**放锁不再等**；
           ④ **最多 6 次**（= 等待阶梯档位数），用尽即 `resume_required` 停止自动挂账；
           ⑤ 判定只看**可判定事实**（锁快照/版本号/事件信号），**不看自述**；
           ⑥ 外部 webhook / 其他仓库用 `cnb:apply` / `cnb:trigger` 触发
-          `api_trigger_probe_check` 再跑（这就是"webhook 触发再跑"的落地）
+          `api_trigger_probe_check` 再跑（这就是"webhook 触发再跑"的落地）；
+          ⑦ **跨仓接力只传判定**（`wait`/`proceed`/`release`/`unknown`），
+          接收方按**组织级同一份规则**算落点（`dispatch_probe_event_shared()`），
+          **不按自己的本地会话号重算**；判不出/非法判定一律 `unknown` → 继续等
     # ⑤ 秘书·协作（执行角色扩展位：开发/评审/测试/交付）
     - name: "秘书·开发"
       slogan: "解耦式模块开发，dev-standard 规范强约束。"
@@ -125,8 +138,9 @@ npc:
         - 到点做**延迟后检测**（`retry_review()`）；其他事做完回来收尾用
           `complete_deferred_review()`，只有真的落盘成功才放锁
         - 检查点探测（v0.7 · Issue #14 追问）：**不轮询**——等锁用
-          `create_checkpoint(kind="lock")` + `probe_checkpoint()`，落点交平台
-          （`cnb:await` / `crontab`）；**最多 6 次**，用尽交回人工；判不出（`unknown`）
+          `create_checkpoint(kind="lock")` + `probe_checkpoint()`，落点交平台且**固定分工**
+          （≤5min `cnb:await` / >5min `crontab` **固定 `*/5`**，不可混用）；
+          **最多 6 次**，用尽交回人工；判不出（`unknown`）
           一律继续等，不得当成"锁已释放"抢写
     - name: "秘书·测试"
       slogan: "开发自评没问题才接单，联调·性能·安全·E2E——信号灯亮起才放行。"
@@ -149,4 +163,5 @@ npc:
           等待走平台挂起语义，本地空转才按 CPU 核时计费
         - 检查点探测（v0.7 · Issue #14 追问）：测试等构建/等锁同理——用
           `create_checkpoint()` 建检查点，`probe_checkpoint()` 判定后再继续；
+          落点**固定分工**（≤5min await / >5min crontab **固定 `*/5`**），不轮询；
           **最多 6 次**；不要写"循环查状态"的脚本（那是轮询）

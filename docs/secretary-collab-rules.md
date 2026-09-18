@@ -1,6 +1,6 @@
 # agent 协同规则（全局 · 跨仓库）
 
-> version: v0.1 · Ref: #14 追问
+> version: v0.2 · Ref: #14 追问（三点确认）
 > 载体：`shared/collab/collab-rules.yaml`（规则包）＋ `state-secretary/src/secretary/collab/`（解析执行）
 > 定位：**agent ↔ agent 的协同礼仪**，与具体仓库业务无关 → **一处定义、全域生效**
 
@@ -26,11 +26,19 @@
 | 锁 | `locks.retry_delay_sec` / `persistent_grace_sec` / `registry_shared` | 延迟首档 10s；重触发转持续锁；所有锁进一本台账 |
 | 循环熔断 | `loop.max_rounds`=3 / `max_advisory_fix_rounds`=1 / `max_total_rounds`=5 / `max_stall_repeats`=2 | §2.1 |
 | 审查范围 | `scan.major_version_tags` / `full_scan_keywords` / `scan_keywords` | 日常只审变化，全量只在大版本 |
+| 探测 | `probe.*` | §4.1（非轮询检查点、固定 `*/5`、落点分工） |
 | 计费口径 | `platform.*` | §4（等待不计 CPU） |
 
-**装载顺序**（先近后远，都找不到则内置默认）：
-显式 `rules_path` → 环境变量 `CNB_COLLAB_RULES` → 从会话数据根逐级向上找
-`shared/collab/collab-rules.yaml` → 内置默认。
+**装载层级**（**已确认口径 #3**，先组织后仓库，都找不到则内置默认）：
+
+| 层级 | 载体 | 权限 |
+|---|---|---|
+| **组织级**（跨仓库一份） | `shared/collab/organization.yaml` / `CNB_ORG_COLLAB_RULES` / `CNB_ORG_SHARED_DIR` | 定义**基线与语义** |
+| 仓库级 | `shared/collab/collab-rules.yaml` / `CNB_COLLAB_RULES` | **只覆写数值**，语义不可改 |
+| 内置默认 | 代码兜底 | 不抛、不静默乱读 |
+
+`load_rules()` 返回的 `scope` 标明生效层级、`chain` 留痕"哪一级给了哪些域"——
+一眼看出"这套数值是全组织共用同一份，还是被本仓覆写过"。
 
 > 显式传参（如 `SecretarySession(retry_delay_sec=…)`）**优先于**规则包——
 > 调用方有明确口径时以调用方为准；不传才取规则包。
@@ -115,6 +123,24 @@ probe:
 平台代跑）、`cnb:apply`/`cnb:trigger` 与 OPENAPI `StartBuild`（外部 webhook 再跑）。
 详见 `docs/secretary-gate-workflow.md` §2.2.2。
 
+**接线**：长等待由 `.cnb.yml` 顶层的 `crontab` 配置真正接到平台
+（`cron: "*/5 * * * *"` + `event: api_trigger_probe_check`；平台约束：仅支持明确
+单一分支，故 `branch: main`）。**固定 `*/5` 一档扫**，与阶梯时间表解耦。
+
+### 4.2 三点确认（v0.2 · 已固化）
+
+| # | 确认项 | 固化口径 |
+|---|---|---|
+| 1 | 落点分工「**≤5min 挂 await，>5min 交 crontab**」 | **硬口径**：按 `probe.await_max_sec`（默认 300s）自动分工；**不存在「一律挂 await」的回退路径**——长等待挂单个 await 就是"把到点必看押在对端一定会 resolve 上"，对端不 resolve 即死等。两个落点**互斥不混用**（await 行不带 cron，crontab 行必带） |
+| 2 | `cron` 间隔「**固定 `*/5` 一档扫**」 | 所有平台定时探测点统一 `*/5 * * * *`，**不随阶梯档位放大**（旧口径 `*/6`、`*/10` 作废）。与阶梯时间表**解耦**：阶梯回答"我们打算什么时候再看"，cron 只回答"平台多久代跑一次"——否则换阶梯就改了平台的代跑节奏 |
+| 3 | `probe` 规则「**推到组织级共享**」 | 装载层级 **组织级 → 仓库级（只覆写数值）→ 内置默认**；仓库级改不动语义（落点成员资格、判别式清单）；跨仓事件按**判定字符串**走同一份规则包出同一套动作 |
+
+**一句话**：**短等待挂 `await`、长等待交 `crontab`；`crontab` 固定 `*/5` 一档扫；
+这套口径放组织级、全组织共用一份，仓库只能改数值。**
+
+代码口径：`probe.TWO_WAY_SPLIT_NOTE` / `probe.CRON_FIXED_EXPR` /
+`organization_probe_rules()`（组织级快照）/ `dispatch_shared()`（跨仓落点判定）。
+
 ## 5. 怎么用
 
 ```python
@@ -139,6 +165,9 @@ wp.explain()                             # "等待是否占 CPU"的完整口径
 | `waiting_plan()` / `waiting_status(n)` | 一行等待计划 / 当前位置的等待状态（含到顶） |
 | `wait_decision(attempt)` / `wait_plan()` | "怎么等"的决策 / 整条等待计划 |
 | `cost_note()` | 「等待是否占 CPU」的平台口径原话 |
+| `probe_status()` | 探测口径快照（含分工阈值、固定 cron、规则来源层级 `chain`） |
+| `organization_probe_rules()` | **组织级共享**口径快照（跨仓同一份） |
+| `dispatch_probe_event_shared()` | **跨仓**落点判定（同一份规则 → 同一套动作） |
 
 ## 6. 覆写与校验
 

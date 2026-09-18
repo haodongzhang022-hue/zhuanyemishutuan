@@ -3,6 +3,12 @@
 # ============================================================
 # 定位：**全局规则**，跨仓库共用一份。与具体仓库的业务无关，
 #       放单仓会导致"每仓一套数值 → 换仓/换 agent 行为漂移"。
+#
+# 层级（**已确认口径 #3**：probe 规则推到组织级共享）：
+#   - 组织级基线：`shared/collab/organization.yaml`
+#     （或 CNB_ORG_COLLAB_RULES / CNB_ORG_SHARED_DIR）——**一份口径、全域生效**；
+#   - 仓库级覆写：本文件——**只允许改数值**，语义（判别式 / 落点成员资格）不可改；
+#   - 装载顺序见 `secretary.collab.rules.load_rules`：组织级 → 仓库级 → 内置默认。
 # 用法：
 #   - 代码：`secretary.collab.load_rules()`（从任意子目录向上查找本文件）
 #   - 覆写：环境变量 `CNB_COLLAB_RULES` 指向自定义规则包，或直接显式路径装载
@@ -26,10 +32,17 @@ probe:
   # 平台落点（**永不本地空转**）：等锁/等状态变化优先挂平台等待语义
   drivers: ["platform_await", "platform_crontab", "external_webhook",
             "delegate_event", "handoff_resume"]
-  # ≤ 该时长 → 挂 cnb:await（零占用，状态一变即醒）；> 该时长 → 交平台定时任务
+  # 落点分工**阈值**（已确认口径 #1：≤5min 挂 await，>5min 交 crontab）
+  # ≤ 该时长 → 挂 cnb:await（零占用，状态一变即醒）；> 该时长 → 交平台定时任务。
+  # **不存在「一律挂 await」这条回退路径**：长等待挂在单个 await 上等于
+  # "把到点必看押在对端一定会 resolve 上"，对端不 resolve 就是死等。
   await_max_sec: 300
   # 平台定时任务（crontab）最小间隔（官方文档：低于 5 分钟无法提交）
   crontab_min_interval_sec: 300
+  # 平台定时任务间隔：**固定 */5 一档扫**（已确认口径 #2）。
+  # 不随阶梯档位放大——`*/5` 就是平台下限本身，且与阶梯时间表**解耦**：
+  # 阶梯回答"我们打算什么时候再看"，cron 只回答"平台多久代跑一次"。
+  crontab_interval_minutes: 5
   # 判别式（只看可判定事实，不看 agent 自述）
   checks: ["confirm", "lock", "version", "event", "resource"]
 
@@ -72,3 +85,8 @@ platform:
     没有在本地 sleep、空转轮询或持续产出日志。本地空转 10 分钟 = 8 核 ×10min ≈
     1.33 核时（约 ¥0.17），而平台挂起同一段时间不计 CPU。
   pause_hint: "阶梯到顶（10 分钟）即停；长等待交给平台等待/挂起语义，本地不做轮询"
+
+# ---- 三点确认留痕（Issue #14 追问） ----
+# 1. 落点分工：≤5min 挂 cnb:await、>5min 交 crontab —— 固化为硬口径（见 probe.await_max_sec）
+# 2. cron 间隔：固定 */5 一档扫 —— 见 probe.crontab_interval_minutes
+# 3. probe 规则推到组织级共享 —— 见 shared/collab/organization.yaml（本文件为其仓库级覆写）

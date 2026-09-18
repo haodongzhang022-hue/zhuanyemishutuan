@@ -16,6 +16,14 @@
 | 3 | **形成检查点，判断检查点** | 检查点 = `key` + **判别式**（`kind`）。判别只看**可判定事实**（锁在不在 / 版本变没变 / 我方还等不等），**不看 agent 自述**；判不出 → `UNKNOWN`（宽进，不误判） |
 | 4 | **边缘计算的探测器** | 采集**轻量本地快照**（锁台账 + 版本台账），产出**结构化事件**（`ProbeEvent`）上报；重活（评审、构建、模型调用）只在"值得唤醒"时才做，符合边缘计算"本地轻量感知、云端重处理"的算力分层 |
 
+## 三条已确认口径（Issue #14 追问 · 用户三点确认）
+
+| # | 确认项 | 固化 |
+|---|---|---|
+| 1 | 落点分工「**≤5min 挂 await，>5min 交 crontab**」 | 固化为**硬口径**：`_driver_for_delay()` 按 `await_max_sec`（默认 300s）自动分工，**不提供"一律挂 await"的回退口**——默认即为唯一落点策略 |
+| 2 | `cron` 间隔「**固定 `*/5` 一档扫**」 | `_cron_fixed_5min()`：所有平台定时探测点统一 `*/5 * * * *`（**= 平台 5 分钟下限**，不随阶梯档位放大），与阶梯时间表**解耦** |
+| 3 | `probe` 规则推到「**组织级共享**」 | 组织级包 `shared/collab/organization.yaml`（全组织一份）+ 仓库级 `shared/collab/collab-rules.yaml`（**只覆写数值**）；装载顺序见 `rules.load_rules`：**组织级 → 仓库级 → 内置默认**，跨仓接力用 `dispatch_shared()` |
+
 ## 平台最佳实践（官方文档口径，已查证）
 
 | 能力 | 平台机制 | 文档 |
@@ -96,22 +104,78 @@ ALL_DRIVERS = (DRIVER_AWAIT, DRIVER_CRONTAB, DRIVER_EXTERNAL,
 CRONTAB_MIN_INTERVAL_SEC = 300.0
 
 
-def _driver_for_delay(delay_sec: float) -> str:
+# 等待时长 → 平台落点的分工阈值（= 平台定时任务下限 5 分钟）
+AWAIT_MAX_SEC = CRONTAB_MIN_INTERVAL_SEC
+
+
+def _driver_for_delay(delay_sec: float,
+                      await_max_sec: float = AWAIT_MAX_SEC) -> str:
     """按等待时长挑平台落点：**短等待挂 await；长等待交平台定时任务**。
 
-    - ≤ 平台定时任务最小间隔（5 分钟）→ `platform_await`（零占用，状态一变就醒）；
-    - > 5 分钟 → `platform_crontab`（平台那个"不睡觉的进程"到点代跑一次探测）。
+    - ≤ ``await_max_sec``（默认 = 平台下限 5 分钟）→ `platform_await`：
+      **零占用**挂起，状态一变由对端 `cnb:resolve` 唤醒；
+    - > ``await_max_sec`` → `platform_crontab`：交**平台那个"不睡觉的进程"**
+      到点代跑一次探测。
+
+    **这是一条硬口径（已确认）**：不存在"一律挂 await"的回退口——
+    超过平台定时下限的等待若仍挂在单个 await 上，就等于把"到点必看"押在
+    对端一定会 resolve 上；对端不 resolve（人没编辑完 / 外部系统不回调）就是死等。
+    故分工按阈值自动进行，且**两个落点不得混用**（见 `TWO_WAY_SPLIT_NOTE`）。
     """
-    return DRIVER_AWAIT if float(delay_sec) <= CRONTAB_MIN_INTERVAL_SEC else DRIVER_CRONTAB
+    return DRIVER_AWAIT if float(delay_sec) <= float(await_max_sec) else DRIVER_CRONTAB
 
 
-def _cron_every(delay_sec: float, base_minutes: int = 5) -> str:
-    """把等待时长换算成 cron 表达式（向上取整到分钟；**不低于平台 5 分钟下限**）。
+# 分工口径一句话（文档/评论/角色提示词共用，避免各说一套）
+TWO_WAY_SPLIT_NOTE = (
+    "落点分工（固定，不可混用）：≤5 分钟挂 `cnb:await`（零占用、事件唤醒）；"
+    ">5 分钟交平台 `crontab`（固定 `*/5` 一档扫，平台代跑）。"
+    "不存在「一律挂 await」这条回退路径。"
+)
 
-    例：``600s → "*/10 * * * *"``（每 10 分钟一次的探测点）。
+
+# 平台定时任务（crontab）固定间隔：**一档 `*/5` 扫**（已确认口径 #2）
+#
+# 为什么固定 `*/5` 而不是随阶梯档位放大：
+# - `*/5` 就是**平台下限**本身，长等待（6min/10min 档）只需"到点时被平台看一眼"，
+#   无需更稀疏；更稀疏反而让收尾更慢；
+# - 与**阶梯时间表解耦**：阶梯回答"我们打算什么时候再看"，cron 只回答"平台多久代跑一次"。
+#   若把 cron 跟着阶梯放大（`*/6`、`*/10`），换阶梯就会改变平台的代跑节奏——
+#   两套节奏耦合，正是"换仓/换 agent 行为漂移"的来源。
+CRON_EVERY_MINUTES = 5
+CRON_FIXED_EXPR = "*/5 * * * *"      # 固定表达式（单一语义源，测试直接断言它）
+
+
+def _cron_fixed_5min(_delay_sec: float = 0.0, base_minutes: int = 5) -> str:
+    """**固定一档扫**：所有平台定时探测点用**同一个** cron 表达式。
+
+    第一个参数（原等待时长）**保留但不使用**——签名兼容旧调用点，语义上
+    "间隔与等待时长无关"（这正是与阶梯**解耦**的落点）。
+
+    间隔 = `max(平台下限 5min, base_minutes)`：传小于 5 的 `base_minutes`
+    会被平台下限夹住（**不可能**配出比平台允许更密的扫描）。
     """
-    minutes = max(int(base_minutes), int(-(-float(delay_sec) // 60.0)))
+    minutes = max(int(CRONTAB_MIN_INTERVAL_SEC // 60), int(base_minutes))
     return f"*/{minutes} * * * *"
+
+
+def cron_expr_for(rules: Optional[Any] = None) -> str:
+    """按规则包给出**唯一**的 cron 表达式（单一语义源，供门面/文档引用）。
+
+    规则包里的 `probe.crontab_interval_minutes` **是真读的**（不是装饰性文档）：
+    调大即有意疏化扫描，调小会被平台下限夹住。
+    """
+    minutes = 5
+    every = getattr(rules, "crontab_every_minutes", None)
+    if callable(every):
+        try:
+            minutes = int(every())
+        except Exception:      # pragma: no cover - 宽进：异常回落默认档
+            minutes = 5
+    return _cron_fixed_5min(0.0, minutes)
+
+
+# 向后兼容别名（旧名 `_cron_every` 在既有代码/文档里出现过）
+_cron_every = _cron_fixed_5min
 
 
 @dataclass
@@ -294,10 +358,16 @@ class CheckpointProbe:
         lock_view: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
         version_view: Optional[Callable[[], Optional[int]]] = None,
         crontab_base_minutes: int = 5,
+        await_max_sec: float = AWAIT_MAX_SEC,
+        rules: Optional[Any] = None,
     ):
-        if not isinstance(session_id, str) or not _SAFE_ID.match(session_id):
+        # 会话号可能来自**跨仓事件**（如 `dongdongxiaozu/zhuanyemishutuan#14`）——
+        # 因此这里接受"仓/号"这类正常写法；危险形态（路径穿越/控制字符）仍拒绝。
+        # 落盘文件名另经 `_slug()` 转义，路径安全**不**依赖会话号本身。
+        if not _safe_shared_id(session_id):
             raise ValueError(
-                f"非法 session_id: {session_id!r}。仅允许 [A-Za-z0-9_.:-]。")
+                f"非法 session_id: {session_id!r}。"
+                "拒绝路径穿越/控制字符/空白；允许 [A-Za-z0-9_.:/-#] 等标识写法。")
         import time as _time
         self.session_id = session_id
         self.data_dir = data_dir or os.path.join(os.getcwd(), "data", "probe")
@@ -308,16 +378,42 @@ class CheckpointProbe:
         self._clock: Callable[[], float] = clock or _time.time
         self._lock_view = lock_view
         self._version_view = version_view
-        self.crontab_base_minutes = max(1, int(crontab_base_minutes))
+        # 规则包里的固定间隔（若给了规则包且未显式传 base_minutes，则以规则包为准）
+        self.crontab_base_minutes = int(crontab_base_minutes)
+        if rules is not None and int(crontab_base_minutes) == 5:
+            every = getattr(rules, "crontab_every_minutes", None)
+            if callable(every):
+                try:
+                    self.crontab_base_minutes = int(every())
+                except Exception:      # pragma: no cover - 宽进
+                    pass
+        self.crontab_base_minutes = max(1, int(self.crontab_base_minutes))
+        # 落点分工阈值（≤ 此值挂 await，> 此值交 crontab）；**用户确认的硬口径**，
+        # 可通过规则包调"时分界线"，但**不能取消分工**（不存在"一律 await"）。
+        self.await_max_sec = (
+            float(await_max_sec)
+            if isinstance(await_max_sec, (int, float))
+            and not isinstance(await_max_sec, bool) and float(await_max_sec) > 0
+            else AWAIT_MAX_SEC)
         os.makedirs(self.data_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # 落盘（一个检查点一个文件；损坏/缺失 → 视为不存在，不炸）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _slug(value: Any) -> str:
+        """把任意标识转成**文件系统安全**的片段（`/`、`#`、`..` 一并转掉）。
+
+        路径安全由这里保证，**不**依赖标识本身有多"规矩"——所以会话号可以是
+        `org/repo#14` 这种人类可读写法，落盘仍然平铺在本会话目录里。
+        """
+        safe = re.sub(r'[^A-Za-z0-9_.:-]', '_', str(value))[:120]
+        safe = safe.replace("..", "__")
+        return safe or "checkpoint"
+
     def _path(self, key: str) -> str:
-        safe = re.sub(r'[^A-Za-z0-9_.:-]', '_', str(key))[:120] or "checkpoint"
-        return os.path.join(self.data_dir, f"{safe}.json")
+        return os.path.join(self.data_dir, f"{self._slug(key)}.json")
 
     def load(self, key: str) -> Optional[Checkpoint]:
         path = self._path(key)
@@ -419,20 +515,20 @@ class CheckpointProbe:
         rows: List[Dict[str, Any]] = []
         for i in range(n):
             st = self.backoff.status(i)
-            driver = _driver_for_delay(st.delay_sec)
+            driver = _driver_for_delay(st.delay_sec, self.await_max_sec)
             rows.append({
                 "check": i + 1,
                 "delay_sec": st.delay_sec,
                 "label": st.label,
                 "at_top": st.at_top,
                 "driver": driver,
-                "crontab": (_cron_every(st.delay_sec, self.crontab_base_minutes)
+                "crontab": (_cron_fixed_5min(st.delay_sec, self.crontab_base_minutes)
                             if driver == DRIVER_CRONTAB else ""),
                 "local_cpu": "0（不占构建核时）",
                 "note": ("挂 cnb:await，锁释放方 resolve 唤醒（零占用）"
                          if driver == DRIVER_AWAIT else
                          "交平台定时任务（crontab）到点代跑一次探测；"
-                         "平台最小间隔 5 分钟"),
+                         "固定 */5 一档扫（= 平台 5 分钟下限）"),
             })
         rows.append({
             "check": n + 1,
@@ -715,7 +811,22 @@ class CheckpointProbe:
         - 条件满足 → `cnb:apply`/`cnb:trigger` 触发 `api_trigger_*` 再跑（真正干活）；
         - 仍未满足 → `cnb:await` 挂起等待（零占用），或交 `crontab` 到点代跑；
         - 预算用尽 → 交回人工（`resume_required`，不得据此再开一轮）。
+
+        事件带 `session_id`（跨仓/跨 agent 传递后）时，落点按**它归属的会话**算，
+        不再误用本地实例的会话号。
         """
+        sid = self.session_id
+        raw = event.facts.get("session_id") if isinstance(event.facts, dict) else None
+        if _safe_shared_id(raw):
+            sid = raw
+        if sid == self.session_id:
+            return self.dispatch_core(event)
+        # 跨会话/跨仓：落点只依赖**会话号 + 规则**，不需要另一个实例。
+        return _dispatch_for_session(
+            event, sid, self._clock, self.crontab_base_minutes)
+
+    def dispatch_core(self, event: ProbeEvent) -> Dict[str, Any]:
+        """dispatch 的**核心实现**（实例内直接调用；跨仓共享走模块级函数）。"""
         if event.verdict == PROCEED:
             return {
                 "action": "resume",
@@ -765,7 +876,8 @@ class CheckpointProbe:
             "driver": DRIVER_CRONTAB,
             "trigger": {
                 "type": "crontab",
-                "cron": _cron_every(event.next_delay_sec, self.crontab_base_minutes),
+                "cron": _cron_fixed_5min(event.next_delay_sec,
+                                         self.crontab_base_minutes),
                 "event": "api_trigger_probe_check",
                 "note": "长等待交**平台**定时任务到点代跑一次探测；平台最小间隔 5 分钟",
             },
@@ -819,3 +931,139 @@ class CheckpointProbe:
             except OSError:
                 pass
         return removed
+
+
+# ======================================================================
+# 跨仓共享（已确认口径 #3）：probe 规则推到组织级
+# ======================================================================
+# 「探什么、最多探几次、怎么等、判出来怎么走」是 **agent ↔ agent 的协同礼仪**，
+# 与任何单个仓库无关——同一份口径要在**所有仓库**生效，否则 A 仓探 6 次、B 仓探 9 次，
+# 换仓就行为漂移（正是"循环"的温床）。
+#
+# 因此本模块提供**不依赖任何实例**的入口：
+#   - `probe_verdict_of(event)`：跨仓事件里带的是**判定字符串**（不是本地对象），
+#     直接给出对外口径（不再"按本地会话号编造落点"）；
+#   - `dispatch_shared(event, rules)`：按**全局规则包**（可来自组织级 YAML）给平台指令。
+# 键名白名单与本地同源，跨仓事件不会被不同实现解读成不同动作。
+
+def _safe_shared_id(value: Any) -> bool:
+    """跨仓标识是否可用作落点键的**安全**前缀。
+
+    与本地 `session_id` 白名单（``_SAFE_ID``，禁 ``/``）**不同**：跨仓协作里
+    `dongdongxiaozu/zhuanyemishutuan#14` 这类"仓/号"写法是**正常标识**，
+    不能因为带 `/` 就丢掉它（丢了就等于把落点错标成本地会话）。
+    这里只挡**真正危险**的形态：路径穿越、路径分隔、空白与控制字符、超长。
+    """
+    if not isinstance(value, str):
+        return False
+    if not value or len(value) > 120:
+        return False
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in value):
+        return False
+    if any(ch.isspace() for ch in value):
+        return False
+    if ".." in value or "\\" in value or value.startswith("/"):
+        return False
+    return True
+
+
+# 落点视图（给人看/文档引用/角色提示词共用）
+DRIVER_ROLE = {
+    DRIVER_AWAIT: "首选：状态变化会被对端 resolve → 零占用唤醒（≤ await_max_sec）",
+    DRIVER_CRONTAB: "兜底：平台「不睡觉的进程」到点代跑（> await_max_sec，固定 */5）",
+    DRIVER_EXTERNAL: "外部 webhook / OPENAPI StartBuild 触发 api_trigger 再跑",
+    DRIVER_DELEGATE: "委托持有者完成时回调 api_trigger_* 事件",
+    DRIVER_HANDOFF: "用尽/到顶 → 交回人工/上游（不据此再开一轮）",
+}
+
+
+def probe_verdict_of(event: Any) -> str:
+    """跨仓口径：从探测事件取**判定字符串**（宽进：非法/缺失 → unknown）。
+
+    跨仓传递的是数据不是对象——对方仓的 `ProbeEvent` 与本仓同名同义，
+    这里只认判定值本身，遇到不认识的值一律当 `unknown`（**继续等，不误判放行**）。
+    """
+    if isinstance(event, ProbeEvent):
+        verdict = event.verdict
+    elif isinstance(event, dict):
+        verdict = event.get("verdict")
+    else:
+        verdict = None
+    return verdict if verdict in ALL_VERDICTS else UNKNOWN
+
+
+def _dispatch_for_session(
+    event: ProbeEvent,
+    session_id: str,
+    clock: Optional[Callable[[], float]] = None,
+    crontab_base_minutes: int = 5,
+    await_max_sec: float = AWAIT_MAX_SEC,
+) -> Dict[str, Any]:
+    """按**指定会话号**算落点（纯函数：不读不写任何检查点状态）。
+
+    `CheckpointProbe.dispatch()` 与模块级 `dispatch_shared()` **共用这一条**算法——
+    两处各写一遍就会分叉（"本地这么判、跨仓那么判"，正是协同漂移的来源）。
+    """
+    if session_id == "":
+        session_id = "shared"
+    probe = CheckpointProbe(
+        session_id, backoff=None, clock=clock,
+        crontab_base_minutes=crontab_base_minutes, await_max_sec=await_max_sec)
+    return probe.dispatch_core(event)
+
+
+def dispatch_shared(
+    event: Any,
+    rules: Optional[Any] = None,
+    session_id: str = "shared",
+    crontab_base_minutes: int = 5,
+) -> Dict[str, Any]:
+    """**跨仓共享**的落点判定：同一份规则包 → 同一套动作（不依赖本地实例）。
+
+    Args:
+        event: `ProbeEvent`（本仓）或跨仓传来的**字典**（键名口径同源）
+        rules: `CollabRules`（组织级/仓库级规则包）；缺省用内置默认口径
+        session_id: 兜底会话标识（事件里带 `session_id` 时以事件为准）
+
+    Returns:
+        `{"verdict", "action", "driver", "trigger", "wake_allowed", "reason"}`
+        —— 跨仓接收方据此执行即可，**不必**、也**不该**再按自己的本地会话号重算。
+    """
+    ev = (event if isinstance(event, ProbeEvent)
+          else ProbeEvent.from_dict(event) or ProbeEvent())
+    sid = session_id
+    raw = ev.facts.get("session_id") if isinstance(ev.facts, dict) else None
+    if _safe_shared_id(raw):
+        sid = raw
+    await_max = getattr(rules, "probe_await_max_sec", AWAIT_MAX_SEC)
+    if not isinstance(await_max, (int, float)) or isinstance(await_max, bool):
+        await_max = AWAIT_MAX_SEC
+    out = _dispatch_for_session(ev, sid, None, crontab_base_minutes, await_max)
+    out["verdict"] = probe_verdict_of(ev)
+    out["shared"] = True
+    return out
+
+
+def organization_probe_rules(
+    path: Optional[str] = None,
+    rules: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """组织级共享的 probe 口径**快照**（"这套数值全组织共用同一份"的证据）。
+
+    装入口径见 `rules.load_rules`：**组织级 → 仓库级 → 内置默认**。
+    `rules` 已给（或 `path` 已给）时以它为口径，否则现取组织级那份。
+    """
+    from .rules import load_rules     # 局部导入：避免与 rules → probe 的依赖成环
+    loaded = rules if rules is not None else load_rules(path, scope="organization")
+    return {
+        "source": loaded.source,
+        "scope": loaded.scope,
+        "max_checks": loaded.probe_max_checks,
+        "await_max_sec": loaded.probe_await_max_sec,
+        "crontab_min_interval_sec": loaded.crontab_min_interval_sec,
+        "crontab_interval": cron_expr_for(loaded),
+        "drivers": list(loaded.probe_drivers),
+        "checks": list(loaded.probe_checks),
+        "split_note": TWO_WAY_SPLIT_NOTE,
+        "local_cpu": "0（探测点全部落平台语义；本地不 sleep、不轮询）",
+    }

@@ -153,7 +153,8 @@ class TestNonPolling:
         long_rows = [r for r in plan if r["delay_sec"] > 300]
         assert [r["delay_sec"] for r in long_rows] == [360.0, 600.0]
         assert all(r["driver"] == DRIVER_CRONTAB for r in long_rows)
-        assert long_rows[-1]["crontab"] == "*/10 * * * *"
+        # 已确认口径 #2：cron 间隔**固定 */5 一档扫**（不随档位放大）
+        assert long_rows[-1]["crontab"] == "*/5 * * * *"
 
     def test_crontab_never_below_platform_floor(self, tmp_probe):
         """反向对照：cron 间隔不低于平台下限 5 分钟（低于下限根本提交不了）。"""
@@ -165,11 +166,11 @@ class TestNonPolling:
             assert minutes * 60 >= CRONTAB_MIN_INTERVAL_SEC, row
 
     def test_top_rc6_is_ten_minutes(self, tmp_probe):
-        """第 6 次（顶）= 10 分钟；平台定时任务每 10 分钟探一次。"""
+        """第 6 次（顶）= 10 分钟；平台定时任务仍按**固定 */5** 一档扫。"""
         plan = tmp_probe.delay_plan()
         row6 = [r for r in plan if r["check"] == 6][0]
         assert row6["delay_sec"] == 600.0 and row6["at_top"] is True
-        assert row6["crontab"] == "*/10 * * * *"
+        assert row6["crontab"] == "*/5 * * * *"
 
     def test_no_local_loop_driver_exists(self, tmp_probe):
         """**永不**本地空转：全部落点里没有"本地 sleep/轮询"这一种。"""
@@ -428,11 +429,16 @@ class TestOverviewAndLifecycle:
         assert sec2.checkpoints_overview()["count"] == 0
 
     def test_illegal_session_id_rejected(self):
-        """非法会话标识拒绝构造（防路径穿越；与同族模块口径一致）。"""
-        with pytest.raises(ValueError):
-            CheckpointProbe("bad/id")
-        with pytest.raises(ValueError):
-            CheckpointProbe("")
+        """非法会话标识拒绝构造（**只挡危险形态**，不挡"仓/号"这类正常标识）。
+
+        `bad/id` 这类"仓/号"写法是**跨仓协作正常标识**，不得误伤（见
+        `test_collab_confirm_issue14.py`）；真正该挡的是路径穿越与控制字符。
+        """
+        for bad in ("", "a/../b", "../evil", "/abs", "a\\b", "has space",
+                    "line\nbreak", "x" * 200):
+            with pytest.raises(ValueError):
+                CheckpointProbe(bad)
+        assert CheckpointProbe("repo-b/issue-7").session_id == "repo-b/issue-7"
 
     def test_corrupt_checkpoint_file_is_tolerated(self, tmp_probe):
         """损坏的检查点文件 → 视为不存在（宽进不炸），不阻塞探测。"""

@@ -1,0 +1,78 @@
+# ============================================================
+# 组织级协同规则包（**跨仓库共享 · 一组织一份**）
+# ============================================================
+# 已确认口径 #3：「探测规则推到**组织级共享**」。
+#
+# 层级关系（装载顺序见 secretary.collab.rules.load_rules）：
+#   组织级（本文件 / CNB_ORG_COLLAB_RULES / CNB_ORG_SHARED_DIR）
+#     → 仓库级（各仓 shared/collab/collab-rules.yaml，**只允许覆写数值**）
+#       → 内置默认（代码兜底）
+#
+# 为什么放组织级而不是单仓：
+#   「探什么、最多探几次、怎么等、判出来怎么走」是 **agent ↔ agent 的协同礼仪**，
+#   与任何仓库的业务无关。放单仓 → A 仓探 6 次、B 仓探 9 次，**换仓即行为漂移**；
+#   跨仓协作时双方对同一件事的处置也会不一致（正是"循环"的温床）。
+#
+# 覆写规则（**硬约束**）：
+#   - 仓库级**只允许改数值**（次数/秒数/关键词），**不允许改语义**；
+#   - `probe.drivers` 的**成员资格不可改**（只能重排）：否则换个仓库就能把
+#     "落点"改成非平台语义（本地 sleep/轮询），那正是要防的漏口；
+#   - 不存在「一律挂 await」这条回退路径：落点分工（≤5min await / >5min crontab）
+#     是组织级固定口径。
+# Ref: #14 追问（三点确认：落点分工 / 固定 */5 / 组织级共享）
+# ============================================================
+
+# ---- 等待/退避：从少到多，到顶即停（组织级统一） ----
+backoff:
+  ladder: [10, 30, 60, 180, 360, 600]
+  max_attempts: 6
+
+# ---- 探测：非轮询检查点，最多 6 次（组织级统一） ----
+probe:
+  max_checks: 6
+  # 落点清单：成员资格**不可改**（组织级口径；仓库级只可重排）
+  drivers: ["platform_await", "platform_crontab", "external_webhook",
+            "delegate_event", "handoff_resume"]
+  # 落点分工**阈值**：≤ 此值挂 cnb:await（零占用）；> 此值交平台 crontab
+  # （已确认口径 #1；默认即平台定时任务下限 5 分钟）
+  await_max_sec: 300
+  # 平台定时任务最小间隔（官方文档下限；低于此值配置无法提交）
+  crontab_min_interval_sec: 300
+  # 平台定时任务间隔：**固定 */5 一档扫**（已确认口径 #2；不随阶梯档位放大）
+  crontab_interval_minutes: 5
+  # 判别式（语义域：判定只看可判定事实，不看 agent 自述）
+  checks: ["confirm", "lock", "version", "event", "resource"]
+
+# ---- 锁：延迟 → 持续 → 聚合台账（组织级统一） ----
+locks:
+  retry_delay_sec: 60
+  persistent_grace_sec: 180
+  registry_shared: true
+
+# ---- 循环熔断：门禁往返的上界（组织级统一） ----
+loop:
+  max_rounds: 3
+  max_advisory_fix_rounds: 1
+  max_total_rounds: 5
+  max_stall_repeats: 2
+
+# ---- 审查范围：日常只审变化，全量只在大版本（组织级统一） ----
+scan:
+  major_version_tags: ["major-version", "大版本", "release-major"]
+  full_scan_keywords: ["大版本", "全量", "major version", "full scan"]
+  scan_keywords: ["只审变化", "增量", "只跑增量", "scan only"]
+
+# ---- 平台计费口径（跨仓同一句话：等待不计 CPU） ----
+platform:
+  cpu_unit: "核时"
+  cpu_formula: "自然月内累积用量 − 免费额度；启动后每 5min 冻结 5min × 节点规格（免费额度 160 核时/月）"
+  ai_unit: "AI Credits"
+  ai_formula: "每次模型调用按实际 Token 消耗计（NPC / AI 评审 / 内置 CodeBuddy）"
+  waiting_billed: false
+  waiting_note: >-
+    平台只有「云原生构建/开发 CPU 核时」与「AI Credits」两项与任务相关：CPU 按任务
+    实际运行时长计，Token 按模型调用计，二者都**没有"等待"这一计费项**。因此等待
+    本身不占用 CPU 计费——**前提是等待走了平台的等待/挂起语义**（如 cnb:await），
+    没有在本地 sleep、空转轮询或持续产出日志。本地空转 10 分钟 = 8 核 ×10min ≈
+    1.33 核时（约 ¥0.17），而平台挂起同一段时间不计 CPU。
+  pause_hint: "阶梯到顶（10 分钟）即停；长等待交给平台等待/挂起语义，本地不做轮询"

@@ -62,7 +62,7 @@ zhuanyemishutuan/            # 通用层
 | org.md + schema.md + cache.md | `session/session.py` | SecretarySession 会话门面统一入口 |
 | loop-guard.md（Issue #14） | `loop/loop_guard.py` | 轮次预算熔断 + 非必要修复上限 + 静默交接不唤醒 |
 | review-arbiter.md（Issue #14） | `review/review_arbiter.py` + `review/scope.py` | 只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口；日常只审变化，全量只在大版本 |
-| secretary-collab-rules.md（docs 根 · Issue #14 追问） | `collab/backoff.py` + `collab/wait_policy.py` + `collab/rules.py` | 跨仓库全局协同规则：等待阶梯 10s→30s→60s→3min→6min→10min 到顶即停；等待走平台挂起（不计 CPU）；规则包 `shared/collab/collab-rules.yaml` |
+| secretary-collab-rules.md（docs 根 · Issue #14 追问） | `collab/backoff.py` + `collab/wait_policy.py` + `collab/rules.py` + `collab/probe.py` | 跨仓库全局协同规则：等待阶梯 10s→30s→60s→3min→6min→10min 到顶即停；等待走平台挂起（不计 CPU）；检查点探测**非轮询**（落点分工 ≤5min await / >5min crontab、crontab 固定 `*/5`）；规则**组织级共享**（`shared/collab/organization.yaml` → 仓库级只覆写数值） |
 
 ## 4. 落地状态
 

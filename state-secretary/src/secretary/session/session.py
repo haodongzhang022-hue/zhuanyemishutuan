@@ -36,6 +36,8 @@ from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
 from ..loop import LoopDecision, LoopGuard
 from ..collab import (
+    TWO_WAY_SPLIT_NOTE,
+    cron_expr_for,
     CollabRules,
     CheckpointProbe,
     ProbeEvent,
@@ -283,6 +285,10 @@ class SecretarySession:
             max_checks=(self.collab_rules.probe_max_checks
                         if max_checks is None else max_checks),
             lock_view=self.lock_registry.overview,
+            # 落点分工阈值 + 固定 cron 间隔都来自**规则包**（组织级共享同一份）：
+            # ≤ 此值挂 cnb:await，> 此值交平台 crontab（固定 */5 一档扫）。
+            await_max_sec=self.collab_rules.probe_await_max_sec,
+            rules=self.collab_rules,
         )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
@@ -1607,7 +1613,11 @@ class SecretarySession:
         return self.probe.overview()
 
     def probe_status(self) -> Dict[str, Any]:
-        """检查点探测的**生效口径快照**：次数上界、平台落点、判别式、计费口径。"""
+        """检查点探测的**生效口径快照**：次数上界、平台落点、判别式、计费口径。
+
+        含三点已确认口径：① 落点分工（`await_max_sec` 阈值 + 不可混用）；
+        ② cron **固定 `*/5` 一档扫**；③ 规则来源层级（组织级 / 仓库级，见 `chain`）。
+        """
         rules = self.collab_rules
         return {
             "max_checks": self.probe.max_checks,
@@ -1615,11 +1625,27 @@ class SecretarySession:
             "probe_plan": rules.probe_plan(),
             "drivers": list(rules.probe_drivers),
             "checks": list(rules.probe_checks),
-            "await_max_sec": rules.probe_await_max_sec,
+            "await_max_sec": self.probe.await_max_sec,
             "crontab_min_interval_sec": rules.crontab_min_interval_sec,
+            "crontab_interval": cron_expr_for(rules),
+            "crontab_interval_note": ("固定一档扫：不随阶梯档位放大；"
+                                      "与阶梯时间表解耦（平台多久代跑一次）"),
+            "split_note": TWO_WAY_SPLIT_NOTE,
+            "rules_scope": rules.scope,
+            "rules_chain": [dict(c) for c in rules.chain],
             "local_cpu_cost": "0（探测点挂平台语义；本地不 sleep、不轮询）",
             "platform_cost": rules.platform.to_dict(),
         }
+
+    def organization_probe_rules(self) -> Dict[str, Any]:
+        """**组织级共享**的 probe 口径快照（跨仓同一份；已确认口径 #3）。"""
+        from ..collab import organization_probe_rules as _org
+        return _org(rules=self.collab_rules)
+
+    def dispatch_probe_event_shared(self, event: Any) -> Dict[str, Any]:
+        """**跨仓**落点判定：同一份组织级规则包 → 同一套动作（不依赖本地会话号）。"""
+        from ..collab import dispatch_shared
+        return dispatch_shared(event, self.collab_rules)
 
     # ------------------------------------------------------------------
     # 进度统计
