@@ -16,6 +16,7 @@
 | `state-secretary-module.md` | 落库新增独立模块划分建议（Q5） |
 | `state-secretary-handoff-visibility.md` | 交接卡引用可见性契约边界（P0-1/P0-2/P1-1 修复后更新；仅 🟡B 边界随 Issue #8） |
 | `state-secretary-loop-guard.md` | 循环熔断守卫（轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒）· Issue #14 |
+| `state-secretary-review-arbiter.md` | 评审版本仲裁（只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口）+ 审查范围分级（日常只审变化，全量只在大版本）· Issue #14 |
 
 ## 2. 对 SKILL.state 论文的三层改进对照
 
@@ -50,8 +51,9 @@
 
 > **2026-09-08**：状态管理秘书模块已落地可运行代码（`state-secretary/`），
 > 代码源自 `hanghangchuzhuangyuan` M9/M10 状态管理层拷贝移植，包名适配为 `secretary.*`。
-> 370 项 pytest 测试全部通过（SecretarySession 门面 148 项 + 独立探针 65 项 + Issue #4 验收矩阵 13 项
-> + Issue #14 循环熔断 62 项 + 底层模块回归，含数据生命周期/评审回归），POC benchmark 可运行。
+> 445 项 pytest 测试全部通过（SecretarySession 门面 148 项 + 独立探针 65 项 + Issue #4 验收矩阵 13 项
+> + Issue #14 循环熔断 62 项 + Issue #14 评审版本仲裁/审查范围 75 项 + 底层模块回归，含数据生命周期/评审回归），
+> POC benchmark 可运行。
 > **2026-09-08 补**：新增 `SecretarySession` 会话门面层——将 state/context/handoff
 > 整合为 L3 会话秘书的统一完整接口，一个实例 = 一个会话秘书，开箱即用。
 
@@ -64,6 +66,7 @@
 | poc.md | `state-secretary/poc/state_m9_benchmark.py` |
 | org.md + schema.md + cache.md | `state-secretary/src/secretary/session/session.py` — SecretarySession 门面 |
 | loop-guard.md | `state-secretary/src/secretary/loop/loop_guard.py` — LoopGuard 循环熔断 |
+| review-arbiter.md | `state-secretary/src/secretary/review/` — ReviewArbiter 评审写回 + 审查范围分级 |
 
 ## 5.1 契约边界
 
@@ -86,4 +89,5 @@
 | R7 跨行业复合交接 POC | ⏳ 待开发 | R6 标记的下一步：跨行业复合诉求 = 拆子任务 → 各路由到对应单元 → 交接卡汇合 |
 | 秘书角色×状态机集成验证 | ⏳ 待验证 | 将 SecretarySession 与 CNB NPC/角色实际使用场景对接验证 |
 | 循环熔断接入 NPC 事件链路 | ✅ 代码就绪 | `LoopGuard` 已可执行；待把 `review_round`/`silent_handoff` 接到 Issue/PR 评论事件（Issue #14） |
+| 评审写回仲裁接入评审角色 | ✅ 代码就绪 | `ReviewArbiter`（`begin_review`/`apply_review`/`retry_review`/`resolve_review_conflict`）已可用；角色提示词已给口径（Issue #14） |
 | CP2 人工确认 | ⏳ 待确认 | 对 POC benchmark 结果做人工验收放行 |

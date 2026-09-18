@@ -39,7 +39,8 @@ zhuanyemishutuan/            # 通用层
     │       └── session/     # 会话门面层（L3 秘书统一入口）
     │           ├── __init__.py
     │           └── session.py         # SecretarySession
-    ├── tests/               # 370 项 pytest 测试（全部通过；含 Issue #14 循环熔断 62 项）
+    │           └── review/          # 评审写回仲裁 + 审查范围分级（Issue #14 补全机制）
+    ├── tests/               # 445 项 pytest 测试（全部通过；含 Issue #14 循环熔断 62 + 评审仲裁 75）
     └── poc/                 # POC 脚本 + benchmark
         ├── m1_router.sh             # 单单元路由
         ├── m2_router_composite.sh   # 复合路由
@@ -59,11 +60,12 @@ zhuanyemishutuan/            # 通用层
 | state-secretary-poc.md | `poc/state_m9_benchmark.py` | 已可运行的量化对比 |
 | org.md + schema.md + cache.md | `session/session.py` | SecretarySession 会话门面统一入口 |
 | loop-guard.md（Issue #14） | `loop/loop_guard.py` | 轮次预算熔断 + 非必要修复上限 + 静默交接不唤醒 |
+| review-arbiter.md（Issue #14） | `review/review_arbiter.py` + `review/scope.py` | 只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口；日常只审变化，全量只在大版本 |
 
 ## 4. 落地状态
 
-1. ✅ schema/fold/org 最小可运行代码 + 测试（370 项通过，门面 148 项 + 独立探针 65 项 + 验收矩阵 13 项
-   + Issue #14 循环熔断 62 项（数据生命周期/评审回归））
+1. ✅ schema/fold/org 最小可运行代码 + 测试（445 项通过，门面 148 项 + 独立探针 65 项 + 验收矩阵 13 项
+   + Issue #14 循环熔断 62 项 + Issue #14 评审仲裁/审查范围 75 项（数据生命周期/评审回归））
 1. ✅ SecretarySession 会话门面：L3 会话秘书统一入口（state+fold+context+handoff 整合）
 2. ✅ cache 稳定前缀策略（context/assembler.py 三层装配）
 3. ✅ poc/benchmark 可运行

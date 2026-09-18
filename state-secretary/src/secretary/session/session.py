@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 from ..state import (
     StateManager, StateCard, TaskRecord,
@@ -39,6 +39,14 @@ from ..loop.loop_guard import (
     DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_MAX_STALL_REPEATS,
+)
+from ..review import (
+    ArbiterDecision,
+    ConflictCard,
+    ReviewArbiter,
+    ScanContext,
+    decide_scan,
+    scan_commands,
 )
 
 # 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
@@ -119,6 +127,8 @@ class SecretarySession:
         max_advisory_fix_rounds: int = DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
         max_total_rounds: Optional[int] = None,
         max_stall_repeats: int = DEFAULT_MAX_STALL_REPEATS,
+        review_dir: Optional[str] = None,
+        retry_delay_sec: float = 30.0,
     ):
         """初始化一个会话秘书。
 
@@ -138,6 +148,8 @@ class SecretarySession:
             max_total_rounds: 修复总轮次硬上界，默认
                 ``max_rounds + max_advisory_fix_rounds + 1``。
             max_stall_repeats: 同一整改项指纹连续出现上界（默认 2）→ 停滞熔断。
+            review_dir: 评审仲裁数据目录（默认 ``<数据根>/review``）。
+            retry_delay_sec: 疑似"正在编辑"时的延迟重试窗（默认 30s）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -184,6 +196,16 @@ class SecretarySession:
             max_advisory_fix_rounds=max_advisory_fix_rounds,
             max_total_rounds=max_total_rounds,
             max_stall_repeats=max_stall_repeats,
+        )
+        # 评审版本仲裁（Issue #14 补全机制）：只在开启评审时记录版本 +
+        # 防同写锁 + 延迟重试 + 单冲突收口。状态落 <数据根>/review/，
+        # 随 delete_session 一并回收。
+        self.review_arbiter = ReviewArbiter(
+            session_id=session_id,
+            state_manager=self.state_manager,
+            reviewer=role_name,
+            data_dir=review_dir or os.path.join(self._session_root, "review"),
+            retry_delay_sec=retry_delay_sec,
         )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
@@ -864,6 +886,12 @@ class SecretarySession:
             self.loop_guard.delete_state()
         except OSError:
             pass
+        # 7) 清理本会话评审基线/冲突卡（Issue #14 补全机制）：同上，避免同
+        #    一 session_id 复用时带上陈旧基线与待处理冲突。
+        try:
+            self.review_arbiter.delete_state()
+        except OSError:
+            pass
         return ok
 
     # ------------------------------------------------------------------
@@ -1251,6 +1279,82 @@ class SecretarySession:
         )
         self.loop_guard = fused
         return fused.is_fused()
+
+    # ------------------------------------------------------------------
+    # 评审版本仲裁（Issue #14 补全机制）
+    # 只在开启评审时记录版本 + 防同写锁 + 延迟重试 + 单冲突收口
+    # ------------------------------------------------------------------
+
+    def begin_review(self, force: bool = False) -> Any:
+        """**开启评审**：把当前版本原子登记为评审基线（幂等）。
+
+        开发过程中**不**记录任何版本；只有开启评审时才登记。已登记且
+        ``force=False`` 时不改写基线（防止靠重新开启评审把基线偷偷推前）。
+        """
+        return self.review_arbiter.begin_review(force=force)
+
+    def review_baseline(self) -> Optional[dict]:
+        """当前评审基线（未开启评审 → ``None``）。"""
+        base = self.review_arbiter.get_baseline()
+        return base.to_dict() if base else None
+
+    def review_recorded(self) -> bool:
+        """是否已在开启评审时登记过版本。"""
+        return self.review_arbiter.recorded()
+
+    def rebase_review(self) -> dict:
+        """以当前版本为新基线（"无法追踪变化就以新的"）。"""
+        return self.review_arbiter.rebase().to_dict()
+
+    def apply_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """写回评审结果（**先完成该做的**），再单独判冲突。
+
+        Returns:
+            ``ArbiterDecision``：``applied`` 为 True 表示评审已落盘；
+            ``should_retry`` 为 True 表示卡正在被编辑，等 ``retry_delay_sec``
+            后调 ``retry_review()``；``conflict`` 为 True 时 ``card`` 是
+            **唯一**冲突卡（后续冲突合并进它）。
+        """
+        return self.review_arbiter.apply_save(mutate=mutate, note=note)
+
+    def retry_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """延迟窗到点后重试评审写回（窗未到则继续等待，不落盘）。"""
+        return self.review_arbiter.retry(mutate=mutate, note=note)
+
+    def pending_review_conflicts(self) -> List[ConflictCard]:
+        """待处理评审冲突卡（**至多一张**：单冲突收口）。"""
+        return self.review_arbiter.pending_conflicts()
+
+    def resolve_review_conflict(
+        self, ticket_id: str, resolution: str, by: str = "",
+    ) -> bool:
+        """收口那张冲突卡（**只额外处理一个**），收口后以当前版本重立基线。"""
+        return self.review_arbiter.resolve(ticket_id, resolution, by=by)
+
+    def review_scope(
+        self,
+        tags: Any = None,
+        text: str = "",
+        major_version: bool = False,
+    ) -> ScanContext:
+        """审查范围分级：**日常开发只审变化，全量只在大版本**。
+
+        用于防止"每轮往返都触发全量构建 + 全量测试"的无效作业：非大版本一律
+        ``scan``（只审变更集与受影响面），仅大版本标签/显式标记才放 ``full``。
+        """
+        return decide_scan(tags=tags, text=text, major_version=major_version)
+
+    def review_scope_commands(self, **kwargs) -> Dict[str, str]:
+        """按范围档位给出构建/测试执行口径（``scan`` 档明确不跑全量）。"""
+        return scan_commands(self.review_scope(**kwargs))
 
     # ------------------------------------------------------------------
     # 进度统计

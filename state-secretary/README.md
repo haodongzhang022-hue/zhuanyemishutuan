@@ -27,6 +27,8 @@
 | POC benchmark | `poc/state_m9_benchmark.py` — token/命中 A/B | poc.md |
 | 会话统一门面 | `SecretarySession` — L3 会话秘书完整驱动（状态+折叠+装配+交接） | org.md |
 | 循环熔断 | `LoopGuard` — 轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒 | loop-guard.md |
+| 评审写回仲裁 | `ReviewArbiter` — 只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口 | review-arbiter.md |
+| 审查范围分级 | `decide_scan` / `ScanContext` — 日常只审变化，全量只在大版本 | review-arbiter.md §6 |
 
 ## 快速开始
 
@@ -82,6 +84,18 @@ if d.action == LoopAction.FUSE.value:
     sec.silent_handoff("秘书·评审", "秘书·开发", "循环熔断交接")  # wake=False
 sec.resume_loop(by="人工", reason="确认收口")    # 恢复预算须人工留痕
 
+# 评审写回：只在开启评审时记版本 + 冲突只额外处理一个
+sec.begin_review()                            # ① 开启评审才登记基线
+dec = sec.apply_review(mutate=lambda c: None) # ② 先落盘（冲突不阻塞评审）
+if dec.should_retry:
+    dec = sec.retry_review()                  # ③ 正在被编辑 → 延迟后重试
+for conf in sec.pending_review_conflicts():   # ④ 待处理冲突至多一张
+    sec.resolve_review_conflict(conf.id, "保留双方，新基线继续", by="人工")
+
+# 审查范围：日常只审变化，全量只在大版本
+assert sec.review_scope().mode == "scan"
+sec.review_scope_commands(tags=["major-version"])   # 大版本才允许全量
+
 # 三层上下文装配（缓存键 = layer_a 哈希）
 result = sec.assemble_context(user_text="查询进度")
 cache_key = result["cache_key"]        # 同一会话稳定不变
@@ -120,7 +134,11 @@ state-secretary/
 │       └── loop/                # 循环熔断守卫（Issue #14）
 │           ├── __init__.py
 │           └── loop_guard.py    # LoopGuard
-├── tests/                       # 370 项测试（门面 148 + 独立探针 65 + 验收矩阵 13 + 循环熔断 62，含评审回归）
+│       └── review/             # 评审版本仲裁 + 审查范围分级（Issue #14 补全机制）
+│           ├── review_arbiter.py  # ReviewArbiter
+│           ├── scope.py           # decide_scan / scan_commands
+│           └── rules.py           # 同侧/过渡态判定规则
+├── tests/                       # 445 项测试（门面 148 + 独立探针 65 + 验收矩阵 13 + 循环熔断 62 + 评审仲裁 75，含评审回归）
 ├── poc/                         # POC 脚本 + benchmark
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC

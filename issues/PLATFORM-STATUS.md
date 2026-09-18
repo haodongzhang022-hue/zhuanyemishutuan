@@ -14,3 +14,6 @@
   - 落地：`state-secretary/src/secretary/loop/loop_guard.py`（轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接）
   - 门禁接入点：`SecretarySession.review_round` / `silent_handoff` / `resume_loop`
   - 规范：`docs/secretary-gate-workflow.md` §2.1（v0.3）；角色提示词 `.cnb/settings.yml`（评审/测试/秘书长）
+  - 补全机制（v0.4 · §2.2/§2.3）：`review/review_arbiter.py`（只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口）
+    + `review/scope.py`（**日常只审变化，全量只在大版本**，防无效构建/测试）；
+    设计：`docs/design/state-secretary-review-arbiter.md`；门面：`begin_review` / `apply_review` / `retry_review` / `resolve_review_conflict` / `review_scope`
