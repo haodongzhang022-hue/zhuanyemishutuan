@@ -84,6 +84,15 @@ from typing import Any, Dict, List, Optional
 # 会话标识白名单（与 SecretarySession / HandoffBus 同族口径，尾锚 \Z 防尾换行）
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
+# 留痕收集 / 归属过滤的**公共实现**（🟢 复评第 5 轮）：与 `collab.probe` 共用
+# 同一份，避免两处再次分叉——🔴1「只取第一条」正是分叉里长出来的缺陷。
+from ..trail import (  # noqa: E402
+    MAX_TRAIL_DEPTH as MAX_COERCE_DEPTH,
+    attributed,
+    collect_marked,
+    trail_re,
+)
+
 # 评论/正文里的预算留痕标记（跨容器传递轮次预算的**可持久载体**）：
 # 交接卡 context、PR/Issue 评论正文里带这一行即可被 `adopt_budget()` 识别。
 #
@@ -91,11 +100,7 @@ _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 # 评论"的**累积载体**，容器回收后正文里必然是多条留痕叠加。只取**第一条** =
 # 拿最旧的那次轮次 → 上界被稀释（"最多 3 轮 / 6 次"永不触发）。故这里**收集
 # 全部**留痕再逐字段 `max()`，与"留痕在前 / 在后"两种顺序都无关。
-BUDGET_TRAIL_RE = re.compile(r'<!--\s*loop-budget:\s*(\{.*?\})\s*-->', re.S)
-
-# 载荷解析的**深度上界**（🟡1）：跨仓/评论载荷不可信，深嵌套 JSON（~3000 层）
-# 会让递归解析抛 `RecursionError` 并逃逸到门面。超界一律按"判不出"处理。
-MAX_COERCE_DEPTH = 8
+BUDGET_TRAIL_RE = trail_re("loop-budget")
 
 # `wake` 的**严格**判定口径（与 HandoffBus.create_handoff 的写出侧一致）：
 #   显式静默（严格 False）→ 静默；显式唤醒（严格 True）→ 唤醒；
@@ -567,12 +572,19 @@ class LoopGuard:
         return data.get("fused") is not False
 
     @staticmethod
-    def _merge_budget_dicts(dicts: Any, _depth: int = 0) -> Optional[dict]:
+    def _merge_budget_dicts(dicts: Any, _depth: int = 0,
+                            session_id: str = "") -> Optional[dict]:
         """把**多份**预算 dict 合并成一份（逐字段 ``max()``，``fused`` 取或）。
 
         🔴1：评论正文里留痕会**累积多条**（每棒把留痕写回评论 = 必做项）。
         只取第一条 = 拿最旧的轮次 → 上界被稀释。故全部取、按 ``max()`` 合并，
         与"留痕在前/在后"的顺序无关。
+
+        **按 ``session_id`` 归属过滤**（🟡1 复评第 5 轮）：同一条评论里可能挂着
+        **别的会话**的留痕（另一个 Issue 已经用掉 5 轮）。无脑 ``max()`` 会把
+        别人的轮次吸收进来 → 本会话下一轮直接 ``fuse``（**误判用尽/误熔断**）。
+        故 ``session_id`` 给出时只合并**属于该会话**的留痕；留痕不带
+        ``session_id`` 字段时不表态（保留）——"没写归属"≠"属于别人"。
 
         内嵌的 ``budget_trail``（``<!-- loop-budget: … -->``）**递归展开后再合并**
         ——交接卡 context 里的预算留痕是内嵌字段，不是单独一段正文。
@@ -587,6 +599,8 @@ class LoopGuard:
         for d in dicts:
             if not isinstance(d, dict):
                 continue
+            if not attributed(d, "session_id", session_id):
+                continue          # 别的会话的留痕：不合并（🟡1）
             rounds = d.get("rounds")
             if isinstance(rounds, dict):
                 for k, v in rounds.items():
@@ -603,9 +617,10 @@ class LoopGuard:
             trail = d.get("budget_trail")
             if isinstance(trail, str) and trail:
                 nested.append(LoopGuard._coerce_budget_payload(
-                    trail, _depth + 1))
+                    trail, _depth + 1, session_id=session_id))
         if nested:
-            inner = LoopGuard._merge_budget_dicts(nested, _depth + 1)
+            inner = LoopGuard._merge_budget_dicts(nested, _depth + 1,
+                                                  session_id=session_id)
             if inner is not None:
                 for k, v in (inner.get("rounds") or {}).items():
                     rounds_out[k] = max(rounds_out.get(k, 0), v)
@@ -623,8 +638,8 @@ class LoopGuard:
         return merged or None
 
     @staticmethod
-    def _coerce_budget_payload(payload: Any,
-                               _depth: int = 0) -> Optional[dict]:
+    def _coerce_budget_payload(payload: Any, _depth: int = 0,
+                               session_id: str = "") -> Optional[dict]:
         """把任意形态的载荷解析成预算 dict（宽进：解析不出 → None，不炸）。
 
         接受：dict / JSON 串 / 含 ``<!-- loop-budget: … -->`` 标记的正文
@@ -640,21 +655,27 @@ class LoopGuard:
         if _depth > MAX_COERCE_DEPTH:
             return None
         if isinstance(payload, dict):
+            if not attributed(payload, "session_id", session_id):
+                return None          # 别的会话的载荷：不合并（🟡1）
             # 内嵌 `budget_trail`（交接卡 context 的形态）也要展开并合并
             trail = payload.get("budget_trail")
             if isinstance(trail, str) and trail:
-                inner = LoopGuard._coerce_budget_payload(trail, _depth + 1)
+                inner = LoopGuard._coerce_budget_payload(
+                    trail, _depth + 1, session_id=session_id)
                 if inner is not None:
                     return LoopGuard._merge_budget_dicts(
-                        [payload, inner], _depth + 1) or payload
+                        [payload, inner], _depth + 1,
+                        session_id=session_id) or payload
             return payload
         if not isinstance(payload, str) or not payload.strip():
             return None
 
         # ① 正文里的**全部** `<!-- loop-budget: … -->` 留痕 → 合并（🔴1）
+        #    归属过滤（🟡1）：只合并属于本会话的留痕（同一条评论可能有多个会话）。
         merged = LoopGuard._merge_budget_dicts(
-            LoopGuard._coerce_budget_payload(m.group(1), _depth + 1)
-            for m in BUDGET_TRAIL_RE.finditer(payload))
+            (rec for rec in collect_marked(payload, "loop-budget")
+             if attributed(rec, "session_id", session_id)),
+            _depth + 1, session_id=session_id)
         if merged is not None and isinstance(merged.get("rounds"), dict):
             return merged
 
@@ -666,20 +687,23 @@ class LoopGuard:
         if not isinstance(got, dict):
             # ③ 正文里散落的多个顶层对象 → 合并（顺序无关；内嵌留痕递归展开）
             got = LoopGuard._merge_budget_dicts(
-                extract_json_objects(payload), _depth + 1)
+                extract_json_objects(payload), _depth + 1,
+                session_id=session_id)
         if not isinstance(got, dict):
             return merged
         if not isinstance(got.get("rounds"), dict) and merged is not None:
             # ④ 合并结果与 ③ 互补（如"留痕段 + 不带 rounds 的载荷"）
-            got = LoopGuard._merge_budget_dicts([got, merged], _depth + 1) or got
+            got = LoopGuard._merge_budget_dicts([got, merged], _depth + 1,
+                                                session_id=session_id) or got
         # 载荷内嵌的 `budget_trail`（`<!-- loop-budget: … -->` 形态）：递归取内层，
         # 与载荷自身的 rounds **合并**（取 max）——不是替换（否则内层较小值时回退）。
         nested = got.get("budget_trail")
         if isinstance(nested, str):
-            inner = LoopGuard._coerce_budget_payload(nested, _depth + 1)
+            inner = LoopGuard._coerce_budget_payload(
+                nested, _depth + 1, session_id=session_id)
             if inner is not None:
                 got = LoopGuard._merge_budget_dicts(
-                    [got, inner], _depth + 1) or got
+                    [got, inner], _depth + 1, session_id=session_id) or got
         return got
 
     def adopt_budget(self, payload: Any, source: str = "",
@@ -698,7 +722,11 @@ class LoopGuard:
             时**保守继承熔断**（宁多一次人工解锁，也不放一个可能已超预算的循环
             继续跑）；键缺失则不表态（不凭"没这个字段"就熔断）。
         """
-        data = self._coerce_budget_payload(payload)
+        # 归属过滤（🟡1）：只合并**属于本会话**的留痕——同一条评论可能挂着
+        # 多个会话/检查点的留痕，无脑 max() 会把别人的轮次吸收进来 → 本会话
+        # 下一轮直接 fuse（误熔断）。
+        data = self._coerce_budget_payload(payload,
+                                           session_id=self.session_id)
         if data is None:
             return {"merged": False, "adopted": {}, "reason": "载荷无法解析（无操作）"}
 

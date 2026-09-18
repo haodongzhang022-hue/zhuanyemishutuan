@@ -60,16 +60,26 @@ npc:
           当前生效值与来源层级（`rules_scope` / `rules_chain`）；
           域内差异**只改数值不改语义**，避免各仓各写一套导致行为漂移
         检查点探测（v0.7 · Issue #14 追问）：等锁/等版本**不靠轮询**，改为**检查点**——
-          `create_checkpoint()` 登记 → `probe_checkpoint()` 到点判定 → 按
-          `dispatch_probe_event()` 落到平台语义；`checkpoints_overview()` 一眼看清
-          「还剩几次探测、下一次等多久、挂在哪」；**最多 6 次**，用尽即交回人工
+          `create_checkpoint(..., waiter_event=…, resolver_event=…)` 登记（🔴G：
+          **两侧事件名必须透传**，否则落点恒降级 `crontab`，"≤5min 挂 await"
+          生产不可达；未显式给出时按当前事件自动登记）→ `probe_checkpoint()` 到点判定
+          → 按 `dispatch_probe_event()` 落到平台语义；`checkpoints_overview()` 一眼看清
+          「还剩几次探测、下一次等多久、挂在哪」；**最多 6 次**，用尽即交回人工。
+          **等锁是三态**（🔴E）：查到且持有 → 等；**查到且未持有 → 放行**；
+          **台账里没有这把锁 → `unknown`（继续等，不得当成"已释放"）**
         全量门禁（v0.11 · Issue #14 本轮）：**默认全量根本不跑**。判定用
           `full_decision(major_version=…, source=…, event=…)`——三重条件缺一不可：
           大版本事实 + 可采信来源（action/tag/operator，**agent 自述不算**）+ 代码推进类事件；
           评论/目录/定时/触发类事件一律 `blocked_full`（防跨仓污染）。
           去升级口径 `repeat_scope: content`：同一份**受审内容**跨版本只跑一次——
           `decide_repeat()` 判 `skip_duplicate` 就不跑；`content_repeats_of()` 看
-          "这份内容被跑了几遍、跨几个版本"（"每开发一步重跑一遍"在这里显形）
+          "这份内容被跑了几遍、跨几个版本"（"每开发一步重跑一遍"在这里显形）。
+          **判重台账跨容器继承（🔴F，与 🔴A 同一载体方案）**：每次 push 都是新容器、
+          新工作区，`<tmp>/run-scope` 从空开始 → 判重永不触发。故用
+          `run_scope_trail()` 把 `<!-- run-scope: … -->` **追加写回同一条评论**，
+          下一棒 `inherit_run_scope(评论正文)` 恢复（按 `session_id` 归属过滤）。
+          **红后修复（同一文件集）允许复跑**——否则"红→修→再跑"这条唯一有信息量的
+          路径会被判重自己堵死。
         三点已确认（v0.8）：① **落点分工固定**——≤5min 挂 `cnb:await`、>5min 交 `crontab`，
           **不存在"一律挂 await"**（长等待挂单个 await = 押注对端一定 resolve，不 resolve 即死等）；
           ② `crontab` 间隔**固定 `*/5` 一档扫**，不随阶梯档位放大（与阶梯时间表解耦）；
@@ -193,10 +203,14 @@ npc:
         - 到点做**延迟后检测**（`retry_review()`）；其他事做完回来收尾用
           `complete_deferred_review()`，只有真的落盘成功才放锁
         - 检查点探测（v0.7 · Issue #14 追问）：**不轮询**——等锁用
-          `create_checkpoint(kind="lock")` + `probe_checkpoint()`，落点交平台且**固定分工**
-          （≤5min `cnb:await` / >5min `crontab` **固定 `*/5`**，不可混用）；
+          `create_checkpoint(kind="lock", waiter_event=…, resolver_event=…)` +
+          `probe_checkpoint()`，落点交平台且**固定分工**（≤5min `cnb:await` /
+          >5min `crontab` **固定 `*/5`**，不可混用）；**两侧事件名必须透传**（🔴G：
+          不透传 → 恒降级 `crontab`，首选落点生产不可达）；
           **最多 6 次**，用尽交回人工；判不出（`unknown`）
-          一律继续等，不得当成"锁已释放"抢写
+          一律继续等，不得当成"锁已释放"抢写。
+          **三态判定**（🔴E）：台账里**没有这把锁**（未登记/跨仓不可见）→ `unknown`；
+          只有"查到且未持有"才是"已释放"——"没查到"与"已释放"必须可区分
     - name: "秘书·测试"
       slogan: "开发自评没问题才接单，联调·性能·安全·E2E——信号灯亮起才放行。"
       prompt: |

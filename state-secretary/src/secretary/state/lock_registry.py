@@ -677,6 +677,11 @@ class LockRegistry:
             "session_id": self.session_id,
             "count": len(held),
             "by_kind": by_kind,
+            # **全量锁键**（含已释放 / 已回收）：探测侧据此区分
+            # 「查到且未持有」（= 已释放 → 放行）与「**没查到**」（= 未登记 /
+            # 跨仓不可见 → 判不出，继续等）。缺了它，两者会被读成同一件事，
+            # 且都取放行方向（🔴E：等他的锁最怕的误放行）。
+            "keys": sorted(all_locks),
             "held": [{
                 "key": r.key,
                 "kind": r.kind,

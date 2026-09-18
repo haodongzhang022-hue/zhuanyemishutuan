@@ -297,7 +297,7 @@ class ReviewArbiter:
         state_manager: StateManager,
         reviewer: str = "reviewer",
         data_dir: Optional[str] = None,
-        retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+        retry_delay_sec: Optional[float] = None,
         clock: Optional[Callable[[], float]] = None,
         lock_registry: Optional[LockRegistry] = None,
         persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
@@ -310,7 +310,12 @@ class ReviewArbiter:
             reviewer: 评审方标识（用于"同向可重试 / 反向算冲突"判定与留痕）
             data_dir: 仲裁数据目录（默认 ``<state 数据根>/../review``，
                 即与会话数据同根，随会话生命周期一并回收）
-            retry_delay_sec: 疑似"正在编辑"时的延迟窗（默认 **60s**），
+            retry_delay_sec: 疑似"正在编辑"时的延迟窗。**不传时取跨仓库规则包
+                `locks.retry_delay_sec`（默认 10s = 等待阶梯首档）**，与
+                `SecretarySession` 走同一条取值路径（🟡4 复评第 5 轮：旧实现
+                独立构造时硬编码 60s，与规则包/会话路径的 10s 不一致 →
+                "同一条口径两条取值路径"）。显式传入仍以调用方为准；
+                规则包也找不到时回落 ``DEFAULT_RETRY_DELAY_SEC``（60s 兼容值）。
                 窗内不落盘、先把其他做完；**再次触发**则该锁升级为持续锁
             clock: 时间源（默认 ``time.time``，测试可注入）
             lock_registry: 锁聚合台账（默认在 ``<state 数据根>/locks/`` 自建）。
@@ -328,6 +333,19 @@ class ReviewArbiter:
                 f"非法 session_id: {session_id!r}。仅允许 [A-Za-z0-9_-]。")
         if state_manager is None or not hasattr(state_manager, "cas_save_card"):
             raise ValueError("state_manager 须为 StateManager 实例（提供 cas_save_card）。")
+        # 🟡4：不传 → 与**会话路径同源**（跨仓库规则包 `locks.retry_delay_sec`），
+        # 不再硬编码 60s；规则包缺失时才回落兼容默认值。这样"独立构造的
+        # ReviewArbiter"与"会话里的 ReviewArbiter"不会给出两套延迟窗。
+        if retry_delay_sec is None:
+            retry_delay_sec = DEFAULT_RETRY_DELAY_SEC
+            try:
+                from ..collab.rules import load_rules
+                retry_delay_sec = float(load_rules(
+                    search_from=os.path.dirname(
+                        os.path.abspath(state_manager.data_dir.rstrip(os.sep)))
+                    or None).lock_retry_delay_sec)
+            except Exception:      # pragma: no cover - 宽进：装载失败用兼容默认
+                retry_delay_sec = DEFAULT_RETRY_DELAY_SEC
         if not isinstance(retry_delay_sec, (int, float)) \
                 or isinstance(retry_delay_sec, bool) or retry_delay_sec < 0:
             raise ValueError(

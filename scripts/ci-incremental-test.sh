@@ -16,6 +16,14 @@
 #   - "连跑 N 次同一命令"当稳定性论证 → 拒绝（不受任何口径字段影响）；
 #   - **能力降级**：算不出受影响面时**保守放行**（判不出就不增量；
 #     漏跑比多跑危险——官方 SCA 增量规则同源）。
+#   - **跨容器判重（🔴F，本轮）**：平台每次 push = **新容器、新工作区**，
+#     `<tmp>/run-scope` 每次都从空开始 → 判重永不触发（实测 r1/r2/r3 全 run）。
+#     故台账随**可持久载体**走（PR/Issue 评论正文，与 🔴A 同一方案）：
+#       ① 跑之前 `adopt_trails()` 从 `CNB_RUN_SCOPE_TRAIL`（评论正文）恢复；
+#       ② 跑之后 `record_repeat(..., verdict=<真实结论>)` + 打印
+#          `<!-- run-scope: … -->`，由流水线**追加写回同一条评论**。
+#     CI 必须落**真实结论**（verdict）：否则"红→修→再跑"这条唯一有信息量的
+#     路径会被判重自己堵死（内容没变=同一份受审内容，结论为空=不绿不红）。
 #
 # 用法：
 #   ./scripts/ci-incremental-test.sh                      # 增量（默认）
@@ -149,12 +157,21 @@ rules = load_rules(search_from=pkg)
 guard = RunScopeGuard(rules, data_dir=os.path.join(
     os.environ.get("CNB_RUN_SCOPE_DIR", "/tmp"), "run-scope"))
 cmd = "pytest -q %s" % targets
+
+# 🔴F ①：从**可持久载体**（评论正文）恢复判重台账。平台每次 push 都是新容器，
+# 本地台账从空开始 → 判重永不触发；容器会被回收，**评论不会**。
+trail = os.environ.get("CNB_RUN_SCOPE_TRAIL", "")
+if trail:
+    got = guard.adopt_trails(trail, session_id=os.environ.get("CNB_SESSION_ID", ""))
+    print("[guard] 从留痕恢复（跨容器继承）：merged=%s" % got.get("merged"))
+
 try:
     wr = int(window)
 except ValueError:
     wr = 1
 # **去升级口径**（本轮加固）：按"受审内容"判重——同一份变更集在**新版本**下
 # 重跑同样算重复（修掉"每改一行 revision 就变 → 每次都放行"）。
+# 🔴F：上一次结论取**台账里的真实结论**（跨容器从留痕恢复），不靠调用方传参。
 d = guard.decide_repeat(mode=scope, revision=revision, impact=targets,
                         command=cmd, window_repeats=wr,
                         base=(base_sha or None), event=event)
@@ -171,8 +188,9 @@ if not d.should_run:
         print("[guard] 稳定性论证请改用：%s" % ", ".join(d.alternatives))
     print("[guard] 跳过执行（同一受审内容重复跑无判别力）")
     sys.exit(10)
-guard.record_repeat(mode=scope, revision=revision, impact=targets, command=cmd)
-print("[guard] 已登记本次执行")
+# **不在这里登记**：先跑，拿到**真实结论**再登记（见脚本末尾的 record 步骤）——
+# 登记时若不给 verdict，"上一轮不绿才允许复跑"的例外永远不成立（🔴F）。
+print("[guard] 判定=执行；跑完再按**真实结论**登记（verdict 由本脚本回填）")
 PYEOF
 )"
 GUARD_RC=$?
@@ -184,10 +202,47 @@ if [ "$GUARD_RC" -eq 10 ]; then
 fi
 
 cd "$PKG"
+set +e
 if [ -n "${TEST_TARGETS:-}" ]; then
   # shellcheck disable=SC2086
   python3 -m pytest -q $TEST_TARGETS
 else
   python3 -m pytest -q
+fi
+TEST_RC=$?
+set -e
+
+# 🔴F ②：把**真实结论**写进台账，并打印可持久留痕（流水线追加写回同一条评论）。
+# 没有这一步：① 台账里没有 verdict → "上一轮不绿才允许复跑"的例外永不成立；
+# ② 下一棒（新容器）读不到"这份内容跑过几遍" → 判重永不触发。
+VERDICT="$([ "$TEST_RC" -eq 0 ] && echo "passed" || echo "failed(rc=$TEST_RC)")"
+python3 - "$REVISION" "$SCOPE" "$CANON_TARGETS" "$PKG" "$VERDICT" <<'PYEOF'
+import os, sys
+rev, scope, targets, pkg, verdict = sys.argv[1:6]
+sys.path.insert(0, os.path.join(pkg, "src"))
+try:
+    from secretary.collab import RunScopeGuard, load_rules
+except Exception as exc:                       # 依赖缺失 → 不挡住干活
+    print("[guard] 无法装载守卫（%s）→ 跳过登记" % exc)
+    raise SystemExit(0)
+guard = RunScopeGuard(load_rules(search_from=pkg), data_dir=os.path.join(
+    os.environ.get("CNB_RUN_SCOPE_DIR", "/tmp"), "run-scope"))
+trail_in = os.environ.get("CNB_RUN_SCOPE_TRAIL", "")
+sid = os.environ.get("CNB_SESSION_ID", "")
+if trail_in:
+    guard.adopt_trails(trail_in, session_id=sid)
+guard.record_repeat(mode=scope, revision=rev, impact=targets,
+                    command="pytest -q %s" % targets, verdict=verdict)
+print("[guard] 已登记本次执行：verdict=%s" % verdict)
+# 可持久留痕（写回评论用；保留旧留痕，解析侧取 max + 按归属过滤）
+out = guard.trails(session_id=sid)
+if out:
+    print("[guard] 写回评论的留痕（追加，勿删旧的）：")
+    print(out)
+PYEOF
+
+if [ "$TEST_RC" -ne 0 ]; then
+  echo "[ci] 增量测试**未通过**（rc=$TEST_RC）——结论已登记，修复后同一份受审内容允许复跑"
+  exit "$TEST_RC"
 fi
 echo "[ci] 增量测试通过"

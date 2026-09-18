@@ -97,6 +97,15 @@ from .platform import (  # noqa: E402  （同包内相对导入，放这里保�
     resolve_driver,
 )
 
+# 留痕收集/归属过滤的**公共实现**（🟢 复评第 5 轮：与 `loop_guard` 不再各写一份，
+# 避免两处再次分叉——🔴1「只取第一条」正是分叉里长出来的）。
+from ..trail import (  # noqa: E402
+    MAX_TRAIL_DEPTH,
+    attributed,
+    collect_marked,
+    trail_re,
+)
+
 # 会话/检查点标识的**安全校验**统一走 `_safe_shared_id()`（见文件末尾）：
 # 跨仓标识（`org/repo#14`）与本地标识共用同一条判定，不再保留第二份正则
 # （🟡6：原先的 `_SAFE_ID` 定义后无人使用，死代码会被误读为"已校验"）。
@@ -176,11 +185,33 @@ def _as_list(value: Any) -> List[Any]:
 # **取全部留痕、按 `max()` 合并**（复评第 3 轮 🔴1，与 `loop_guard.BUDGET_TRAIL_RE`
 # 同一口径）：评论正文是"每棒把留痕写回评论"的累积载体（`.cnb.yml` 必做项），
 # 正文里必然多条叠加；只取**第一条** = 拿最旧那次轮次 → "最多 6 次"永不触发。
-PROBE_BUDGET_TRAIL_RE = re.compile(r'<!--\s*probe-budget:\s*(\{.*?\})\s*-->', re.S)
+PROBE_BUDGET_TRAIL_RE = trail_re("probe-budget")
 
 # 载荷解析的**深度上界**（🟡1）：跨仓载荷不可信，深嵌套 JSON（~3000 层）会让
 # 递归解析抛 `RecursionError` 并逃逸到门面；超界一律按"判不出"处理。
-MAX_COERCE_DEPTH = 8
+MAX_COERCE_DEPTH = MAX_TRAIL_DEPTH
+
+
+def _lock_key_known(known: Any, scope: str) -> bool:
+    """台账是否**出现过**这个锁键（含已释放/已回收的记录）。
+
+    只有"出现过"才敢把"当前未持有"读成"**已释放**"；否则只能判"没查到"→
+    `unknown`（🔴E）。台账不给全量键（旧视图 / 手搓视图）时，**取保守方向**：
+    按"没查到"处理（宁可多等一次，不可误放行）。
+    """
+    if not isinstance(known, (list, tuple, set, frozenset)):
+        return False
+    if not scope:
+        return False
+    return scope in {str(k) for k in known}
+
+
+def _judge_lock(facts: Dict[str, Any]) -> Any:
+    """锁事实 → 判定（持有 → wait；未持有 → proceed）。"""
+    if facts.get("lock_held"):
+        return WAIT, (f"锁仍在 {facts.get('holder') or '未知持有者'} 手上"
+                      "（持续锁：等对方处理完）")
+    return PROCEED, "锁已释放 → 条件满足，可以继续"
 
 
 def crontab_minutes_from_rules(rules: Optional[Any]) -> int:
@@ -613,8 +644,8 @@ class CheckpointProbe:
                 + " -->")
 
     @staticmethod
-    def _coerce_checks_used(value: Any,
-                            _depth: int = 0) -> Optional[int]:
+    def _coerce_checks_used(value: Any, _depth: int = 0,
+                            cp_key: Any = "") -> Optional[int]:
         """从任意形态的载荷里取外部探测轮次（宽进：取不到 → ``None``）。
 
         接受：int / 数字串 / 字典（``checks_used`` 或 ``rounds.checks_used``）/
@@ -623,6 +654,12 @@ class CheckpointProbe:
         **多条留痕 → 取 ``max()``**（🔴1）：评论正文里留痕会累积多条
         （每棒把留痕写回评论是 `.cnb.yml` 的必做项），只取第一条 = 拿最旧那次
         轮次 → "最多 6 次"永不触发。故收集**全部**留痕取最大值，与顺序无关。
+
+        **按归属过滤**（🟡1 复评第 5 轮）：同一条评论里可能同时挂着**多个检查点**
+        的留痕（A 用掉 6 次、B 才 1 次）。无脑 `max()` 会让 B "继承" A 的轮次 →
+        B 一上来就判「预算用尽」→ `resume_required`（**误判用尽**）。故当
+        `cp_key` 给出时，只采纳**属于该检查点**的留痕；留痕不带 `checkpoint_key`
+        字段时不表态（保留）——"没写归属"≠"属于别人"。
 
         **深度上界**（🟡1）：跨仓载荷不可信，深嵌套 JSON 会触发 ``RecursionError``
         并逃逸到门面；超过 ``MAX_COERCE_DEPTH`` 一律按"判不出"（``None``）处理。
@@ -636,19 +673,17 @@ class CheckpointProbe:
         if isinstance(value, float):
             return max(0, int(value))
         if isinstance(value, str):
-            text = value.strip()
             best: Optional[int] = None
-            for m in PROBE_BUDGET_TRAIL_RE.finditer(text):
-                try:
-                    got = json.loads(m.group(1))
-                except (ValueError, RecursionError):
-                    got = None
-                inner = CheckpointProbe._coerce_checks_used(got, _depth + 1) \
-                    if isinstance(got, dict) else None
+            for got in collect_marked(value, "probe-budget"):
+                if not attributed(got, "checkpoint_key", cp_key):
+                    continue
+                inner = CheckpointProbe._coerce_checks_used(
+                    got, _depth + 1, cp_key=cp_key)
                 if inner is not None and (best is None or inner > best):
                     best = inner
             if best is not None:
                 return best
+            text = value.strip()
             try:
                 return max(0, int(text))
             except ValueError:
@@ -657,20 +692,22 @@ class CheckpointProbe:
             best: Optional[int] = None
             for key in ("checks_used", "external_checks", "used"):
                 if key in value:
-                    got = CheckpointProbe._coerce_checks_used(value[key],
-                                                              _depth + 1)
+                    got = CheckpointProbe._coerce_checks_used(
+                        value[key], _depth + 1, cp_key=cp_key)
                     if got is not None:
                         return got
             rounds = value.get("rounds")
             if isinstance(rounds, dict):
-                got = CheckpointProbe._coerce_checks_used(rounds, _depth + 1)
+                got = CheckpointProbe._coerce_checks_used(
+                    rounds, _depth + 1, cp_key=cp_key)
                 if got is not None:
                     best = got
             # 内嵌的**留痕**（`budget_trail` 字段，交接卡 context / 事件载荷形态）
             # 也要展开（🔴1 同族）：否则"带留痕的载荷"只能读到载荷自身的轮次。
             trail = value.get("budget_trail")
             if isinstance(trail, str) and trail:
-                got = CheckpointProbe._coerce_checks_used(trail, _depth + 1)
+                got = CheckpointProbe._coerce_checks_used(
+                    trail, _depth + 1, cp_key=cp_key)
                 if got is not None and (best is None or got > best):
                     best = got
             return best
@@ -690,7 +727,10 @@ class CheckpointProbe:
         Returns:
             ``{"merged": bool, "checks_used": int, "max_checks": int}``。
         """
-        external = self._coerce_checks_used(payload)
+        # 归属过滤（🟡1）：只采纳**属于本检查点**的留痕——同一条评论里
+        # 可能挂着多个检查点的留痕，无脑 max() 会把别人的轮次"继承"过来，
+        # 直接判「预算用尽」（误判用尽）。
+        external = self._coerce_checks_used(payload, cp_key=cp.key)
         if external is None or external <= cp.checks_used:
             return {"merged": False, "checks_used": cp.checks_used,
                     "max_checks": cp.max_checks}
@@ -914,7 +954,22 @@ class CheckpointProbe:
     # ------------------------------------------------------------------
 
     def _collect_lock_facts(self, cp: Checkpoint) -> Optional[Dict[str, Any]]:
-        """采集**锁快照**（边缘探测器口径：只取相关那一把，不搬全量）。"""
+        """采集**锁快照**（边缘探测器口径：只取相关那一把，不搬全量）。
+
+        **三态返回**（🔴E 复评第 5 轮；🟢 同轮建议）：旧实现把"没查到这把锁"
+        与"查到且未持有"都返回 ``{"lock_held": False}`` —— 于是"对方**尚未登记**"
+        与"对方**已释放**"在判定上**完全不可区分，且都取放行方向**：等他的锁最怕的
+        误放行。现改为：
+
+        - ``{"lock_held": True, ...}`` —— **查到且被持有**（→ ``wait``）；
+        - ``{"lock_held": False}`` —— **查到且未持有**（→ ``proceed``）；
+        - ``{"lock_held": None}`` —— **没查到这把锁**（scope 未登记 / 跨仓不可见，
+          台账里没有它的任何痕迹）→ 判不出 → ``unknown``（**继续等**，不误放行）；
+        - ``None`` —— 锁表整体不可见（未接入台账）→ ``unknown``。
+
+        "查到过"的判据是台账给出的**全量锁键**（``keys``，含已释放/已回收的记录）：
+        只有"这把锁曾经/正在台账里出现"才敢把"当前未持有"读成"已释放"。
+        """
         view = None
         if self._lock_view is not None:
             try:
@@ -925,6 +980,7 @@ class CheckpointProbe:
             return None
         scope = cp.scope or cp.key
         held = view.get("held") if isinstance(view, dict) else None
+        known = view.get("keys") if isinstance(view, dict) else None
         if isinstance(held, list):
             for row in held:
                 if not isinstance(row, dict):
@@ -936,15 +992,17 @@ class CheckpointProbe:
                         "persistent": bool(row.get("persistent")),
                         "ttl_left_sec": row.get("ttl_left_sec"),
                     }
-            return {"lock_held": False, "holder": ""}
-        # 兼容 `{key: {...}}` 形态
+            return ({"lock_held": False, "holder": ""}
+                    if _lock_key_known(known, scope) else {"lock_held": None})
+        # 兼容 `{key: {...}}` 形态（只含**持有中**的锁 → 未命中一律判"没查到"）
         if isinstance(held, dict):
             row = held.get(scope)
-            if row is None:
-                return {"lock_held": False, "holder": ""}
-            return {"lock_held": True,
-                    "holder": (row or {}).get("holder", "")
-                    if isinstance(row, dict) else ""}
+            if row is not None:
+                return {"lock_held": True,
+                        "holder": (row or {}).get("holder", "")
+                        if isinstance(row, dict) else ""}
+            return ({"lock_held": False, "holder": ""}
+                    if _lock_key_known(known, scope) else {"lock_held": None})
         return None
 
     def _collect_version_fact(self, cp: Checkpoint) -> Optional[Dict[str, Any]]:
@@ -977,6 +1035,19 @@ class CheckpointProbe:
         # 跨容器预算继承（**在"是否用尽"判定之前**合并，否则永远判不出用尽）。
         self.adopt_checks_budget(cp, kwargs, save=False)
         if cp.used_up():
+            # 🟡5：**用尽分支也要落盘**。旧实现直接 `return _outcome(...)`：
+            # 外部 `checks_used=6` 被合并进内存却从未写盘 → 磁盘与 `overview()`
+            # 仍显示 0，而事件留痕显示 6 —— **观测面与判定不一致**（复核者
+            # 看不出"为什么这次判用尽"，下一棒读磁盘也读不到已用尽）。
+            cp.resume_required = True
+            cp.last_verdict = WAIT
+            cp.next_delay_sec = 0.0
+            cp.history.append({
+                "at": self._clock(), "action": "budget_exhausted",
+                "checks_used": cp.checks_used, "max_checks": cp.max_checks,
+                "note": "探测预算用尽（含外部合并轮次）→ 停止自动挂账，交回人工",
+            })
+            self._save(cp)
             return self._outcome(cp, WAIT,
                                  reason="探测预算已用尽（最多 %d 次）" % cp.max_checks,
                                  resume_required=True,
@@ -1049,13 +1120,20 @@ class CheckpointProbe:
             return UNKNOWN, "缺少确认事实（未给 confirmed）"
         prev = cp.last_facts if prev is None else prev
         if kind == CHECK_LOCK:
-            facts = self._collect_lock_facts(cp) or facts
+            # ① **显式事实优先**（🔴E）：调用方给出的可判定事实不得被"缺席推断"
+            #    覆盖——旧实现 `self._collect_lock_facts(cp) or facts` 会让
+            #    "台账里没这把锁"（= 判不出）把显式的 `lock_held=True` 冲掉，
+            #    方向还是**放行**（最危险的那一侧）。
             if "lock_held" in facts:
-                if facts["lock_held"]:
-                    return WAIT, (f"锁仍在 {facts.get('holder') or '未知持有者'} 手上"
-                                  "（持续锁：等对方处理完）")
-                return PROCEED, "锁已释放 → 条件满足，可以继续"
-            return UNKNOWN, "锁表不可见（未接入锁台账）→ 不误判，继续等"
+                return _judge_lock(facts)
+            # ② 否则读锁台账（三态：查到持有 / 查到未持有 / **没查到**）
+            snap = self._collect_lock_facts(cp)
+            if snap is None:
+                return UNKNOWN, "锁表不可见（未接入锁台账）→ 不误判，继续等"
+            if snap.get("lock_held") is None:
+                return UNKNOWN, ("锁台账里**没有这把锁**（scope 未登记 / 跨仓不可见）"
+                                 "→ 不误判为「已释放」，继续等")
+            return _judge_lock(snap)
         if kind == CHECK_VERSION:
             facts2 = self._collect_version_fact(cp) or facts
             if "version_changed" in facts2:

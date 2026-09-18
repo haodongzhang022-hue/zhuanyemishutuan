@@ -1254,3 +1254,55 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   🔴4 `fused=1/"yes"/0/None` 一律 `is_fused()=True`；
   🟡 深嵌套不抛、await 事件名同源、坏 key→None、`wake_allowed` 保守、plan 无重复行。
 - 兜底解析器 vs PyYAML **逐字段比对**（两份真实规则包）：差异 **0**。
+
+---
+
+## 21. 复评第 5 轮定点修复（PR #15 · 基线 `a7847f9`）
+
+> 触发：架构·评审 复评第 4 轮 —— 本轮 🔴1–🔴4 已认可清零，但**第 3 轮同时提出的
+> 🔴E–🔴H 本轮未处理、在 `a7847f9` 上逐项实测仍成立** → 处置标签 `fix_bug`。
+> 本节只记该 4 项 🔴 与 5 项 🟡（+ 2 项 🟢）的修法与判别性回归。
+
+### 21.1 🔴 四项（未清零项）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归 |
+|---|---|---|---|
+| 🔴E | 等锁判定把「台账**查不到这把锁**」当「锁已释放」→ 放行。未登记 / 已释放**不可区分且都取放行方向**；显式 `lock_held=True` 也被 `_collect_lock_facts(cp) or facts` 覆盖成放行 | `_collect_lock_facts` 改**三态返回**（`True` / `False` / `None`=没查到）；台账 `overview()` 增**全量锁键** `keys`（含已释放/已回收）作为"查到过"的判据；判定改为**显式事实优先**（`if "lock_held" in facts` 先判），缺席推断**永不覆盖**显式事实 | `TestLockFactsAreThreeState`（未登记 → `unknown`；曾登记已释放 → `proceed`；**两者可区分**；显式 `lock_held=True` + 台账查不到 → `wait`；手搓视图不给 `keys` → 保守 `unknown`）/ **反向**：整体未接台账仍 `unknown` |
+| 🔴F | 判重台账落 `<tmp>/run-scope`、无留痕回写、CI 不落 verdict → 平台每次 push = **新容器** → 判重**永不触发**（实测 r1/r2/r3 全 `run`）；`record_repeat(...)` 不传 `verdict` → "修完同一文件集的新提交仍 `skip_duplicate`" | 与 🔴A **同一载体方案**：`RunScopeGuard.trail()/trails()` = `<!-- run-scope: {…} -->`，`adopt_trails()` 恢复（`max()` + 按 `session_id` 归属过滤）；门面 `run_scope_trail()` / `inherit_run_scope()`；CI 脚本接 `CNB_RUN_SCOPE_TRAIL`、跑完 `record_repeat(..., verdict=<rc 回填>)` 并打印写回留痕；**红后（同一受审内容）允许复跑**（`decide_repeat` 从台账取真实结论） | `TestRunScopeCarrierAcrossContainers`（跨容器第 2 次 → `skip_duplicate`；红后同一文件集 → 可复跑；绿仍跳过；归属过滤；只增不减；门面载体入口；CI 接线断言）/ **反向**：不带留痕每容器仍从 0 开始 |
+| 🔴G | 门面 `create_checkpoint` / `register_platform_wait` 形参**没有**两侧事件名 → 落点四档恒 `platform_crontab`，"≤5min 挂 `cnb:await`"这条**首选落点在生产路径不可达**（照角色提示词用门面调用永远走不到） | 门面两处补 `waiter_event` / `resolver_event`（+ `stage`）并透传；未显式给出时按**当前事件**（`CNB_EVENT` / `CNB_PIPELINE_EVENT` / `CNB_TRIGGER_EVENT`）自动登记 | `TestFacadeCarriesEvents`（同事件 → 计划与登记两处都 `platform_await`；显式事件生效；环境事件回落生效）/ **反向**：两侧不同 / 事件不可判定 → 仍降级 `crontab` |
+| 🔴H | `main.push` 新增的增量测试阶段 `image: node:20` 且**零安装步骤**（该镜像不含 python3）→ `python3 -m pytest` 在干净镜像里**必失败**（`set -euo pipefail`），且 `main` 此前无测试阶段 → 本 PR 新引入 | `.cnb.yml` 的 `main.push` 改 `image: python:3.11` + `pip install pytest`（+ 运行时自检）；删掉 `python3 --version || true`（`|| true` 把"没有运行时"静默吞掉） | `TestCiDeclaresRuntime`（镜像声明 Python 运行时；装 pytest；无 `|| true` 吞错；CI 脚本按真实 rc 失败） |
+
+### 21.2 🟡 五项
+
+| 项 | 缺陷 | 修法 | 回归 |
+|---|---|---|---|
+| 🟡1 | 多留痕 `max()` **未按归属过滤**：把 A 检查点的 `checks_used=6` / 别的会话的 `rounds.total=5` 合并进来 → **误判"预算用尽"/"已熔断"** | `loop_guard._merge_budget_dicts` / `_coerce_budget_payload` 按 `session_id` 过滤；`probe._coerce_checks_used` 按 `checkpoint_key` 过滤（`adopt_checks_budget` 传 `cp.key`）；留痕**不带该字段时不表态**（保留） | `TestTrailAttribution`（跨会话不吸收、跨检查点不吸收、本会话/本检查点照常合并、无归属字段保留）/ **反向**：A 用尽 6 次不再让 B 判 `resume_required` |
+| 🟡2 | `_is_red` **子串**匹配把 `"577 passed, 0 failed"` 判红 → "允许重跑一次"的例外**恒真激活** | 匹配前先把 `0 failed` / `0 errors` 这类**零个失败**整段抹掉（`_ZERO_ISSUE_RE`） | `TestRedVerdictIgnoresZeroCounts`（6 组"零失败"→ 非红；7 组真失败 → 红；端到端：上轮 `"577 passed, 0 failed"` → 仍 `skip_duplicate`）/ **反向**：`2 failed` 仍允许重跑一次 |
+| 🟡3 | `checkpoint_plan(checks=3)` 返回 4 行但 docstring 未说明"含末尾用尽行" | docstring 明写"返回行数 = 档位数 + 1，末尾恒有「预算用尽」行" | `TestCheckpointPlanDocstring`（docstring 含"预算用尽"/"档位数 + 1"；`checks=3` → `[1,2,3,7]` 末行 `handoff_resume`） |
+| 🟡4 | `ReviewArbiter` **独立构造**默认硬编码 60s，与规则包 / 会话路径的 10s 不一致 | `retry_delay_sec` 改 `Optional[float]`：不传 → 取规则包 `locks.retry_delay_sec`（与会话同一取值路径）；规则包缺失才回落 `DEFAULT_RETRY_DELAY_SEC` | `TestReviewArbiterDefaultDelay`（独立构造 = 规则包值；会话与独立构造一致）/ **反向**：显式传入仍以调用方为准 |
+| 🟡5 | 预算用尽分支**不落盘**：外部 `checks_used=6` 时磁盘 / `overview` 仍显示 0，而事件留痕显示 6 → **观测面与判定不一致** | 用尽分支补 `_save(cp)` + `history` 留痕（`action="budget_exhausted"`）+ 置 `resume_required` | `TestExhaustedBudgetPersists`（磁盘/总览显示 6、`resume_required=True`、留痕可见）/ **反向**：正常探测路径照常落盘 |
+
+### 21.3 🟢 两项
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 留痕收集/归属过滤抽公共实现 | 新增 `secretary/trail.py`（`trail_re` / `collect_marked` / `attributed` / `MAX_TRAIL_DEPTH`）；`loop_guard.BUDGET_TRAIL_RE` 与 `probe.PROBE_BUDGET_TRAIL_RE` 均改为 `trail_re(...)`，两处不再各写一份同形正则 | `TestTrailAttribution::test_shared_trail_impl_is_single_source`（两处正则来自同一实现；`collect_marked` 收集**全部**留痕） |
+| 锁采集三态返回 | 见 🔴E（`_collect_lock_facts` 从"缺席即推断"改为"缺席即 `unknown`"） | 见 🔴E 回归 |
+
+### 21.4 自测
+
+- `pytest -q`：**909 passed**（基线 `a7847f9` 853 + 本轮新增
+  `test_collab_round5_fixes_issue14.py` **55** 项 + 上一轮改判的
+  `test_full_gate_issue14.py` 净 +1），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 ✅。
+- **独立探针**（非复用作者测试）复现 → 修复后复测：
+  🔴E 未登记 → `unknown`（旧 `proceed`）、已释放 → `proceed`、两者可区分；
+  🔴F 跨容器序列 `run → skip_duplicate`（旧恒 `run`）、红后同内容可复跑；
+  🔴G 门面同事件落点 = `platform_await`（旧恒 `platform_crontab`）；
+  🔴H `.cnb.yml` 声明 `python:3.11` + 装 pytest；
+  🟡1 跨检查点 `checks_used` 不再污染（`coerce(body, cp_key="cpB")=0`）；
+  🟡2 `_is_red("577 passed, 0 failed")=False`；
+  🟡5 用尽后磁盘 `checks_used=6`。
+- CI 脚本**端到端模拟**（同一受审内容连跑 3 个"新容器"）：容器 1 `run` +
+  留痕 → 容器 2/3 `skip_duplicate`（旧实现三个容器全 `run`）。

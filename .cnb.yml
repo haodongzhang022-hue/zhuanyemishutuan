@@ -67,22 +67,43 @@
 main:
   push:
     - docker:
-        image: node:20
+        # 🔴H（复评第 5 轮）：本阶段会跑 `python3 -m pytest`，**必须声明运行时**。
+        # 旧配置只声明了 Node 运行时（`node:20`）且零安装步骤 —— 该镜像**不含 python3**
+        # （逐层核对：apt 清单里只有 ca-certificates/curl/gnupg/netbase/sq/wget
+        # 与 scm、buildpack-deps 的 -dev 库，Env 无 python 路径），
+        # 于是 `python3 -m pytest` 在干净 node 镜像里**必失败**（`set -euo pipefail`），
+        # 而 main 分支此前无测试阶段 → 属"新引入的必失败阶段"。
+        # 现改为 `python:3.11`（自带 python3 + pip，与 setup.py 的
+        # `python_requires=">=3.9"` 一致），并在 stages 里装测试依赖（pytest）。
+        image: python:3.11
       volumes:
-        - /root/.npm:copy-on-write
+        - /root/.cache/pip:copy-on-write
       stages:
         - echo "秘书团流水线已启动"
-        - node -v
+        - python3 --version
+        # 运行时自检（🔴H）：**装不上 pytest 就直接失败**，不再靠 `|| true`
+        # 把"没有运行时/没有测试框架"静默吞掉（那正是"阶段看似跑了、实际没跑"）。
+        - python3 -m pip install --disable-pip-version-check -q pytest
+        - python3 -c "import pytest, sys; print('pytest', pytest.__version__, sys.version)"
         # **增量测试（日常唯一跑法）**：只跑本 PR/本次推送**变更相关**的用例，
         # 不跑全量、更不连跑同一命令（跑法固定 → 重复跑不产生判别力）。
         # 全量只在**大版本**（major-version 标签 / 显式触发）。
         # 口径（机制，非提醒）：`RunScopeGuard.decide()` 同口径第 2 次起 skip_duplicate；
         # "连跑 N 次"当稳定性论证 → blocked_stability + 替代口径
         # （定点/变异探针、独立场景）。规则见 shared/collab/*.yaml。
-        - python3 --version || true
         # **唯一的执行入口**：不接收"全量"参数（全量只能由大版本流程显式触发），
         # 因此不存在"通过传参绕过全量门禁"的路径。
         # `utils:params` 只用于**观测**（打印本次拿到的参数），不参与执行。
+        #
+        # 🔴F（跨容器判重载体）：平台每次 push = **新容器、新工作区**，
+        # `<tmp>/run-scope` 每次都从空开始 → 判重永不触发。故台账随**可持久载体**
+        # （评论正文）走，与 🔴A 同一方案：
+        #   ① 跑前把评论正文里的 `<!-- run-scope: … -->` 放进
+        #      `CNB_RUN_SCOPE_TRAIL`（未注入则本次按"无历史"处理，不误拦）；
+        #   ② 跑后脚本打印新的 `<!-- run-scope: … -->` → **追加写回同一条评论**
+        #      （保留旧留痕；解析侧 `max()` + 按 `session_id` 归属过滤）。
+        # 结论必须落**真实退出码**：否则"红→修→再跑"这条唯一有信息量的路径
+        # 会被判重自己堵死（受影响面不变 = 同一份受审内容）。
         - ./scripts/ci-dispatch.sh
 
 # Issue / PR 评论触发（**只做秘书接待，不做测试**）
@@ -142,6 +163,11 @@ main:
             ③ 把本次 `dispatch_probe_event(...)["budget_trail"]` **追加写回同一条评论**
             （= ①取留痕的那条；保留旧留痕，解析侧按 max() 合并，评论数不膨胀）。
             没有第 ③ 步，下一棒又会归零（等于把软约束换了个位置）。
+          - **判重台账同样跨容器继承（🔴F）**：跑增量测试前 `inherit_run_scope(评论正文)`
+            恢复"这份受审内容跑过几遍、上轮结论是什么"（留痕 `<!-- run-scope: … -->`，
+            按 `session_id` 归属过滤）；跑完用 `run_scope_trail()` 把新留痕
+            **追加写回同一条评论**（保留旧留痕）。结论必须落**真实退出码**——
+            否则"红→修→再跑"（受影响面不变）会被自己的判重堵死。
           - **跨仓接力只传判定**（wait/proceed/release/unknown），接收方按组织级同一份规则
             算落点（`dispatch_probe_event_shared()`），**不按自己的本地会话号重算**；
             判不出/非法判定一律 `unknown` → 继续等，**不得当成放行**。

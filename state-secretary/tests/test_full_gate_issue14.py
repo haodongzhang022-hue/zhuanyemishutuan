@@ -41,7 +41,6 @@ from secretary.collab import (
     SOURCE_ACTION,
     SOURCE_AGENT_CLAIM,
     SOURCE_OPERATOR,
-    SOURCE_TAG,
     CollabRules,
     RunScopeGuard,
     content_key_of,
@@ -275,16 +274,30 @@ class TestRepeatScopeDeEscalation:
                                "command": "pytest -q tests/test_z.py"})
         assert d.action == RUN
 
-    def test_red_verdict_does_not_license_content_repeat(
+    def test_red_verdict_licenses_content_repeat(
             self, rules: CollabRules) -> None:
-        """**反向对照**：上一轮红**也**不得成为"换个版本重跑同一份内容"的理由。
+        """**红后修复必须可复跑**（🔴F 复评第 5 轮，取代上一轮的反向断言）。
 
-        "红→修→再跑"的前提是**修了**（内容会变）；内容没变就说明没修，
-        再跑一遍不会有新信息。
+        上一轮的断言是"红也不得成为重跑同一份内容的理由"，理由写作"红→修→再跑
+        的前提是修了（内容会变）"。**那条理由不成立**：修 bug 常常改的就是
+        **同一批文件**（受影响面/命令不变 = 同一份受审内容）→ 一律跳过就把
+        "红 → 修 → 再跑"这条**唯一有信息量**的路径堵死了（实测：修完同一文件集
+        的新提交仍 `skip_duplicate`，修复代码永远得不到验证）。
+
+        现口径与 `decide()` 的例外一致：上一轮**明确不绿** → 允许复跑一次；
+        绿 → 仍跳过（反向对照见下一条）。
         """
         g = RunScopeGuard(rules)
         g.record_repeat(**KW, verdict="2 failed")
         d = g.decide_repeat(**{**KW, "revision": "v2", "last_verdict": "2 failed"})
+        assert d.action == RUN, "红后修复（同一文件集）必须可复跑"
+
+    def test_green_verdict_still_skips_content_repeat(
+            self, rules: CollabRules) -> None:
+        """**反向对照**：上一轮**绿** + 同一份受审内容 → 仍跳过（判重不被例外架空）。"""
+        g = RunScopeGuard(rules)
+        g.record_repeat(**KW, verdict="684 passed")
+        d = g.decide_repeat(**{**KW, "revision": "v2", "last_verdict": "684 passed"})
         assert d.action == SKIP_DUPLICATE
 
     def test_revision_scope_still_available(self) -> None:

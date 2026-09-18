@@ -113,6 +113,20 @@ class _StateCardProxy:
         return self._fold_engine.compact_context(self._card)
 
 
+def _current_event() -> str:
+    """**当前流水线事件名**（平台内置变量；判不出 → 空串 = 不可判定）。
+
+    用途（🔴G）：检查点/等待登记时按当前事件自动补两侧事件名，否则门面路径
+    永远"两侧事件不可判定" → 一律降级 `crontab`，"≤5min 挂 `cnb:await`"这条
+    首选落点在生产路径上**不可达**。
+    """
+    for name in ("CNB_EVENT", "CNB_PIPELINE_EVENT", "CNB_TRIGGER_EVENT"):
+        got = os.environ.get(name, "")
+        if isinstance(got, str) and got.strip():
+            return got.strip()
+    return ""
+
+
 class SecretarySession:
     """会话秘书门面：一个 L3 会话秘书的完整接口。
 
@@ -1779,6 +1793,20 @@ class SecretarySession:
         """口径台账总览：跑了几次、有没有**超出同口径上界**的重复执行。"""
         return self.run_guard.overview()
 
+    def run_scope_trail(self) -> str:
+        """判重台账的**可持久留痕**（`<!-- run-scope: … -->`），写回评论即完成继承。
+
+        🔴F：平台每次 push = **新容器、新工作区**，本地台账从空开始 → 判重永不
+        触发（与 🔴A 同族，但 A 有"写回评论"载体、F 连载体都没有）。故本方法给出
+        与 🔴A 同一方案的载体：把留痕**追加写回同一条 PR/Issue 评论**，
+        下一棒 `inherit_run_scope(该评论正文)` 即恢复。
+        """
+        return self.run_guard.trails(session_id=self.session_id)
+
+    def inherit_run_scope(self, payload: Any) -> Dict[str, Any]:
+        """从**可持久载体**（评论正文 / 交接卡 context）恢复判重台账（只增不减）。"""
+        return self.run_guard.adopt_trails(payload, session_id=self.session_id)
+
     def run_scope_note(self) -> str:
         """一行口径（评论/文档/角色提示词共用）：**只跑增量、同口径只跑一次**。"""
         r = self.collab_rules
@@ -1801,23 +1829,42 @@ class SecretarySession:
         await_key: str = "",
         max_checks: Optional[int] = None,
         note: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
     ):
         """建一个**检查点**：等什么（``kind``）、等谁（``holder``）、还能探几次。
 
         **幂等**：同键已存在即原样返回（不重置预算）——否则"每次遇到都重建"
         等于把"最多 6 次"变成无限次，正是要治的循环。
+
+        🔴G（复评第 5 轮）：**必须能透传两侧事件名**（``waiter_event`` /
+        ``resolver_event``）。旧门面签名没有这两个形参 → 检查点永远"两侧事件
+        不可判定" → `resolve_driver()` 一律降级 `crontab`，**"≤5min 挂
+        cnb:await"这条首选落点在门面生产路径上不可达**（照角色提示词用门面调用
+        永远走不到 await）。事件名未显式给出时，按**当前事件**自动登记
+        （`CNB_EVENT` / `CNB_PIPELINE_EVENT`）——两侧同事件才可能配上对。
         """
+        we = waiter_event or _current_event()
+        re_ = resolver_event or we
         return self.probe.create(key=key, kind=kind, holder=holder, scope=scope,
                                  await_key=await_key, max_checks=max_checks,
-                                 note=note)
+                                 note=note, waiter_event=we,
+                                 resolver_event=re_)
 
     def checkpoint_plan(self, key: str = "",
                         checks: Optional[int] = None) -> List[Dict[str, Any]]:
         """六次探测**怎么等**：等待阶梯 + 平台落点（await / crontab），非轮询。
 
+        **返回行数 = 探测档位数 + 1**：末尾**恒有一行「预算用尽」**（`check`
+        = 档位数 + 1，`driver=handoff_resume`）——它是"停止自动挂账、交回人工"
+        这一步，不是第七次探测。故 `checks=3` → 4 行（`[1,2,3,用尽行]`），
+        不传 `checks` → 7 行（6 档 + 用尽行）。调用方按 `check` 列取值时不要把
+        末行当成"还能再探一次"。
+
         Args:
             key: 检查点键（空 → 用本会话默认预算档位数）。
-            checks: 显式档位数（覆盖检查点自带 ``max_checks``）。
+            checks: 显式档位数（覆盖检查点自带 ``max_checks``）；超出阶梯档位
+                时**夹到档位数**（不把同一档报两遍）。
 
         🟢：原签名为 ``**kwargs`` 但**静默忽略**（传 ``max_checks=99`` 无效，
         形参存在却不生效 = 另一种"读了不生效"）。现改为**具名形参**并真透传；
@@ -1838,10 +1885,24 @@ class SecretarySession:
         return rows[:keep] + rows[-1:]
 
     def register_platform_wait(self, key: str, await_key: str = "", sn: str = "",
-                               driver: str = "platform_await", note: str = ""):
-        """登记"等待已挂到平台语义上"（``cnb:await``）→ 本地零占用，可被回收。"""
+                               driver: str = "platform_await", note: str = "",
+                               waiter_event: str = "", resolver_event: str = "",
+                               stage: str = "stages"):
+        """登记"等待已挂到平台语义上"（``cnb:await``）→ 本地零占用，可被回收。
+
+        🔴G：同样**透传两侧事件名**（旧签名没有 → 挂 await 时永远过不了
+        "同一事件配对"这道官方硬约束，只能降级 crontab）。未显式给出时：
+        检查点登记时留痕的事件优先，其次按**当前事件**自动登记。
+        """
+        we = waiter_event
+        re_ = resolver_event
+        if not we or not re_:
+            cp = self.probe.load(key)
+            we = we or (cp.waiter_event if cp else "") or _current_event()
+            re_ = re_ or (cp.resolver_event if cp else "") or we
         return self.probe.register_platform_wait(
-            key, await_key=await_key, sn=sn, driver=driver, note=note)
+            key, await_key=await_key, sn=sn, driver=driver, note=note,
+            waiter_event=we, resolver_event=re_, stage=stage)
 
     def probe_checkpoint(self, key: str, **kwargs) -> ProbeOutcome:
         """**探测一次**（采集轻量事实 → 判断检查点 → 记预算 → 给下一步落点）。
