@@ -26,6 +26,23 @@
 | 上下文装配 | `ContextAssembler` — 三层物理隔离 + 稳定前缀 | cache.md |
 | POC benchmark | `poc/state_m9_benchmark.py` — token/命中 A/B | poc.md |
 | 会话统一门面 | `SecretarySession` — L3 会话秘书完整驱动（状态+折叠+装配+交接） | org.md |
+| 增量跑测门禁 | `secretary.gate.IncrementalGate` — 只跑有效增量 / 反全量冗余 / 计数权责一致 | incremental-gate.md |
+
+## 增量跑测门禁（Issue #14）
+
+原则：**只跑增量**（允许漏，后续用时会重新提需求去改），不得大量重复冗余；
+**跑多少写多少**，不得用"全量"造成歧义。
+
+```bash
+# 本轮要跑什么（过程可视化；只列 diff 触及的用例）
+python3 poc/incremental_gate.py plan --base <上次已跑 head>
+# 按计划实跑（精确到 nodeid）
+python3 poc/incremental_gate.py run  --base <上次已跑 head>
+# 全量告警视图：把「已跑过、默认不重复」逐项标出来
+python3 poc/incremental_gate.py full --base <上次已跑 head>
+```
+
+契约见 `docs/design/state-secretary-incremental-gate.md`。
 
 ## 快速开始
 
@@ -108,8 +125,15 @@ state-secretary/
 │       └── session/             # 会话门面层（L3 秘书统一入口）
 │           ├── __init__.py
 │           └── session.py       # SecretarySession（推荐使用）
-├── tests/                       # 308 项测试（门面 148 + 独立探针 65 + 验收矩阵 13，含评审回归）
+├── tests/                       # 380 项测试（门面 148 + 独立探针 65 + 验收矩阵 13
+│                                #   + 增量门禁 72 + 其余既有回归，含评审回归）
+├── src/secretary/gate/          # 增量跑测门禁（Issue #14）
+│   ├── models.py                # 三态模型 SweepTarget/Plan/Report + 全量告警视图
+│   ├── rules.py                 # 增量分类 + 冗余剔除 + 有效覆盖面兜底
+│   ├── counter.py               # 计数口径守卫（跑多少写多少）
+│   └── incremental.py           # IncrementalGate（git 增量识别 + 采集 + 实跑）
 ├── poc/                         # POC 脚本 + benchmark
+│   ├── incremental_gate.py      # 增量跑测门禁 CLI（plan/run/full/counter）
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC
 │   ├── m3_multiunit_router.sh   # 多单元路由 POC

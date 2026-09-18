@@ -15,6 +15,7 @@
 | `state-secretary-poc.md` | POC 验证方案（token 消耗与缓存命中 A/B） |
 | `state-secretary-module.md` | 落库新增独立模块划分建议（Q5） |
 | `state-secretary-handoff-visibility.md` | 交接卡引用可见性契约边界（P0-1/P0-2/P1-1 修复后更新；仅 🟡B 边界随 Issue #8） |
+| `state-secretary-incremental-gate.md` | 增量跑测门禁（Issue #14）：只跑增量 / 反全量冗余 / 计数权责一致 / 全量须标记 |
 
 ## 2. 对 SKILL.state 论文的三层改进对照
 
