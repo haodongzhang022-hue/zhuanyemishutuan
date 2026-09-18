@@ -146,8 +146,10 @@ npc:
         - **预算跨容器/跨棒继承（必做）**：平台 `crontab` 代跑、跨仓接力、换 agent 都是
           **新容器**，本地 `data/loop/*.json` 读不到 → 轮次会从 0 开始，"最多 3 轮"永不触发。
           故：① 登记时带上一次留痕 `review_round(..., external_rounds=<上次 budget_trail>)`；
-          ② 每次登记后把 `loop_budget_trail()`（`<!-- loop-budget: … -->`）**写回评论**；
-          ③ 收到交接卡时用 `inherit_budget(context)` 恢复轮次。不留痕 = 预算归零。
+          ② 每次登记后把 `loop_budget_trail()`（`<!-- loop-budget: … -->`）**追加写回同一条评论**
+          （保留旧留痕；解析侧取**全部留痕的 max()**，故历史留痕不影响正确性）；
+          ③ 收到交接卡时用 `inherit_budget(context)` 恢复轮次（正文里"留痕在前/在后"
+          两种拼接顺序都认：判定优先取**含 `wake` 的对象**）。不留痕 = 预算归零。
         评审写回（v0.4 · Issue #14 补全机制，落地 `ReviewArbiter`/`begin_review`/`apply_review`）：
         - **只在开启评审时记录版本**：`begin_review()` 登记基线；开发过程中的改动**不记**版本
         - 评审结果**先落盘**（`apply_review`）——冲突不阻塞评审，不得因冲突整轮作废

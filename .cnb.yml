@@ -136,9 +136,11 @@ main:
             预算用尽（最多 6 次）→ 停止自动挂账、交回人工。
           - **探测预算跨容器继承（必做）**：本任务是**新容器**，本地
             `data/probe/*.json` 是空的 → `checks_used` 会从 0 开始，"最多 6 次"永不触发。
-            故必须：① 从评论/交接卡里取上一次的 `<!-- probe-budget: … -->` 留痕；
+            故必须：① 从评论/交接卡里取上一次的 `<!-- probe-budget: … -->` 留痕
+            （**取全部留痕的 max()**，正文里会累积多条，不是只取第一条）；
             ② 调 `probe_checkpoint(key, external_checks=<上次 checks_used>)` 合并预算；
-            ③ 把本次 `dispatch_probe_event(...)["budget_trail"]` **写回评论**。
+            ③ 把本次 `dispatch_probe_event(...)["budget_trail"]` **追加写回同一条评论**
+            （= ①取留痕的那条；保留旧留痕，解析侧按 max() 合并，评论数不膨胀）。
             没有第 ③ 步，下一棒又会归零（等于把软约束换了个位置）。
           - **跨仓接力只传判定**（wait/proceed/release/unknown），接收方按组织级同一份规则
             算落点（`dispatch_probe_event_shared()`），**不按自己的本地会话号重算**；

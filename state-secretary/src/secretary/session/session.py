@@ -1829,8 +1829,13 @@ class SecretarySession:
         if not isinstance(checks, int) or isinstance(checks, bool) or checks < 1:
             raise ValueError(f"非法 checks: {checks!r}（须为 >=1 的整数）。")
         rows = self.probe.delay_plan(cp)
-        # 只保留前 `checks` 个探测档 + 末尾"预算用尽"行
-        return rows[:checks] + rows[-1:]
+        # 只保留前 `checks` 个探测档 + 末尾"预算用尽"行。
+        # 🟡5：`checks` 须**先夹到实际档位数**（`len(rows) - 1` = 阶梯档位数），
+        # 否则 `checks > 档位数` 时 `rows[:checks]` 已含末行，再拼 `rows[-1:]`
+        # 就出现**重复行**（`checks=7` → check id `[1..7, 7]` 共 8 行）。
+        # 请求超过阶梯档位时按阶梯档位截断（不是把同一档报两遍）。
+        keep = min(checks, max(0, len(rows) - 1))
+        return rows[:keep] + rows[-1:]
 
     def register_platform_wait(self, key: str, await_key: str = "", sn: str = "",
                                driver: str = "platform_await", note: str = ""):

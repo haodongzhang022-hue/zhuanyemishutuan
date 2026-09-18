@@ -494,6 +494,44 @@ def _parse_yaml(text: str) -> Any:
     return _mini_yaml(text)
 
 
+def _strip_inline_comment(line: str) -> str:
+    """按 **YAML 语义**剥掉行内注释（引号配对后再找 ``#``）。
+
+    为什么不能"见引号就整行跳过"（复评第 3 轮 🔴3）：真实规则包里
+    ``retry_delay_sec: 30   # 覆写"锁窗口"为 30s`` 这种**值行带引号注释**很常见；
+    "有引号就不剥"会把整行当值 → 读成字符串 ``'30   # 覆写"锁窗口"为 30s'``
+    → ``_as_float`` 判不出 → **静默落回默认值**（文件写 30、生效 10）。
+    这正是 🔴D 那一类"规则包数值被读但不生效"，且覆盖 ``locks/loop/probe/scan``
+    全域（"一处定义、全域生效"不成立）。
+
+    规则（与 YAML 一致）：``#`` 在**行首**或**前面是空白**且**不在引号内**时
+    才开始注释；单/双引号各自配对（双引号内 ``\\`` 转义、``""`` 转义）。
+    """
+    in_single = False
+    in_double = False
+    escaped = False
+    for i, ch in enumerate(line):
+        if in_double:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
 def _mini_yaml(text: str) -> Dict[str, Any]:
     """极简 YAML 子集解析（无 PyYAML 时的兜底；失败返回空 dict）。
 
@@ -505,6 +543,10 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
     - **多行 inline list**：``[a, b,\n  c]``（按括号配平跨行拼接）；
     - **折叠/字面块标量**：``>-`` / ``>`` / ``|-`` / ``|``（读其缩进续行）；
     - 标量：引号串、bool、int、float、``[]`` 内联列表、其余按字符串。
+
+    **行内注释**按 YAML 语义剥离（引号配对后再找 ``#``，见
+    ``_strip_inline_comment``）——值行带引号注释（``30  # 覆写"锁窗口"``）也必须
+    读到数值，否则"规则写了却不生效"（🔴3）。
 
     复杂 YAML 特性（锚点/多文档/流式映射）仍不在子集内——但**宁可读不出**，
     也不静默读成半截字符串（那会让"规则写了却不生效"重新出现）。
@@ -565,10 +607,10 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
     i = 0
     while i < len(lines):
         raw_line = lines[i]
-        # 行内注释只在**非引号内**才剥离（粗判：无引号时才剥）
-        line = raw_line
-        if '"' not in line and "'" not in line:
-            line = line.split("#", 1)[0]
+        # 行内注释按 YAML 语义剥离（引号配对后再找 `#`）——🔴3：
+        # "见引号就整行跳过"会把 `retry_delay_sec: 30  # 覆写"锁窗口"为 30s`
+        # 整行当值 → 数值被读成字符串 → 静默落回默认（"读了不生效"）。
+        line = _strip_inline_comment(raw_line)
         if not line.strip():
             i += 1
             continue
@@ -605,9 +647,7 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
             acc = m_inline.group(2)
             j = i + 1
             while j < len(lines) and acc.count("[") > acc.count("]"):
-                nxt = lines[j]
-                if '"' not in nxt and "'" not in nxt:
-                    nxt = nxt.split("#", 1)[0]
+                nxt = _strip_inline_comment(lines[j])
                 acc += " " + nxt.strip()
                 j += 1
             parent = _container_for(indent)
@@ -652,9 +692,7 @@ def _mini_yaml(text: str) -> Dict[str, Any]:
             nxt_body = ""
             j = i + 1
             while j < len(lines):
-                probe_line = lines[j]
-                if '"' not in probe_line and "'" not in probe_line:
-                    probe_line = probe_line.split("#", 1)[0]
+                probe_line = _strip_inline_comment(lines[j])
                 if probe_line.strip():
                     nxt_body = probe_line.strip()
                     break

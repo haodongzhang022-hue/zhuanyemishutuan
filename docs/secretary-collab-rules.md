@@ -256,15 +256,26 @@ probe:
 |---|---|
 | 合并 | `probe(key, external_checks=…)` / `adopt_checks_budget()`：`max()` 只增不减，且在"是否用尽"判定**之前**合并 |
 | 留痕 | `ProbeEvent.budget_trail` = `<!-- probe-budget: {…} -->`，可贴进**评论正文** / 交接卡 `context` / 事件载荷（容器会被回收，评论不会） |
-| 回写 | `dispatch()` 返回值统一带 `budget_trail`；接收方**写回评论**，下一棒据此恢复 |
+| **取全部** | 正文里留痕会**累积多条**（每棒写回）→ 解析取**全部留痕的 `max()`**，**不是第一条**；"留痕在前/在后"两种顺序结果一致（🔴1） |
+| 回写 | `dispatch()` 返回值统一带 `budget_trail`；接收方**追加写回同一条评论**（口径见下），下一棒据此恢复 |
 | 接线 | `.cnb.yml` 的 `probe_task` 明列三步：取上次留痕 → 合并 → 写回评论 |
+
+**写回哪一条**（口径，防"多留痕叠加"再次踩坑）：**追加到本检查点的同一条评论**
+（即"取留痕的那条"，不是每次新建一条）。追加时**保留旧留痕**——解析侧按
+`max()` 合并，故历史留痕不影响正确性，且评论条数不随探测次数膨胀。
+新建评论（如首轮还没有承载评论）时才新建一条，并在正文里标明检查点 KEY。
 
 **边界（明示）**：调用方既不给载荷、又换数据根 → 预算只能从 0 开始。
 这是平台执行模型的边界，不是"实现疏忽"；故上表"回写"一步是**必做项**。
 
+**同族（熔断轮次）**：`loop-budget` 留痕同样**取全部、`max()` 合并**，
+且交接卡 `context` 内嵌的 `budget_trail` 字段会**递归展开后合并**（不是替换）。
+
 同族口径见 §2.1（熔断轮次）：`LoopGuard.budget_payload()` / `budget_trail()` /
 `adopt_budget()`，门面入口 `review_round(external_rounds=…)` /
-`inherit_budget(…)` / `loop_budget_trail()`。
+`inherit_budget(…)` / `loop_budget_trail()`。解析侧口径函数
+`loop_guard.extract_json_objects()` / `pick_wake_object()`：静默交接判定
+**优先取含 `wake` 的对象**（拼接顺序无关）。
 
 **接线**：长等待由 `.cnb.yml` 顶层的 `crontab` 配置真正接到平台
 （`cron: "*/5 * * * *"` + `event: api_trigger_probe_check`；平台约束：仅支持明确

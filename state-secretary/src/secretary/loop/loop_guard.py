@@ -86,7 +86,16 @@ _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
 # 评论/正文里的预算留痕标记（跨容器传递轮次预算的**可持久载体**）：
 # 交接卡 context、PR/Issue 评论正文里带这一行即可被 `adopt_budget()` 识别。
+#
+# **取全部留痕、按 `max()` 合并**（复评第 3 轮 🔴1）：评论正文是"每棒把留痕写回
+# 评论"的**累积载体**，容器回收后正文里必然是多条留痕叠加。只取**第一条** =
+# 拿最旧的那次轮次 → 上界被稀释（"最多 3 轮 / 6 次"永不触发）。故这里**收集
+# 全部**留痕再逐字段 `max()`，与"留痕在前 / 在后"两种顺序都无关。
 BUDGET_TRAIL_RE = re.compile(r'<!--\s*loop-budget:\s*(\{.*?\})\s*-->', re.S)
+
+# 载荷解析的**深度上界**（🟡1）：跨仓/评论载荷不可信，深嵌套 JSON（~3000 层）
+# 会让递归解析抛 `RecursionError` 并逃逸到门面。超界一律按"判不出"处理。
+MAX_COERCE_DEPTH = 8
 
 # `wake` 的**严格**判定口径（与 HandoffBus.create_handoff 的写出侧一致）：
 #   显式静默（严格 False）→ 静默；显式唤醒（严格 True）→ 唤醒；
@@ -98,19 +107,11 @@ WAKE_AWAKE = "awake"
 WAKE_UNKNOWN = "unknown"
 
 
-def extract_json_object(text: str) -> Optional[dict]:
-    """从正文里取出**第一个 JSON 对象**（宽进：取不到 → ``None``）。
+def _balanced_object_end(text: str, start: int) -> Optional[int]:
+    """从 ``text[start] == '{'`` 起按**括号配平**找出对象结束位置（跳过字符串内括号）。
 
-    静默交接的 ``context`` 形态是「JSON 载荷 + 预算留痕标记」拼接
-    （见 ``SecretarySession.silent_handoff``），直接 ``json.loads`` 整段会失败。
-    故这里按**括号配平**（跳过字符串内的括号）截出第一个对象再解析——
-    解析失败不抛，交由调用方按"判不出"走保守方向。
+    取不到（未闭合 / 空）→ ``None``。纯迭代实现，**不做递归**（深嵌套不炸栈）。
     """
-    if not isinstance(text, str):
-        return None
-    start = text.find("{")
-    if start < 0:
-        return None
     depth = 0
     in_str = False
     escaped = False
@@ -131,11 +132,62 @@ def extract_json_object(text: str) -> Optional[dict]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                try:
-                    got = json.loads(text[start:i + 1])
-                except ValueError:
-                    return None
-                return got if isinstance(got, dict) else None
+                return i
+    return None
+
+
+def extract_json_objects(text: str) -> List[dict]:
+    """从正文里取出**全部**顶层 JSON 对象（宽进：解析不出的片段跳过）。
+
+    **为什么要"全部"**（复评第 3 轮 🔴2）：评论正文常见形态是
+    「预算留痕 + 交接卡 context」拼接，而留痕在前/在后两种顺序都存在。
+    只取**第一个**对象时，"留痕在前"就会把静默交接的 ``wake=False`` 读丢 →
+    ``should_wake_next()=True``（熔断语义从新入口漏出去，且方向是**放行**）。
+    """
+    out: List[dict] = []
+    if not isinstance(text, str):
+        return out
+    i = 0
+    while i < len(text):
+        start = text.find("{", i)
+        if start < 0:
+            break
+        end = _balanced_object_end(text, start)
+        if end is None:
+            i = start + 1
+            continue
+        try:
+            got = json.loads(text[start:end + 1])
+        except (ValueError, RecursionError):
+            got = None
+        if isinstance(got, dict):
+            out.append(got)
+        i = end + 1
+    return out
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    """从正文里取出**第一个** JSON 对象（宽进：取不到 → ``None``）。
+
+    保留本入口供既有调用方使用；判定"是不是静默交接"请用
+    ``extract_json_objects()`` + ``pick_wake_object()``——只认第一个对象会把
+    "留痕在前"的静默交接读丢（见 🔴2）。
+    """
+    objs = extract_json_objects(text)
+    return objs[0] if objs else None
+
+
+def pick_wake_object(objects: List[dict]) -> Optional[dict]:
+    """在多个顶层对象里挑**含 ``wake`` 键**的那个（找不到 → ``None``）。
+
+    ``wake`` 是静默交接的**判据字段**，故解析时**优先找它**，而不是盲取第一个：
+    "留痕在前"时第一个对象是预算留痕（不带 ``wake``），盲取 = 判不出静默交接。
+    全都找不到 ``wake`` → 返回 ``None``，调用方按"非静默交接"处理（普通 context
+    不误熔断）；而"带 ``wake`` 但值非严格 bool"仍走**保守静默**（见 ``parse_wake``）。
+    """
+    for obj in objects:
+        if isinstance(obj, dict) and "wake" in obj:
+            return obj
     return None
 
 
@@ -243,7 +295,11 @@ class LoopState:
 
     @classmethod
     def from_dict(cls, data: Any, session_id: str) -> "LoopState":
-        """字段级容错恢复：非 dict / 字段类型不符 → 退化为默认值（不抛异常）。"""
+        """字段级容错恢复：非 dict / 字段类型不符 → 退化为默认值（不抛异常）。
+
+        **例外**：``fused`` 是安全旗标，非严格 ``False`` 一律按**已熔断**（🔴4）
+        ——"判不出"取保守方向，不得把熔断语义放宽掉。
+        """
         if not isinstance(data, dict):
             return cls(session_id=session_id)
 
@@ -255,11 +311,19 @@ class LoopState:
             v = data.get(key, "")
             return v if isinstance(v, str) else ""
 
-        def _bool(key: str) -> bool:
-            # 严格 bool（与 🔴B 的 wake 判定同族口径）：``"yes"``/``1`` 这类
-            # 真值串不得被 ``bool()`` 当成"已熔断/已释放"，否则坏卡能改写熔断语义。
-            v = data.get(key, False)
-            return v if isinstance(v, bool) else False
+        def _fused_flag() -> bool:
+            """``fused`` 的**保守**读取（🔴4，方向与 🔴B 同族）。
+
+            ``fused`` 是**安全旗标**：保守方向应是"判不出 → 按**已熔断**"，
+            而不是"判不出 → 按未熔断"。旧实现 ``bool(...)`` 把 ``fused: 1``
+            视为**已熔断**；若改成"非 bool → False"，一张坏卡（``fused: 1``）
+            就能把熔断**清掉** → ``should_wake_next()=True`` → 循环复活
+            （与同 PR 自己的判据"读入侧放宽等于把熔断语义漏出去"冲突）。
+
+            故：严格 ``False`` → 未熔断；**其余任何形态**（严格 ``True`` /
+            ``1`` / ``"yes"`` / 缺失 / 坏值）→ 一律按**已熔断**处理。
+            """
+            return data.get("fused") is not False
 
         hist = data.get("history", [])
         if not isinstance(hist, list):
@@ -270,7 +334,7 @@ class LoopState:
             blocking_rounds=max(0, _int("blocking_rounds")),
             repair_rounds=max(0, _int("repair_rounds")),
             advisory_used=max(0, _int("advisory_used")),
-            fused=_bool("fused"),
+            fused=_fused_flag(),
             fused_reason=_str("fused_reason"),
             fused_at=_str("fused_at"),
             resume_count=max(0, _int("resume_count")),
@@ -390,21 +454,34 @@ class LoopGuard:
         - 载荷**不带** ``wake`` 键 / 无法解析 → 非静默交接（常规接力）；
           静默交接载荷**必带** ``wake``（见 ``silent_handoff_payload``），
           故"缺失"不构成"判不出"（不能对普通 context 误熔断）。
+
+        **拼接顺序无关**（复评第 3 轮 🔴2）：``handoff_context`` 是评论正文时，
+        常见形态是「留痕 + 交接卡 context」或「context + 留痕」两种顺序。解析按
+        **全部顶层对象**进行并**优先取含 ``wake`` 的那个**，故两种顺序判定一致
+        （旧实现只取第一个对象 → "留痕在前"时 ``wake=False`` 读不到 →
+        ``should_wake_next()=True``，熔断语义从新入口漏出去，且方向是**放行**）。
         """
-        payload: Any = handoff_context
-        if isinstance(payload, str) and payload.strip():
+        raw: Any = handoff_context
+        payload: Any = raw
+        if isinstance(raw, str) and raw.strip():
             try:
-                payload = json.loads(payload)
+                payload = json.loads(raw)
             except ValueError:
-                # 常见形态：JSON 载荷 + `<!-- loop-budget: … -->` 留痕拼接
-                payload = extract_json_object(payload)
+                # 常见形态：JSON 载荷 + `<!-- loop-budget: … -->` 留痕拼接。
+                # 🔴2：**优先取含 `wake` 键的对象**——正文里"留痕在前"时第一个
+                # 对象是预算留痕（不带 `wake`），盲取第一个 = 判不出静默交接。
+                payload = pick_wake_object(extract_json_objects(raw))
         if not isinstance(payload, dict):
             payload = None
 
         guard = cls(session_id=session_id, data_dir=data_dir, **kwargs)
         # 轮次预算**无条件合并**（常规接力也要带，见上"跨容器/跨棒预算继承"）。
-        if payload is not None:
-            guard.adopt_budget(payload, source="handoff", save=False)
+        # 预算来源取**整段正文**（🔴1：正文里留痕会累积多条，`adopt_budget` 会
+        # 收集全部并 `max()` 合并），而不是只取 wake 对象那一个——否则"留痕段 +
+        # 不带内嵌留痕的载荷"拼接形态会把预算丢掉。
+        budget_src = raw if isinstance(raw, str) and raw.strip() else payload
+        if budget_src is not None:
+            guard.adopt_budget(budget_src, source="handoff", save=False)
 
         has_wake = payload is not None and "wake" in payload
         wake_state = parse_wake(payload.get("wake")) if has_wake else None
@@ -477,36 +554,132 @@ class LoopGuard:
                 + " -->")
 
     @staticmethod
-    def _coerce_budget_payload(payload: Any) -> Optional[dict]:
+    def _fused_of(data: Any) -> bool:
+        """载荷里的 ``fused`` 是否表示**已熔断**（**保守方向**，与 🔴4 同族）。
+
+        - 键不存在 → 不表态（``False``，不得凭"没这个字段"就熔断）；
+        - 严格 ``False`` → 未熔断；
+        - **其余任何形态**（``True`` / ``1`` / ``"yes"`` / 坏值）→ **按已熔断**
+          （"判不出 → 取保守方向"：读入侧放宽等于把熔断语义漏出去）。
+        """
+        if not isinstance(data, dict) or "fused" not in data:
+            return False
+        return data.get("fused") is not False
+
+    @staticmethod
+    def _merge_budget_dicts(dicts: Any, _depth: int = 0) -> Optional[dict]:
+        """把**多份**预算 dict 合并成一份（逐字段 ``max()``，``fused`` 取或）。
+
+        🔴1：评论正文里留痕会**累积多条**（每棒把留痕写回评论 = 必做项）。
+        只取第一条 = 拿最旧的轮次 → 上界被稀释。故全部取、按 ``max()`` 合并，
+        与"留痕在前/在后"的顺序无关。
+
+        内嵌的 ``budget_trail``（``<!-- loop-budget: … -->``）**递归展开后再合并**
+        ——交接卡 context 里的预算留痕是内嵌字段，不是单独一段正文。
+        深度超过 ``MAX_COERCE_DEPTH`` 一律不展开（跨仓载荷不可信）。
+        """
+        if _depth > MAX_COERCE_DEPTH:
+            return None
+        merged: Dict[str, Any] = {}
+        rounds_out: Dict[str, Any] = {}
+        reason_out = ""
+        nested: List[Any] = []
+        for d in dicts:
+            if not isinstance(d, dict):
+                continue
+            rounds = d.get("rounds")
+            if isinstance(rounds, dict):
+                for k, v in rounds.items():
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        rounds_out[k] = max(rounds_out.get(k, 0), v)
+            if LoopGuard._fused_of(d):
+                merged["fused"] = True
+                reason = d.get("reason")
+                if isinstance(reason, str) and reason and not reason_out:
+                    reason_out = reason
+            budget = d.get("budget")
+            if isinstance(budget, dict) and "budget" not in merged:
+                merged["budget"] = dict(budget)
+            trail = d.get("budget_trail")
+            if isinstance(trail, str) and trail:
+                nested.append(LoopGuard._coerce_budget_payload(
+                    trail, _depth + 1))
+        if nested:
+            inner = LoopGuard._merge_budget_dicts(nested, _depth + 1)
+            if inner is not None:
+                for k, v in (inner.get("rounds") or {}).items():
+                    rounds_out[k] = max(rounds_out.get(k, 0), v)
+                if inner.get("fused") is True:
+                    merged["fused"] = True
+                    if not reason_out:
+                        reason_out = inner.get("reason") or ""
+                if isinstance(inner.get("budget"), dict) \
+                        and "budget" not in merged:
+                    merged["budget"] = dict(inner["budget"])
+        if rounds_out:
+            merged["rounds"] = rounds_out
+        if reason_out:
+            merged["reason"] = reason_out
+        return merged or None
+
+    @staticmethod
+    def _coerce_budget_payload(payload: Any,
+                               _depth: int = 0) -> Optional[dict]:
         """把任意形态的载荷解析成预算 dict（宽进：解析不出 → None，不炸）。
 
         接受：dict / JSON 串 / 含 ``<!-- loop-budget: … -->`` 标记的正文
         （评论、交接卡 context、事件 ``facts`` 都能直接喂进来）。
+
+        **多条留痕 → ``max()`` 合并**（🔴1）：评论正文是"每棒写回留痕"的累积
+        载体，正文里必然叠加多条留痕；只取第一条会让轮次回退到最旧那次，
+        "最多 3 轮 / 6 次"永不触发。故**收集全部**再合并，顺序无关。
+
+        **深度上界**（🟡1）：跨仓载荷不可信，深嵌套 JSON 会触发 ``RecursionError``
+        并逃逸到门面；超过 ``MAX_COERCE_DEPTH`` 一律按"判不出"（``None``）处理。
         """
+        if _depth > MAX_COERCE_DEPTH:
+            return None
         if isinstance(payload, dict):
+            # 内嵌 `budget_trail`（交接卡 context 的形态）也要展开并合并
+            trail = payload.get("budget_trail")
+            if isinstance(trail, str) and trail:
+                inner = LoopGuard._coerce_budget_payload(trail, _depth + 1)
+                if inner is not None:
+                    return LoopGuard._merge_budget_dicts(
+                        [payload, inner], _depth + 1) or payload
             return payload
         if not isinstance(payload, str) or not payload.strip():
             return None
-        m = BUDGET_TRAIL_RE.search(payload)
-        if m:
-            try:
-                got = json.loads(m.group(1))
-            except ValueError:
-                got = None
-            if isinstance(got, dict):
-                return got
+
+        # ① 正文里的**全部** `<!-- loop-budget: … -->` 留痕 → 合并（🔴1）
+        merged = LoopGuard._merge_budget_dicts(
+            LoopGuard._coerce_budget_payload(m.group(1), _depth + 1)
+            for m in BUDGET_TRAIL_RE.finditer(payload))
+        if merged is not None and isinstance(merged.get("rounds"), dict):
+            return merged
+
+        # ② 整段就是一份 JSON
         try:
-            got = json.loads(payload)
-        except ValueError:
-            got = extract_json_object(payload)
+            got: Any = json.loads(payload)
+        except (ValueError, RecursionError):
+            got = None
         if not isinstance(got, dict):
-            return None
-        # 载荷内嵌的 `budget_trail`（`<!-- loop-budget: … -->` 形态）：递归取内层。
+            # ③ 正文里散落的多个顶层对象 → 合并（顺序无关；内嵌留痕递归展开）
+            got = LoopGuard._merge_budget_dicts(
+                extract_json_objects(payload), _depth + 1)
+        if not isinstance(got, dict):
+            return merged
+        if not isinstance(got.get("rounds"), dict) and merged is not None:
+            # ④ 合并结果与 ③ 互补（如"留痕段 + 不带 rounds 的载荷"）
+            got = LoopGuard._merge_budget_dicts([got, merged], _depth + 1) or got
+        # 载荷内嵌的 `budget_trail`（`<!-- loop-budget: … -->` 形态）：递归取内层，
+        # 与载荷自身的 rounds **合并**（取 max）——不是替换（否则内层较小值时回退）。
         nested = got.get("budget_trail")
         if isinstance(nested, str):
-            inner = LoopGuard._coerce_budget_payload(nested)
+            inner = LoopGuard._coerce_budget_payload(nested, _depth + 1)
             if inner is not None:
-                return inner
+                got = LoopGuard._merge_budget_dicts(
+                    [got, inner], _depth + 1) or got
         return got
 
     def adopt_budget(self, payload: Any, source: str = "",
@@ -521,8 +694,9 @@ class LoopGuard:
 
         Returns:
             合并结果摘要 ``{"merged": bool, "adopted": {...}, "reason": str}``。
-            载荷里带 ``fused=True`` 时**保守继承熔断**（宁多一次人工解锁，
-            也不放一个可能已超预算的循环继续跑）。
+            载荷里的 ``fused`` **非严格 ``False``**（``True``/``1``/``"yes"``/坏值）
+            时**保守继承熔断**（宁多一次人工解锁，也不放一个可能已超预算的循环
+            继续跑）；键缺失则不表态（不凭"没这个字段"就熔断）。
         """
         data = self._coerce_budget_payload(payload)
         if data is None:
@@ -546,7 +720,8 @@ class LoopGuard:
         st.advisory_used = max(st.advisory_used, _n("advisory_used"))
         st.stall_count = max(st.stall_count, _n("stall_count"))
 
-        fused_from_payload = data.get("fused") is True
+        # 载荷里的 `fused` 取**保守方向**（🔴4 同族）：非严格 `False` 一律按已熔断。
+        fused_from_payload = self._fused_of(data)
         if fused_from_payload and not st.fused:
             st.fused = True
             reason = data.get("reason")

@@ -1195,7 +1195,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 | 🟡6 死代码 | 删除 `probe._SAFE_ID`（未使用）与 `_cron_every` 别名；回归 `test_y6_dead_code_removed` |
 | 🟢 `checkpoint_plan(**kwargs)` 静默忽略 | 改具名形参 `checks=` 并**真透传**（未知关键字直接 `TypeError`）；回归 `test_checkpoint_plan_kwargs_now_named_and_real` |
 | 🟢 嵌套映射丢字段 | 见 🟡5（`test_y5_nested_map_inside_sequence_item`） |
-| 附带加固 | `dispatch_core` **按本地规则重算落点**（不轻信事件自带 `driver`，否则跨仓写 `driver=platform_await` 就能把 10 分钟等待挂成单 await = 死等）；`LoopGuard.from_dict` 的 `fused` 改**严格 bool**（与 🔴B 同族） |
+| 附带加固 | `dispatch_core` **按本地规则重算落点**（不轻信事件自带 `driver`，否则跨仓写 `driver=platform_await` 就能把 10 分钟等待挂成单 await = 死等）；`LoopGuard.from_dict` 的 `fused` 改严格 bool（**此改动在第 4 轮被判定为方向反了 → 已改为保守读取，见 §二十 🔴4**） |
 
 ### 19.3 自测
 
@@ -1206,3 +1206,51 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - 独立探针（**非复用作者测试**）复现 → 修复后复测：🔴A 序列 `fix,fix,fix,fuse,...`、
   `checks_used`→6 且 `resume_required=True`；🔴B `"false"/0/"no"` 全熔断；🔴C 全路径不抛；
   🔴D 覆写 30 → 生效 30、cron 本地/跨仓同为 `*/15`。
+
+---
+
+## 二十、PR #15 复评第 4 轮定点修复（🔴1–🔴4 + 🟡1–🟡5）
+
+> 触发：架构·评审 复评第 3 轮（基线 `ed62088`）判 `fix_bug`——**🔴 未清零，不转测试**。
+> 本轮只动 `89d48bd..ed62088` 的**新增/改动行**，修复提交见本 PR 最新 commit。
+
+### 20.1 四项 🔴（独立探针复现 → 定点修 → 判别性回归）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归护栏（含反向对照） |
+|---|---|---|---|
+| **🔴1** 预算通道只取**第一条**留痕 → 评论正文多留痕叠加时轮次**回退**，「最多 3 轮 / 6 次」永不触发 | `BUDGET_TRAIL_RE.search()` / `PROBE_BUDGET_TRAIL_RE.search()` 只取第一条（= 最旧轮次）→ 8 棒正文累积形态恒 `fix×8`；探测 `checks_used` 卡在 1 | 两处都改**取全部留痕、逐字段 `max()` 合并**（`_merge_budget_dicts` / `_coerce_checks_used` 收集全部匹配）；交接卡 `context` 内嵌的 `budget_trail` **递归展开后合并**（不是替换）；`probe` 侧同样展开 `budget_trail` 字段 | `test_comment_body_with_many_trails_still_fuses`（8 棒必须出现 fuse 且第 4 次即拦）/ `test_order_of_trails_does_not_matter`（留痕在前/在后 → 轮次一致）/ `test_probe_budget_from_comment_body_with_many_trails`（`checks_used`→6）/ `test_handoff_context_embedded_trail_merges` / **反向**：`test_last_only_payload_agrees`、`test_probe_without_payload_stays_at_one` |
+| **🔴2** `extract_json_object` 只取**第一个**对象 → 留痕在前时静默交接 `wake=False` 读不到 → `should_wake_next()=True`（熔断语义从新入口漏出，方向是**放行**） | `text.find("{")` 起只解析第一个配平对象；门面 `inherit_silent_handoff(trail + context)` 同结论 | 新增 `extract_json_objects()`（全部顶层对象）+ `pick_wake_object()`（**优先取含 `wake` 的对象**）；`from_handoff` 用它解析；找不到 `wake` 仍按"非静默"（普通 context 不误熔断），带 `wake` 但非严格 bool 仍走**保守静默** | `test_both_orders_inherit_silence`（参数化两种顺序）/ `test_facade_inherit_silent_handoff_both_orders` / `test_probe_trail_first_reads_event` / `test_pick_wake_object_skips_trailless_objects` / **反向**：`test_wake_true_payload_is_not_silent` |
+| **🔴3** 新 `_mini_yaml` 值行含引号即跳过注释剥离 → 带引号注释的**覆写**被读成字符串 → 静默落回默认（生产无 PyYAML 路径；旧实现正确；本 PR 真实规则包 :77/:79 已命中） | `if '"' not in line and "'" not in line:` 才剥注释 → `retry_delay_sec: 30  # 覆写"锁窗口"为 30s` 整行当值 → 生效 10（文件写 30） | 新增 `_strip_inline_comment()`：**按 YAML 语义**（引号配对后再找 `#`，`#` 须在行首或前有空白）剥行内注释；`_mini_yaml` 三处调用点统一换用（主行 / 多行 inline list / 空值探测行） | `test_override_with_quoted_comments_takes_effect`（`locks/loop/probe/scan` **四域**都读到生效值）/ `test_parsed_values_are_typed_not_strings` / `test_real_rule_package_bools_are_bools`（真实规则包 :77/:79 读成 **bool**）/ **反向**：`test_unquoted_comments_still_stripped`、`test_hash_inside_quotes_is_not_a_comment` |
+| **🔴4** `LoopState.from_dict` 的 `fused` 改严格 bool → 安全旗标 fail-open（`fused=1` 的坏卡把熔断**清掉** → 循环复活） | 本轮新增 `_bool("fused")`：非 bool → `False`（= 未熔断），与同 PR 判据"读入侧放宽等于把熔断语义漏出去"冲突 | `fused` 改**保守读取**：严格 `False` → 未熔断；**其余任何形态**（`1`/`"yes"`/`"true"`/`0`/`None`/缺失/坏值）→ 一律按**已熔断**（`data.get("fused") is not False`） | `test_non_bool_fused_means_fused`（8 组参数化：`is_fused()=True`、`should_wake_next()=False`、后续轮恒 `fuse`）/ `test_explicit_fuse_survives_bad_card` / **反向**：`test_strict_false_is_not_fused` |
+
+### 20.2 🟡1–🟡5（同轮清掉）
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 🟡1 `adopt_budget` 嵌套递归无上界 → 深嵌套（~3000 层）`RecursionError` 逃逸到门面 | 新增 `MAX_COERCE_DEPTH = 8` 深度上界（`loop_guard` / `probe` 两处），超界按"判不出"（`None` / 不合并）处理；`json.loads` 的 `RecursionError` 一并兜住 | `TestCoercionDepthBound`（`adopt_budget` / 门面 `inherit_budget` / `dispatch_shared` / `_coerce_checks_used` 全不抛）/ **反向**：浅载荷仍被读到 |
+| 🟡2 `api_trigger_probe_wait` 只有引用、**代码从不产出** | `dispatch_core` 的 await 分支补 `trigger["event"] = "api_trigger_probe_wait"`（crontab 分支仍是 `api_trigger_probe_check`）→ `.cnb.yml` 的口径与代码产出**同名同源** | `TestAwaitEventWired`（await 落点产出该事件名；**反向**：crontab 落点仍是 check 事件且带 `*/5`） |
+| 🟡3 `Checkpoint.from_dict({"key": 5})` → `key=""`（坏 key 退化成**空标识**，互相覆盖） | 坏 `key`（非 str / 空白）→ 返回 `None`（**视为不存在**） | `TestBadCheckpointKey`（6 组坏 key → `None`；`load()` 不把坏卡当合法检查点）/ **反向**：合法 key 正常解析 |
+| 🟡4 `ProbeEvent.from_dict` 的 `wake_allowed` 默认方向偏宽（`"yes"` → `True`） | 读入侧非严格 bool → **`False`**（保守：不得据此唤醒）；数据类默认值同改 | `TestWakeAllowedConservative`（8 组坏值 → `False`；默认构造亦 `False`）/ **反向**：严格 bool 原样读取 |
+| 🟡5 `checkpoint_plan(checks=7)` 产出重复行（`[1..7, 7]`） | `keep = min(checks, len(rows) - 1)` 先夹到实际档位数再拼"用尽行" | `TestCheckpointPlanNoDuplicateRows`（`checks=7` → `[1..7]` 无重复；`checks=2` → 3 行）/ **反向**：非法 `checks` 仍 `ValueError`、未知关键字仍 `TypeError` |
+
+### 20.3 附带收口
+
+- `.cnb.yml` / `.cnb/settings.yml` / `docs/secretary-collab-rules.md` 写回口径补全：
+  **追加写回同一条评论**（保留旧留痕，解析侧按 `max()` 合并 → 评论数不膨胀）；
+  并明写"取全部留痕的 max()，不是第一条"、"留痕在前/在后两种顺序都认"。
+- `tests/test_collab_confirm_issue14.py` 的 `import json`（`89d48bd` 起未使用，
+  但它在本 PR 改动清单内）顺手清零 → 本轮改动文件 `pyflakes` **0 告警**（口径不含糊）。
+
+### 20.4 自测
+
+- `pytest -q`：**853 passed**（基线 `ed62088` 789 + 本轮新增
+  `test_collab_round4_fixes_issue14.py` **64** 项），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- 独立探针（**非复用作者测试**）复现 → 修复后复测：
+  🔴1 8 棒正文累积序列 `fix,fix,fix,fuse,…`、`checks_used`→6；
+  🔴2 两种拼接顺序都 `fused=True / wake=False`；
+  🔴3 带引号注释覆写四域生效（30 / 7 / 15 / true）；
+  🔴4 `fused=1/"yes"/0/None` 一律 `is_fused()=True`；
+  🟡 深嵌套不抛、await 事件名同源、坏 key→None、`wake_allowed` 保守、plan 无重复行。
+- 兜底解析器 vs PyYAML **逐字段比对**（两份真实规则包）：差异 **0**。

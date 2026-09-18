@@ -172,7 +172,15 @@ def _as_list(value: Any) -> List[Any]:
 
 # 探测预算的**可持久留痕**标记（评论正文 / 交接卡 context / 事件载荷共用）：
 # 容器会被回收，评论不会 —— 跨容器"最多 6 次"只能靠载荷走，不能靠本地磁盘。
+#
+# **取全部留痕、按 `max()` 合并**（复评第 3 轮 🔴1，与 `loop_guard.BUDGET_TRAIL_RE`
+# 同一口径）：评论正文是"每棒把留痕写回评论"的累积载体（`.cnb.yml` 必做项），
+# 正文里必然多条叠加；只取**第一条** = 拿最旧那次轮次 → "最多 6 次"永不触发。
 PROBE_BUDGET_TRAIL_RE = re.compile(r'<!--\s*probe-budget:\s*(\{.*?\})\s*-->', re.S)
+
+# 载荷解析的**深度上界**（🟡1）：跨仓载荷不可信，深嵌套 JSON（~3000 层）会让
+# 递归解析抛 `RecursionError` 并逃逸到门面；超界一律按"判不出"处理。
+MAX_COERCE_DEPTH = 8
 
 
 def crontab_minutes_from_rules(rules: Optional[Any]) -> int:
@@ -291,7 +299,9 @@ class ProbeEvent:
     resume_required: bool = False
     reason: str = ""
     action: str = ""            # 给接收方的**明确指令**（resume / keep_waiting / sweep_lock / human）
-    wake_allowed: bool = True   # 是否允许据此唤醒下一轮（防"探测自己变成新循环"）
+    # 是否允许据此唤醒下一轮（防"探测自己变成新循环"）。**安全旗标**：
+    # 读入侧（``from_dict``）对非严格 bool 取保守方向（→ False），不默认放行。
+    wake_allowed: bool = False
     # **探测预算留痕**（``<!-- probe-budget: … -->``）：随评论/交接卡/事件载荷走，
     # 下一棒（可能是新容器）据此恢复 ``checks_used``，不必共享磁盘。
     budget_trail: str = ""
@@ -341,7 +351,10 @@ class ProbeEvent:
         ev.resume_required = _as_bool(data.get("resume_required"), False)
         ev.reason = _as_str(data.get("reason"))
         ev.action = _as_str(data.get("action"))
-        ev.wake_allowed = _as_bool(data.get("wake_allowed"), True)
+        # 🟡4：``wake_allowed`` 是**安全旗标**，同族"判不出"取**保守方向**
+        # （与 ``loop_guard`` 的 ``wake`` / ``fused`` 一致）：非严格 bool 一律
+        # 按 ``False``（不得据此唤醒）。旧实现默认 ``True`` = 判不出即放行。
+        ev.wake_allowed = _as_bool(data.get("wake_allowed"), False)
         ev.budget_trail = _as_str(data.get("budget_trail"))
         ev.at = _as_float(data.get("at"), 0.0)
         return ev
@@ -414,9 +427,16 @@ class Checkpoint:
         坏字段退化默认值（同 ``LoopGuard`` / ``LockRegistry`` 族口径）；
         只有"不是对象"或"缺 key"才返回 ``None``（= 视为不存在）。
         """
-        if not isinstance(data, dict) or not data.get("key"):
+        if not isinstance(data, dict):
             return None
-        cp = cls(key=_as_str(data.get("key")))
+        # 🟡3：坏 ``key``（非 str / 空串）→ 返回 ``None``（**视为不存在**）。
+        # 旧实现把 ``{"key": 5}`` 读成 ``key=""``：坏 key 没被当"不存在"，
+        # 而是退化成一个**空标识** → 与其它坏 key 检查点**互相覆盖**（`_save`
+        # 落成同一个 `checkpoint.json`）。坏标识不得成为"合法但空"的身份。
+        raw_key = data.get("key")
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            return None
+        cp = cls(key=raw_key)
         cp.session_id = _as_str(data.get("session_id"))
         cp.kind = _as_str(data.get("kind"), CHECK_EVENT) or CHECK_EVENT
         cp.holder = _as_str(data.get("holder"))
@@ -593,12 +613,22 @@ class CheckpointProbe:
                 + " -->")
 
     @staticmethod
-    def _coerce_checks_used(value: Any) -> Optional[int]:
+    def _coerce_checks_used(value: Any,
+                            _depth: int = 0) -> Optional[int]:
         """从任意形态的载荷里取外部探测轮次（宽进：取不到 → ``None``）。
 
         接受：int / 数字串 / 字典（``checks_used`` 或 ``rounds.checks_used``）/
         含 ``<!-- probe-budget: … -->`` 的正文 / ``ProbeEvent.to_dict()``。
+
+        **多条留痕 → 取 ``max()``**（🔴1）：评论正文里留痕会累积多条
+        （每棒把留痕写回评论是 `.cnb.yml` 的必做项），只取第一条 = 拿最旧那次
+        轮次 → "最多 6 次"永不触发。故收集**全部**留痕取最大值，与顺序无关。
+
+        **深度上界**（🟡1）：跨仓载荷不可信，深嵌套 JSON 会触发 ``RecursionError``
+        并逃逸到门面；超过 ``MAX_COERCE_DEPTH`` 一律按"判不出"（``None``）处理。
         """
+        if _depth > MAX_COERCE_DEPTH:
+            return None
         if isinstance(value, bool):
             return None
         if isinstance(value, int):
@@ -607,27 +637,43 @@ class CheckpointProbe:
             return max(0, int(value))
         if isinstance(value, str):
             text = value.strip()
-            m = PROBE_BUDGET_TRAIL_RE.search(text)
-            if m:
+            best: Optional[int] = None
+            for m in PROBE_BUDGET_TRAIL_RE.finditer(text):
                 try:
                     got = json.loads(m.group(1))
-                except ValueError:
+                except (ValueError, RecursionError):
                     got = None
-                if isinstance(got, dict):
-                    return CheckpointProbe._coerce_checks_used(got)
+                inner = CheckpointProbe._coerce_checks_used(got, _depth + 1) \
+                    if isinstance(got, dict) else None
+                if inner is not None and (best is None or inner > best):
+                    best = inner
+            if best is not None:
+                return best
             try:
                 return max(0, int(text))
             except ValueError:
                 return None
         if isinstance(value, dict):
+            best: Optional[int] = None
             for key in ("checks_used", "external_checks", "used"):
                 if key in value:
-                    got = CheckpointProbe._coerce_checks_used(value[key])
+                    got = CheckpointProbe._coerce_checks_used(value[key],
+                                                              _depth + 1)
                     if got is not None:
                         return got
             rounds = value.get("rounds")
             if isinstance(rounds, dict):
-                return CheckpointProbe._coerce_checks_used(rounds)
+                got = CheckpointProbe._coerce_checks_used(rounds, _depth + 1)
+                if got is not None:
+                    best = got
+            # 内嵌的**留痕**（`budget_trail` 字段，交接卡 context / 事件载荷形态）
+            # 也要展开（🔴1 同族）：否则"带留痕的载荷"只能读到载荷自身的轮次。
+            trail = value.get("budget_trail")
+            if isinstance(trail, str) and trail:
+                got = CheckpointProbe._coerce_checks_used(trail, _depth + 1)
+                if got is not None and (best is None or got > best):
+                    best = got
+            return best
         return None
 
     def adopt_checks_budget(self, cp: Checkpoint, payload: Any = None,
@@ -1195,6 +1241,12 @@ class CheckpointProbe:
                         "key": v.await_key or await_key_for(
                             event.checkpoint_key,
                             (cp.checks_used if cp else 0)),
+                        # 🟡2 **接线**：`.cnb.yml` 的 `api_trigger_probe_wait`
+                        # 事件承载 `*await_lock_task`（await 片）。此前只声明
+                        # "走它的 await 片"、代码从不产出该事件名 → 口径未接线。
+                        # 这里把承载事件写进落点，接收方据此把 await 片挂到
+                        # 正确的 pipeline 事件上（`crontab` 分支才是 probe_check）。
+                        "event": "api_trigger_probe_wait",
                         "note": "零占用挂起；锁/状态变化时由对端 cnb:resolve 唤醒。"
                                 "**本地不 sleep、不轮询**",
                     },

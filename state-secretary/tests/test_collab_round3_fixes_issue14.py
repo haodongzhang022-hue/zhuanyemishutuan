@@ -312,7 +312,11 @@ class TestFieldLevelTolerance:
         ev = ProbeEvent.from_dict({"next_delay_sec": "soon", "checks_used": "NaN",
                                    "facts": "nope", "wake_allowed": "yes"})
         assert ev.next_delay_sec == 0.0 and ev.checks_used == 0
-        assert ev.facts == {} and ev.wake_allowed is True
+        assert ev.facts == {}
+        # 🟡4（复评第 4 轮收口）：`wake_allowed` 是**安全旗标** → "判不出"取保守方向
+        # （非严格 bool → False，不得据此唤醒）。旧断言 `is True` = 判不出即放行，
+        # 与同族 `wake` / `fused` 的保守口径不一致。
+        assert ev.wake_allowed is False
 
     def test_dispatch_shared_tolerates_bad_types(self):
         """跨仓入口 `dispatch_shared` 类型不符 → **不抛**，判不出即继续等。"""
@@ -333,7 +337,10 @@ class TestFieldLevelTolerance:
         g._state.round_no = 2
         bad = {"round_no": "NaN", "fused": "yes", "history": "x"}
         st = type(g._state).from_dict(bad, SESSION)
-        assert st.round_no == 0 and st.fused is False and st.history == []
+        # 🔴4（复评第 4 轮收口）：`fused` 是**安全旗标** → 非严格 `False` 一律按
+        # **已熔断**（`fused: "yes"`/`1`/缺失/坏值 → True）。旧断言 `is False`
+        # 方向反了：一张坏卡就能把熔断清掉 → `should_wake_next()=True` → 循环复活。
+        assert st.round_no == 0 and st.fused is True and st.history == []
 
 
 # ==================================================================

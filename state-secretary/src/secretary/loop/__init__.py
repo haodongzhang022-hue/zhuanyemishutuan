@@ -11,7 +11,10 @@ from .loop_guard import (
     DEFAULT_MAX_ROUNDS,
     DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
     DEFAULT_MAX_STALL_REPEATS,
+    MAX_COERCE_DEPTH,
     extract_json_object,
+    extract_json_objects,
+    pick_wake_object,
     parse_wake,
 )
 
@@ -29,4 +32,7 @@ __all__ = [
     "WAKE_UNKNOWN",
     "parse_wake",
     "extract_json_object",
+    "extract_json_objects",
+    "pick_wake_object",
+    "MAX_COERCE_DEPTH",
 ]
