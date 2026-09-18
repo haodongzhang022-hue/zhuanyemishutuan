@@ -56,6 +56,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..collab.backoff import StepBackoff
+
 # 会话标识白名单（与 StateManager / LoopGuard / ReviewArbiter 同族口径，尾锚 \Z）
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 
@@ -74,7 +76,7 @@ LOCK_RELEASED = "released"  # 已正常释放
 LOCK_REVOKED = "revoked"  # 人工/清理回收（留痕）
 
 # 默认 TTL
-DEFAULT_TTL_SEC = 60.0          # 「延迟可以到 1 分钟」
+DEFAULT_TTL_SEC = 60.0          # 「延迟可以到 1 分钟」（= 阶梯第 3 档）
 DEFAULT_PERSISTENT_GRACE_SEC = 180.0  # 「再次触发就按 3 分钟持续到对方解决完」
 DEFAULT_SWEEP_GRACE_SEC = 30.0  # 过期后仍给一段宽限，避免误杀"刚好在续期"的锁
 
@@ -204,6 +206,7 @@ class LockRegistry:
         persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
         sweep_grace_sec: float = DEFAULT_SWEEP_GRACE_SEC,
         clock: Optional[Callable[[], float]] = None,
+        backoff: Optional[StepBackoff] = None,
     ):
         if not isinstance(session_id, str) or not _SAFE_ID.match(session_id):
             raise ValueError(
@@ -219,6 +222,10 @@ class LockRegistry:
         self.persistent_grace_sec = float(persistent_grace_sec)
         self.sweep_grace_sec = float(sweep_grace_sec)
         self._clock = clock or time.time
+        # 阶梯退避（Issue #14 追问）：延迟后检测的**等待时长**从少到多逐步拉长，
+        # 10s → 30s → 60s → 3min → 6min → 10min 到顶即停。默认为空 = 保持
+        # 「每次都等固定 ttl」的旧语义（向后兼容；会话层默认装载跨仓库规则包）。
+        self.backoff = backoff
         os.makedirs(self.data_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -308,6 +315,7 @@ class LockRegistry:
         persist: bool = False,
         increment: bool = False,
         reason: str = "",
+        delay_step: Optional[int] = None,
     ) -> LockRecord:
         """登记（或**再次触发**升级）一把锁。
 
@@ -325,6 +333,11 @@ class LockRegistry:
             increment: 是否把本次登记计为「**再次触发**」（调用方显式声明；
                 内部续期/心跳不得计入，否则计数会被悄悄抬高）
             reason: 触发原因（留痕）
+            increment: 是否把本次登记计为「**再次触发**」（调用方显式声明）
+            delay_step: **阶梯档位序号**（0 起算）。给定且构造时带 ``backoff`` 时，
+                本次等待时长**由阶梯推出**（``10s→30s→60s→3min→6min→10min``），
+                且**只增不减**：已承诺的等待窗口绝不会被缩短；显式 ``retry_delay_sec``
+                优先于阶梯（调用方有明确口径时以调用方为准）。
 
         Returns:
             最新 ``LockRecord``；同一 key **再次触发** → 升级为持续锁
@@ -344,6 +357,13 @@ class LockRegistry:
             existing = locks.get(key)
             ttl = self.ttl_sec if ttl_sec is None else float(ttl_sec)
             delay = float(retry_delay_sec) if retry_delay_sec else ttl
+            # 阶梯退避（Issue #14 追问）：档位由调用方给出（0 起算），
+            # 等待时长从少到多；显式 retry_delay_sec 优先（口径冲突时以调用方为准）。
+            stair = None
+            if self.backoff is not None and delay_step is not None \
+                    and not retry_delay_sec:
+                stair = self.backoff.delay_for(delay_step)
+                delay = stair
             if existing is not None and existing.status == LOCK_HELD:
                 # 再次触发的**计数只由调用方显式声明**（increment=True）——
                 # 否则内部续期/心跳也会被当成"重触发"，把计数越抬越高。
@@ -360,12 +380,20 @@ class LockRegistry:
                 existing.expires_at = now + lock_ttl
                 existing.ttl_sec = lock_ttl
                 existing.heartbeat_at = now
-                if retry_delay_sec:
+                if retry_delay_sec or stair is not None:
                     # 退避**由调用方定值**（已含"上一档 + 一档"），本层只承接；
-                    # 新窗口若比原窗口更早，也要保持"不缩短"的最小语义。
+                    # 新窗口若比原窗口更早，也要保持"不缩短"的最小语义——
+                    # 阶梯"从少到多"绝不意味着可以把已承诺的长等待改回短等待。
                     earliest = max(existing.retry_at, now + delay)
                     existing.retry_at = earliest
                     existing.retry_delay_sec = max(0.0, earliest - now)
+                    if stair is not None:
+                        existing.history.append({
+                            "at": _now_str(now), "action": "backoff-step",
+                            "by": holder, "step": int(delay_step),
+                            "delay_sec": stair,
+                            "label": self.backoff.status(int(delay_step)).label,
+                        })
                 else:
                     existing.retry_at = 0.0
                     existing.retry_delay_sec = 0.0

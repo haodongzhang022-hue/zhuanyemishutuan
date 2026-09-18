@@ -28,8 +28,9 @@
 | 会话统一门面 | `SecretarySession` — L3 会话秘书完整驱动（状态+折叠+装配+交接） | org.md |
 | 循环熔断 | `LoopGuard` — 轮次预算 + 非必要修复最多 1 次 + 停滞感知 + 静默交接不唤醒 | loop-guard.md |
 | 评审写回仲裁 | `ReviewArbiter` — 只在开启评审时记版本 + 防同写锁 + 延迟重试 + 单冲突收口 | review-arbiter.md |
+| 锁聚合台账 | `LockRegistry` — 所有锁统一登记 + 延迟后检测 + 先做其他并挂锁 + 绝不遗留 | [lock-registry.md](../docs/design/state-secretary-lock-registry.md) |
+| 跨仓库协同规则 | `collab/` — 阶梯退避（10s→30s→60s→3min→6min→10min 到顶即停）+ 等待走平台挂起（不占 CPU） | [collab-rules.md](../docs/secretary-collab-rules.md) |
 | 审查范围分级 | `decide_scan` / `ScanContext` — 日常只审变化，全量只在大版本 | review-arbiter.md §6 |
-| 锁聚合台账 | `LockRegistry` — 所有锁统一登记 + 延迟后检测 + 先做其他并挂锁 + 绝不遗留 | lock-registry.md |
 
 ## 快速开始
 
@@ -102,6 +103,14 @@ for conf in sec.pending_review_conflicts():   # ④ 待处理冲突至多一张
 # 审查范围：日常只审变化，全量只在大版本
 assert sec.review_scope().mode == "scan"
 sec.review_scope_commands(tags=["major-version"])   # 大版本才允许全量
+
+# 跨仓库协同规则：等待阶梯 10s→30s→60s→3min→6min→10min（到顶即停）
+sec.waiting_plan()                            # 一行全阶梯 + "到顶即停"
+sec.waiting_status(3)                         # 第 4 档：180s（3 分钟）
+sec.wait_decision(0)["mode"]                  # 'platform_suspend'（挂平台等，不占 CPU）
+sec.wait_decision(5)["mode"]                  # 'resume_required'（到顶用尽 → 交回人工）
+sec.cost_note()["waiting_billed"]             # False：等待没有独立计费项
+sec.collab_status()                           # 生效快照：数值从哪来 / 当前是多少
 
 # 三层上下文装配（缓存键 = layer_a 哈希）
 result = sec.assemble_context(user_text="查询进度")

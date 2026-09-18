@@ -1,0 +1,59 @@
+# ============================================================
+# 跨仓库协同规则包（agent ↔ agent 的协同礼仪）
+# ============================================================
+# 定位：**全局规则**，跨仓库共用一份。与具体仓库的业务无关，
+#       放单仓会导致"每仓一套数值 → 换仓/换 agent 行为漂移"。
+# 用法：
+#   - 代码：`secretary.collab.load_rules()`（从任意子目录向上查找本文件）
+#   - 覆写：环境变量 `CNB_COLLAB_RULES` 指向自定义规则包，或直接显式路径装载
+#   - 仓库内差异**只允许覆写数值**，不允许改语义（语义见 docs/secretary-collab-rules.md）
+# Ref: #14（追问：等待阶梯 10s→30s→60s→3min→6min→10min 封顶停止；等待是否占 CPU）
+# ============================================================
+
+# ---- 等待/退避：从少到多，到顶即停 ----
+backoff:
+  # 阶梯（秒）。前两档刻意很短：**大部分冲突第 1 次检测就没了**，
+  # 不为少数长尾付等待成本；后段拉长收敛长尾。
+  ladder: [10, 30, 60, 180, 360, 600]
+  # 本地挂账次数硬上界（到顶后仍重复的兜底；≠"会一直等下去"）
+  max_attempts: 6
+
+# ---- 锁：延迟 → 持续 → 聚合台账 ----
+locks:
+  # 首次遇到"正在编辑"的延迟窗（秒）
+  retry_delay_sec: 60
+  # 再次触发 → 持续锁宽限（秒），持续到对方解决完，不自动打开
+  persistent_grace_sec: 180
+  # 所有锁统一登记在一本台账（触发即可查"哪里要避开"）
+  registry_shared: true
+
+# ---- 循环熔断：门禁往返的上界 ----
+loop:
+  max_rounds: 3                # 🔴 门禁必修轮次上界
+  max_advisory_fix_rounds: 1   # 🟡 非必要修复：最多 1 次，其后结转不回转
+  max_total_rounds: 5          # 修复总轮次硬上界（防 🔴/🟡 交替绕过）
+  max_stall_repeats: 2         # 同一整改项指纹连续重复 → 停滞熔断
+
+# ---- 审查范围：日常只审变化，全量只在大版本 ----
+scan:
+  major_version_tags: ["major-version", "大版本", "release-major"]
+  full_scan_keywords: ["大版本", "全量", "major version", "full scan"]
+  scan_keywords: ["只审变化", "增量", "只跑增量", "scan only"]
+
+# ---- 平台计费口径（回答"等待会不会占用 CPU 计费"） ----
+# 依据 CNB 官方文档：/zh/pricing.md、/zh/build/timeout.md、
+# /zh/build/internal-steps/cnb/await-resolve.md、/zh/build/internal-steps/npc/go.md
+platform:
+  cpu_unit: "核时"
+  cpu_formula: "自然月内累积用量 − 免费额度；启动后每 5min 冻结 5min × 节点规格（免费额度 160 核时/月）"
+  ai_unit: "AI Credits"
+  ai_formula: "每次模型调用按实际 Token 消耗计（NPC / AI 评审 / 内置 CodeBuddy）"
+  # 关键结论：等待**没有独立计费项**
+  waiting_billed: false
+  waiting_note: >-
+    平台只有「云原生构建/开发 CPU 核时」与「AI Credits」两项与任务相关：CPU 按任务
+    实际运行时长计，Token 按模型调用计，二者都**没有"等待"这一计费项**。因此等待
+    本身不占用 CPU 计费——**前提是等待走了平台的等待/挂起语义**（如 cnb:await），
+    没有在本地 sleep、空转轮询或持续产出日志。本地空转 10 分钟 = 8 核 ×10min ≈
+    1.33 核时（约 ¥0.17），而平台挂起同一段时间不计 CPU。
+  pause_hint: "阶梯到顶（10 分钟）即停；长等待交给平台等待/挂起语义，本地不做轮询"

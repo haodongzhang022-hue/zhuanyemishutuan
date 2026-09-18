@@ -92,11 +92,11 @@ class TestDefaults:
         assert DEFAULT_RETRY_DELAY_SEC == 60.0
         assert DEFAULT_PERSISTENT_GRACE_SEC == 180.0
 
-    def test_session_uses_60s_delay(self, env):
-        """不传参时，会话/仲裁/台账三处的延迟窗都是 1 分钟（同源）。"""
+    def test_session_uses_ladder_first_step(self, env):
+        """不传参时，会话默认按**跨仓库规则包**取阶梯首档 10s（同源三处）。"""
         _, _, rev, _ = env
-        assert rev.review_arbiter.retry_delay_sec == 60.0
-        assert rev.lock_registry.ttl_sec == 60.0
+        assert rev.review_arbiter.retry_delay_sec == 10.0
+        assert rev.lock_registry.ttl_sec == 10.0
         assert rev.lock_registry.persistent_grace_sec == 180.0
 
 
@@ -105,8 +105,8 @@ class TestDefaults:
 # ------------------------------------------------------------------
 
 class TestDeferAndRetryAfter:
-    def test_first_defer_window_is_60s(self, env):
-        """首次遇到"正在编辑" → 延迟窗 = 1 分钟（反向对照：≠ 30s）。"""
+    def test_first_defer_window_is_10s(self, env):
+        """首次遇到"正在编辑" → 延迟窗 = 阶梯首档 10s（反向对照：≠ 60s 旧值）。"""
         _, clock, rev, dev = env
         rev.begin_review()
         dev_starts_editing(dev)
@@ -114,7 +114,7 @@ class TestDeferAndRetryAfter:
         assert dec.should_retry is True
         assert dec.deferred is True
         assert dec.applied is False, "延迟内不落盘（先做其他）"
-        assert dec.retry_after == pytest.approx(clock() + 60.0)
+        assert dec.retry_after == pytest.approx(clock() + 10.0)
 
     def test_lock_is_registered_and_visible(self, env):
         """挂锁立刻可在聚合台账里查到（"触发了就可以去看一眼"）。"""
@@ -146,7 +146,7 @@ class TestDeferAndRetryAfter:
         og = dev_starts_editing(dev)
         rev.apply_review(note="评审")
         og.release()                      # 对方处理完（写租约释放）
-        clock.advance(61)
+        clock.advance(11)
         dec = rev.retry_review(note="评审")
         assert dec.applied is True
         assert dec.conflict is False
@@ -158,11 +158,11 @@ class TestDeferAndRetryAfter:
         rev.begin_review()
         dev_starts_editing(dev)
         rev.apply_review(note="评审")
-        clock.advance(61)
+        clock.advance(11)
         dec = rev.retry_review(note="评审")
         assert dec.should_retry is True
         assert dec.applied is False
-        assert dec.retry_after > clock()
+        assert dec.retry_after >= clock()
         assert len(rev.lock_registry.list_held(KIND_DEFER)) == 1, "锁不得被丢掉"
 
 
@@ -184,7 +184,7 @@ class TestRetriggerBecomesPersistent:
         assert dec.lock and dec.lock["persistent"] is True
 
     def test_backoff_extends_never_shortens(self, env):
-        """退避：等待依次变长（60 → 120 → 180 封顶），**绝不缩短已有承诺**。"""
+        """退避：等待沿阶梯依次变长（10 → 30 → 60 → 180），**绝不缩短已有承诺**。"""
         _, clock, rev, dev = env
         rev.begin_review()
         dev_starts_editing(dev)
@@ -192,10 +192,9 @@ class TestRetriggerBecomesPersistent:
         for i in range(4):
             dec = rev.apply_review(note=f"评审{i}")
             delays.append(round(dec.retry_after - clock()))
-        assert delays[0] == 60
+        assert delays[0] == 10
         assert delays == sorted(delays), f"等待不得回退: {delays}"
-        assert max(delays) <= DEFAULT_PERSISTENT_GRACE_SEC, f"不得超过 3 分钟上限: {delays}"
-        assert delays[-1] == 180
+        assert delays[-1] == 180, f"第 4 次触发应到 3 分钟档: {delays}"
 
     def test_persistent_lock_not_released_within_grace(self, env):
         """**持续锁在宽限内不许打开**（对方还没解决完）。"""
@@ -219,7 +218,7 @@ class TestRetriggerBecomesPersistent:
         clock.advance(181)
         dec = rev.retry_review(note="评审")
         assert dec.should_retry is True
-        assert dec.retry_after > clock(), "仍要给出下一次检测点"
+        assert dec.retry_after >= clock(), "仍要给出下一次检测点（到顶后为当前窗口）"
         assert len(rev.lock_registry.list_held(KIND_DEFER)) == 1
 
     def test_deferred_status_reports_situation(self, env):
@@ -286,7 +285,7 @@ class TestNoLeftoverLocks:
         dev_starts_editing(dev)
         rev.apply_review(note="评审1")
         rev.apply_review(note="评审2")
-        clock.advance(60 + 180 + 30 + 1)      # 过期 + 宽限
+        clock.advance(600 + 180 + 30 + 1)     # 过期 + 宽限（阶梯顶 10 分钟）
         swept = rev.sweep_locks(by="tester")
         assert any(r["key"] == rev.review_arbiter.defer_lock_key() for r in swept)
         assert rev.deferred_review_status() is None, "锁被回收后不得再挂着待处理项"
@@ -438,7 +437,7 @@ class TestDoOtherFirst:
         og = dev_starts_editing(dev)
         rev.apply_review(note="评审")
         og.release()                         # 对方处理完
-        clock.advance(61)
+        clock.advance(11)
         dec = rev.complete_deferred_review(note="收尾补做评审")
         assert dec.applied is True
         assert rev.lock_registry.list_held(KIND_DEFER) == []
@@ -449,7 +448,7 @@ class TestDoOtherFirst:
         rev.begin_review()
         dev_starts_editing(dev)
         rev.apply_review(note="评审")
-        clock.advance(61)
+        clock.advance(11)
         dec = rev.complete_deferred_review(note="收尾补做评审")
         assert dec.applied is False
         assert dec.should_retry is True

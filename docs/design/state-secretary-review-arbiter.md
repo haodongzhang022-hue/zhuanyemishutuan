@@ -19,7 +19,7 @@
 |---|---|---|
 | 1 | 只在开启评审时记录版本 | `begin_review()`；过程中 `recorded()` 恒 False |
 | 2 | 无法追踪变化就以新的 | `REBASE`（不编造冲突） |
-| 3 | 正在编辑 → 防同写锁 + 延迟 | `retry_after` / `retry_delay_sec` / `retry()` |
+| 3 | 正在编辑 → 防同写锁 + **阶梯延迟** | `retry_after` / `retry_delay_sec`（阶梯首档）/ `retry()` |
 | 4 | 先完成该做的，只额外处理一个 | `apply_save()` **先落盘**；冲突收敛为**一张**卡 |
 | 5 | 日常只审变化，全量只在大版本 | `decide_scan()` / `scan_commands()` |
 
@@ -51,9 +51,15 @@
 + **锁**：复用既有 `OwnershipGuard` 的写租约（`<session>.owner.json`）。
   有**他人**有效租约 = "正在编辑" → 给防同写锁：本次**不落盘**，返回
   `should_retry=True` + `retry_after`。
-+ **延迟**：`retry_delay_sec`（默认 30s）。窗内调 `retry()` 继续等待；
-  到点后编辑多半已结束 → 直接完成，无需人工（用例
++ **延迟（阶梯）**：走 `StepBackoff`（Issue #14 追问）——
+  **10s → 30s → 60s → 3min → 6min → 10min（到顶即停）**。
+  窗内调 `retry()` 继续等待；到点后编辑多半已结束 → 直接完成，无需人工（用例
   `test_retry_after_lease_released_applies`）。
++ **不许缩短承诺**：重触发沿阶梯上行且**只增不减**（下一档永不短于已承诺的窗口）；
+  到顶后**不再把检测点往后推**（否则"到顶"就成无限等待）——顶档只重复有限次，
+  用尽则 `resume_required`（交回人工/上游）。
++ **等待不计 CPU**：等待模式只产出 `platform_suspend` / `deferred_review` /
+  `resume_required`，**永不选"本地空转"**（`WaitPolicy`）。
 + **同向可重试**：另一方也是评审（`rules.is_same_side`）且写入落在过渡态
   → 判**可重试的时序冲突**（`should_retry`，**不是** conflict）。
 + **自己的租约不延迟自己**（反向对照用例 `test_own_lease_does_not_defer_self`）。

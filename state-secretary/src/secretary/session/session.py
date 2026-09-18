@@ -35,14 +35,8 @@ from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
 from ..loop import LoopDecision, LoopGuard
-from ..loop.loop_guard import (
-    DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
-    DEFAULT_MAX_ROUNDS,
-    DEFAULT_MAX_STALL_REPEATS,
-)
+from ..collab import CollabRules, StepBackoff, WaitPolicy, load_rules
 from ..review import (
-    DEFAULT_PERSISTENT_GRACE_SEC,
-    DEFAULT_RETRY_DELAY_SEC,
     ArbiterDecision,
     ConflictCard,
     ReviewArbiter,
@@ -126,14 +120,16 @@ class SecretarySession:
         archive_root: Optional[str] = None,
         static_prefix: Optional[str] = None,
         loop_dir: Optional[str] = None,
-        max_rounds: int = DEFAULT_MAX_ROUNDS,
-        max_advisory_fix_rounds: int = DEFAULT_MAX_ADVISORY_FIX_ROUNDS,
+        max_rounds: Optional[int] = None,
+        max_advisory_fix_rounds: Optional[int] = None,
         max_total_rounds: Optional[int] = None,
-        max_stall_repeats: int = DEFAULT_MAX_STALL_REPEATS,
+        max_stall_repeats: Optional[int] = None,
         review_dir: Optional[str] = None,
-        retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+        retry_delay_sec: Optional[float] = None,
         locks_dir: Optional[str] = None,
-        persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
+        persistent_grace_sec: Optional[float] = None,
+        collab_rules: Optional[CollabRules] = None,
+        rules_path: Optional[str] = None,
     ):
         """初始化一个会话秘书。
 
@@ -148,19 +144,23 @@ class SecretarySession:
             archive_root: 原文归档根目录（默认 <data_dir>/content）。
             static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
             loop_dir: 循环熔断状态目录（默认 ``<数据根>/loop``）。
-            max_rounds: 门禁（🔴）修复轮次上界，默认 3。
-            max_advisory_fix_rounds: 非必要（🟡）修复轮次上界，默认 1。
-            max_total_rounds: 修复总轮次硬上界，默认
-                ``max_rounds + max_advisory_fix_rounds + 1``。
-            max_stall_repeats: 同一整改项指纹连续出现上界（默认 2）→ 停滞熔断。
+            max_rounds: 门禁（🔴）修复轮次上界。不传取**跨仓库规则包**（默认 3）。
+            max_advisory_fix_rounds: 非必要（🟡）修复轮次上界。不传取规则包（默认 1）。
+            max_total_rounds: 修复总轮次硬上界。不传取规则包（默认 5）。
+            max_stall_repeats: 同一整改项指纹连续出现上界。不传取规则包（默认 2）。
             review_dir: 评审仲裁数据目录（默认 ``<数据根>/review``）。
-            retry_delay_sec: 疑似"正在编辑"时的延迟窗，默认 **60s**（1 分钟），
-                窗内**先做其他**；**再次触发**则对应锁升级为持续锁。
+            retry_delay_sec: **兼容参数**。不传时按跨仓库协同规则取阶梯首档
+                （默认 10s）；传入则固定用该值（旧语义，不做阶梯）。
             locks_dir: 锁聚合台账目录（默认 ``<数据根>/locks``）。
                 **所有锁统一登记在此**：卡片写租约 / 评审读锁 / 延迟锁，
                 `locks_overview()` 一次看全"哪里要避开"。
-            persistent_grace_sec: 重触发后持续锁的宽限，默认 **180s**（3 分钟），
-                持续到对方处理完为止（不自动打开）。
+            persistent_grace_sec: **兼容参数**。不传时取规则包（默认 180s）。
+            collab_rules: **跨仓库协同规则包**（`CollabRules`）。不传时按
+                `rules_path` → 环境变量 `CNB_COLLAB_RULES` → 从 `data_dir`
+                向上查找 `shared/collab/collab-rules.yaml` 的顺序装载。
+                规则包承载"agent 协同时的全局规则"：等待阶梯（
+                10s→30s→60s→3min→6min→10min 到顶即停）、锁/熔断/审查范围/计费口径。
+            rules_path: 显式规则包路径（优先于自动查找）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -183,6 +183,29 @@ class SecretarySession:
             self._session_root, "content")
         ho_dir = os.path.join(self._session_root, "handoffs")
 
+        # 跨仓库协同规则（Issue #14 追问）：agent 协同的**全局参数**一处定义。
+        # 装载顺序：显式 rules_path → 环境变量 → 从会话数据根逐级向上找规则包
+        # → 内置默认。规则包决定等待阶梯 / 锁窗口 / 熔断预算 / 审查范围 / 计费口径。
+        self.collab_rules = (collab_rules if collab_rules is not None
+                             else load_rules(rules_path, search_from=self._session_root))
+        # 等待阶梯：显式传了 retry_delay_sec 就不走阶梯（旧语义，向后兼容）；
+        # 未传则用规则包阶梯——等待从少到多，到顶（10 分钟）即停。
+        self.backoff: Optional[StepBackoff] = (
+            None if retry_delay_sec is not None else self.collab_rules.backoff)
+        # 等待策略：把"等多久"翻译成"怎么等"——**等待交平台挂起，本地不做 CPU 轮询**
+        # （回答"长时间等待会不会占用构建 CPU 计费"）。显式固定窗口时也成立。
+        self.wait_policy = WaitPolicy(
+            backoff=self.backoff or self.collab_rules.backoff,
+            platform=self.collab_rules.platform,
+        )
+        if retry_delay_sec is not None:
+            effective_delay = float(retry_delay_sec)
+        else:
+            effective_delay = self.collab_rules.backoff.delay_for(0)
+        effective_grace = (float(persistent_grace_sec)
+                           if persistent_grace_sec is not None
+                           else self.collab_rules.lock_persistent_grace_sec)
+
         # 初始化底层组件
         self.state_manager = StateManager(data_dir=state_dir)
         self.fold_engine = FoldEngine(
@@ -203,10 +226,17 @@ class SecretarySession:
         self.loop_guard = LoopGuard(
             session_id=session_id,
             data_dir=loop_dir or os.path.join(self._session_root, "loop"),
-            max_rounds=max_rounds,
-            max_advisory_fix_rounds=max_advisory_fix_rounds,
-            max_total_rounds=max_total_rounds,
-            max_stall_repeats=max_stall_repeats,
+            max_rounds=(self.collab_rules.max_rounds if max_rounds is None
+                        else max_rounds),
+            max_advisory_fix_rounds=(
+                self.collab_rules.max_advisory_fix_rounds
+                if max_advisory_fix_rounds is None else max_advisory_fix_rounds),
+            max_total_rounds=(self.collab_rules.max_total_rounds
+                              if max_total_rounds is None
+                              else max_total_rounds),
+            max_stall_repeats=(self.collab_rules.max_stall_repeats
+                               if max_stall_repeats is None
+                               else max_stall_repeats),
         )
         # 评审版本仲裁（Issue #14 补全机制）：只在开启评审时记录版本 +
         # 防同写锁 + 延迟重试 + 单冲突收口。状态落 <数据根>/review/，
@@ -216,14 +246,16 @@ class SecretarySession:
             state_manager=self.state_manager,
             reviewer=role_name,
             data_dir=review_dir or os.path.join(self._session_root, "review"),
-            retry_delay_sec=retry_delay_sec,
+            retry_delay_sec=effective_delay,
             lock_registry=LockRegistry(
                 session_id=session_id,
                 data_dir=locks_dir or os.path.join(self._session_root, "locks"),
-                ttl_sec=retry_delay_sec,
-                persistent_grace_sec=persistent_grace_sec,
+                ttl_sec=effective_delay,
+                persistent_grace_sec=effective_grace,
+                backoff=self.backoff,
             ),
-            persistent_grace_sec=persistent_grace_sec,
+            persistent_grace_sec=effective_grace,
+            backoff=self.backoff,
         )
         # 锁聚合台账（同一本，供总览/清扫/外部模块登记；卡片写租约也镜像到此）
         self.lock_registry = self.review_arbiter.lock_registry
@@ -1145,6 +1177,9 @@ class SecretarySession:
         summary["loop"] = self.loop_guard.status()
         summary["wake_allowed"] = self.loop_guard.should_wake_next()
         summary["locks"] = self.locks_overview()
+        # 协同规则随汇总上行（Issue #14 追问）：上级一眼知道"下一档等多久、
+        # 到没到顶、等待按不按 CPU 计费"，不必回读会话本地状态。
+        summary["collab"] = self.collab_status()
         return summary
 
     def set_upstream(self, upstream_session: str) -> bool:
@@ -1372,6 +1407,68 @@ class SecretarySession:
     def deferred_review_status(self) -> Optional[dict]:
         """当前「先做其他，并挂锁」项：锁还剩多久、对方动没动、是否已升级持续锁。"""
         return self.review_arbiter.deferred_status()
+
+    # ------------------------------------------------------------------
+    # 跨仓库协同规则（Issue #14 追问：agent 协同时的全局规则）
+    # ------------------------------------------------------------------
+
+    def collab_status(self) -> dict:
+        """跨仓库协同规则的**生效快照**："这套数值从哪来、现在是多少"。
+
+        一眼回答三个问题：
+        - 等待阶梯是什么（从少到多、到顶即停）；
+        - 锁/熔断/审查范围用的是哪套预算；
+        - **等待算不算 CPU 计费**（平台口径）。
+        """
+        rules = self.collab_rules
+        return {
+            "source": rules.source,
+            "waiting_plan": rules.waiting_plan(),
+            "waiting_ladder": rules.waiting_ladder(),
+            "waiting": (self.backoff.status(0).to_dict()
+                        if self.backoff is not None else None),
+            "locks": {
+                "retry_delay_sec": self.review_arbiter.retry_delay_sec,
+                "persistent_grace_sec": self.review_arbiter.persistent_grace_sec,
+                "registry_shared": rules.lock_registry_shared,
+            },
+            "loop": {
+                "max_rounds": self.loop_guard.max_rounds,
+                "max_advisory_fix_rounds": self.loop_guard.max_advisory_fix_rounds,
+                "max_total_rounds": self.loop_guard.max_total_rounds,
+                "max_stall_repeats": self.loop_guard.max_stall_repeats,
+            },
+            "scan": {
+                "major_version_tags": list(rules.major_version_tags),
+            },
+            "platform_cost": rules.platform.to_dict(),
+        }
+
+    def waiting_plan(self) -> str:
+        """等待计划（一行）：``10s → 30s → … → 600s（到顶即停）``。"""
+        if self.backoff is None:      # 显式固定窗口（旧语义）
+            return f"固定延迟 {self.review_arbiter.retry_delay_sec:.0f}s（未启用阶梯）"
+        return self.backoff.human()
+
+    def waiting_status(self, retriggered: int = 0) -> Optional[dict]:
+        """当前位置的等待状态：第几档、等多久、是否到顶/已停。"""
+        return self.review_arbiter.waiting_status(retriggered)
+
+    def cost_note(self) -> dict:
+        """**等待是否占用 CPU 计费**：平台口径原话（供所有角色统一答复）。"""
+        return self.collab_rules.platform.to_dict()
+
+    def wait_decision(self, attempt: int = 0, *, editing: bool = True) -> dict:
+        """该"怎么等"（第 ``attempt`` 次检测）。
+
+        三选一，**永不选"本地空转"**：`platform_suspend`（挂平台等）/
+        `deferred_review`（先做其他）/ `resume_required`（到顶交回人工）。
+        """
+        return self.wait_policy.decide(attempt, editing=editing).to_dict()
+
+    def wait_plan(self, attempts: Optional[int] = None) -> List[dict]:
+        """整条等待计划（每次到点怎么等），可直接贴进讨论/文档。"""
+        return self.wait_policy.plan(attempts)
 
     # ------------------------------------------------------------------
     # 锁聚合管理（Issue #14：所有锁统一登记，触发即可查看，绝不遗留）

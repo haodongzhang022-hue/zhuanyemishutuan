@@ -17,10 +17,16 @@
 
 | # | 口径 | 落地 |
 |---|---|---|
-| 1 | 延迟 = 1 分钟；重触发 = 3 分钟持续到对方解决完 | `DEFAULT_RETRY_DELAY_SEC=60`；退避 60→120→180 封顶；重触发即 `persistent` |
+| 1 | 延迟**阶梯**从少到多、10 分钟到顶即停；重触发持续到对方解决完 | `StepBackoff`：10s→30s→60s→3min→6min→**600s 顶**；到顶即停（不重挂）；重触发即 `persistent` |
 | 2 | 别遗留锁一直不打开 | 每把锁都有 `expires_at`；`sweep()` 回收过期+超宽限锁；收口/消解即释放 |
 | 3 | 所有锁聚合管理，触发即可查看 | 一本台账 `registry.json`；`locks_overview()` 给出「哪里要避开」 |
 | 4 | 延迟后检测 + 先做其他并挂锁 | `retry()` 到点检测；`acquire_blocked()` / `_defer_while_editing()` |
+| 5 | 等待**不计 CPU**（平台挂起语义） | `WaitPolicy`：只产出 `platform_suspend` / `deferred_review` / `resume_required`，**永不选本地空转** |
+
+> **v0.2 口径更正**：原「延迟 1 分钟 + 退避 60→120→180 封顶」作废。
+> 现为 **10s → 30s → 60s → 3min → 6min → 10min（顶，停）**：前两档刻意很短
+> （"大部分很快就没问题"），到顶**不再增长也不无限重挂**（到顶次数用尽 →
+> `resume_required`，交回人工/上游）。详见 `docs/secretary-collab-rules.md`。
 
 ## 2. 锁的层次与聚合关系
 

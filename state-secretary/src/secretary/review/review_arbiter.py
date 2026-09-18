@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from ..collab.backoff import StepBackoff
 from ..state.lock_registry import (
     KIND_DEFER,
     KIND_REVIEW,
@@ -56,10 +57,15 @@ _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 # 冲突卡 ID 前缀（仅 [A-Za-z0-9_-]，可直接参与路径拼接，无需再转义）
 _CONFLICT_ID_PREFIX = "REVCONF"
 
-# 延迟窗：首次触发「正在编辑」→ 延迟 **1 分钟**再检测（不用立刻抢写）
+# 延迟窗：首次触发「正在编辑」→ **阶梯第 1 档**再检测（不用立刻抢写）。
+# 阶梯（Issue #14 追问）：10s → 30s → 60s → 3min → 6min → 10min 到顶即停；
+# 前两档刻意很短（"大部分很快就没问题"），后段拉长收敛长尾。
+# 本常量保留为**兼容默认**（会话未装载规则包时的固定延迟窗）。
 DEFAULT_RETRY_DELAY_SEC = 60.0
-# 再次触发（第 2 次及以后）→ 升级为**持续锁**，默认 **3 分钟**宽限，
-# 持续到对方处理完为止（不自动打开）
+# 「到顶即停」的上界 = 阶梯顶（10 分钟）：重触发的等待**不再超过它**
+DEFAULT_MAX_WAIT_SEC = 600.0
+# 再次触发（第 2 次及以后）→ 升级为**持续锁**；等待档位继续沿阶梯上行
+# （3 分钟是阶梯中的一档），一直持续到对方处理完为止（不自动打开）
 DEFAULT_PERSISTENT_GRACE_SEC = 180.0
 
 # 冲突类别
@@ -295,6 +301,7 @@ class ReviewArbiter:
         clock: Optional[Callable[[], float]] = None,
         lock_registry: Optional[LockRegistry] = None,
         persistent_grace_sec: float = DEFAULT_PERSISTENT_GRACE_SEC,
+        backoff: Optional[StepBackoff] = None,
     ):
         """
         Args:
@@ -311,6 +318,10 @@ class ReviewArbiter:
                 触发即可 `locks_overview()` 一眼看清"哪里要避开"
             persistent_grace_sec: 重触发后持续锁的宽限（默认 **3 分钟**），
                 持续到对方处理完（不自动打开）
+            backoff: **阶梯退避**（Issue #14 追问）。给定后，延迟后检测的等待
+                时长走阶梯：``10s → 30s → 60s → 3min → 6min → 10min``，
+                **到顶即停**（不再涨、不再重挂）；未给出则退化为固定
+                ``retry_delay_sec``（旧语义，向后兼容）。
         """
         if not isinstance(session_id, str) or not _SAFE_ID.match(session_id):
             raise ValueError(
@@ -338,6 +349,8 @@ class ReviewArbiter:
         self.data_dir = data_dir or os.path.join(self._state_dir, "review")
         os.makedirs(self.data_dir, exist_ok=True)
         self.persistent_grace_sec = float(persistent_grace_sec)
+        # 阶梯退避（Issue #14 追问）：等待从少到多、到顶（10 分钟）即停
+        self.backoff = backoff
         # 锁聚合台账（"所有锁应该被聚合的管理"）：与会话数据同根，随会话回收
         self.lock_registry = lock_registry or LockRegistry(
             session_id=session_id,
@@ -345,6 +358,7 @@ class ReviewArbiter:
             clock=self._clock,
             ttl_sec=self.retry_delay_sec,
             persistent_grace_sec=self.persistent_grace_sec,
+            backoff=backoff,
         )
 
     # ------------------------------------------------------------------
@@ -393,13 +407,14 @@ class ReviewArbiter:
                            scope: str, reason: str = "",
                            persist: bool = False,
                            retry_delay_sec: float = 0.0,
-                           increment: bool = False) -> Optional[dict]:
+                           increment: bool = False,
+                           delay_step: Optional[int] = None) -> Optional[dict]:
         """台账登记（失败静默：台账是观测面，不得阻塞评审落盘）。"""
         try:
             rec = self.lock_registry.register(
                 key, kind=kind, holder=holder, scope=scope,
                 persist=persist, retry_delay_sec=retry_delay_sec,
-                increment=increment, reason=reason)
+                increment=increment, reason=reason, delay_step=delay_step)
             return rec.to_dict()
         except Exception:  # noqa: BLE001
             return None
@@ -630,13 +645,43 @@ class ReviewArbiter:
             reason=card.reason, detail=note,
         )
 
+    # ------------------------------------------------------------------
+    # 阶梯退避（Issue #14 追问：从少到多，10 分钟到顶即停）
+    # ------------------------------------------------------------------
+
+    def _step_for(self, retriggered: int) -> int:
+        """本次该用阶梯的哪一档（0 起算）。无阶梯 → 0（固定窗口旧语义）。"""
+        return max(0, int(retriggered))
+
+    def waiting_status(self, retriggered: int = 0) -> Optional[dict]:
+        """当前位置的等待计划（给角色/人看：下一档等多久、是否到顶）。"""
+        if self.backoff is None:
+            return None
+        return self.backoff.status(self._step_for(retriggered)).to_dict()
+
+    def _next_step(self, lock: Optional[Any]) -> int:
+        """下一次检测该用阶梯的哪一档（**只进不退**，到顶后停在顶）。"""
+        if self.backoff is None:
+            return 0
+        cur = 0
+        if lock is not None and lock.retry_delay_sec:
+            # 由"当前窗口时长"反查档位：窗口被拉长过就不能再退回短档。
+            for idx, sec in enumerate(self.backoff.ladder):
+                if sec <= lock.retry_delay_sec + 1e-9:
+                    cur = idx
+        return min(cur + 1, len(self.backoff.ladder) - 1)
+
     def _defer_while_editing(self, note: str, scope: str = "状态卡正在被编辑",
                              holder: str = "", persistent: bool = False) -> dict:
         """「**先做其他，并挂锁**」：挂一把锁等对方处理完，锁上带延迟后检测点。
 
-        首次触发：TTL = ``retry_delay_sec``（默认 1 分钟）——到点自动重试；
-        **再次触发**：台账里同一把锁升级为**持续锁**（默认 3 分钟宽限、持久），
-        一直持续到对方处理完（`should_release()` 为 False 时**绝不释放**）。
+        **等待时长走阶梯**（Issue #14 追问）：第 1 次 ≈ 10 秒，其后 30s → 60s →
+        3min → 6min → **10min 到顶即停**（不再增长、不再重挂）。理由：
+        "大部分很快就没问题"，前两档短一点，多数冲突在第 1 次检测就消失；
+        长尾才逐步拉长，最后停在 10 分钟。
+
+        **再次触发**：台账里同一把锁升级为**持续锁**（持久，不自动打开），
+        等待档位继续沿阶梯上行（同一档不允许回退）。
         """
         key = self.defer_lock_key()
         now = self._clock()
@@ -645,33 +690,36 @@ class ReviewArbiter:
         # 重触发 = 本会话此前已挂过同一把锁（第 2 次及以后触发同一问题）
         triggers = int(existing.retry_count) + 1 if existing is not None else 0
         want_persistent = bool(is_retrigger or persistent)
-        # 退避：本次「延迟后检测」的等待 = 上一档 +1 分钟，**上限 = 持续锁宽限
-        # （默认 3 分钟）**；只增不减（已承诺的等待绝不缩短）→ 60 → 120 → 180 封顶。
-        prev_gap = (max(0.0, existing.retry_at - now)
-                    if existing is not None and existing.retry_at > now else 0.0)
-        requested = min(prev_gap + self.retry_delay_sec, self.persistent_grace_sec)
+        step = self._step_for(triggers)
+        # 未装载规则包时退化为固定窗口（旧语义）；装载后等待由阶梯推出。
+        requested = 0.0 if self.backoff is not None else self.retry_delay_sec
         # 一次登记同时带上「持续锁」与「延迟后检测点」两项语义
         # （不许分两次登记，否则会被当成"重触发"而互相抬高计数）
         lock = self._registry_register(
             key, KIND_DEFER, self.reviewer,
             scope=f"{scope}（先做其他，勿抢写）",
             persist=want_persistent, retry_delay_sec=requested,
-            increment=is_retrigger,
+            increment=is_retrigger, delay_step=step,
             reason=note or "评审遇到他人写租约：先做其他，并挂锁")
         if lock is None:      # 台账不可用时的最小降级（内存语义仍正确）
+            fallback = (self.backoff.delay_for(step) if self.backoff is not None
+                        else self.retry_delay_sec)
             return {"key": key, "kind": KIND_DEFER, "holder": self.reviewer,
                     "scope": scope,
-                    "retry_at": (now + requested if want_persistent
-                                 else now + self.retry_delay_sec),
+                    "retry_at": now + fallback,
+                    "retry_delay_sec": fallback,
+                    "step": step,
                     "persistent": want_persistent,
                     "retriggered": triggers}
         lock["persistent"] = bool(lock.get("persistent") or want_persistent)
         lock["retriggered"] = triggers
+        lock["step"] = step
         self._update_deferred(
             scope=scope, reason=note,
             persistent=bool(lock.get("persistent")),
             retriggered=triggers,
-            retry_after=float(lock.get("retry_at") or 0.0))
+            retry_after=float(lock.get("retry_at") or 0.0),
+            step=step)
         return lock
 
     def retry(
@@ -700,22 +748,32 @@ class ReviewArbiter:
             )
 
         if self._editing():
-            # 还在编辑：续期，绝不释放。重触发过的持续锁按 3 分钟宽限续期，
-            # 且 retry_at 只能更靠后（不把"等到对方处理完"缩短回 1 分钟）。
-            grant = (self.persistent_grace_sec
-                     if (lock is not None and lock.persistent)
-                     else self.retry_delay_sec)
+            # 还在编辑：续期，绝不释放。**等待档位沿阶梯上行**（Issue #14 追问）：
+            # 10s → 30s → 60s → 3min → 6min → 10min 到顶即停；到顶后**不再重挂**，
+            # 只做 heartbeat 续期把锁挂在原地等对方处理完（不遗留、也不重复空转）。
+            step = self._next_step(lock)
+            grant = (self.backoff.delay_for(step) if self.backoff is not None
+                     else (self.persistent_grace_sec
+                           if (lock is not None and lock.persistent)
+                           else self.retry_delay_sec))
             self.lock_registry.heartbeat(
                 self.defer_lock_key(), self.reviewer, extend_sec=grant)
             prev_retry = lock.retry_at if lock is not None else 0.0
             if prev_retry <= self._clock():
-                # 只重排**已过期**的检测点：本轮新窗口默认 = 在旧窗口上续 grant；
-                # 仍在未来的窗口绝不缩短（"持续到对方处理完"的承诺不可回退）。
-                self.lock_registry.register(
-                    self.defer_lock_key(), kind=KIND_DEFER, holder=self.reviewer,
-                    scope=(lock.scope if lock is not None else "状态卡正在被编辑"),
-                    reason="延迟后检测：对方仍在编辑 → 续期等待（锁不打开）",
-                    retry_delay_sec=grant)
+                if self.backoff is not None and self.backoff.is_top(step) \
+                        and (lock is not None and lock.retry_delay_sec >= self.backoff.top):
+                    # **到顶即停**：不把窗口继续往后推（否则"到顶"就成了无限等待），
+                    # 只保留心跳续期与 10 分钟检测窗；锁状态由台账/票据继续可见。
+                    pass
+                else:
+                    # 只重排**已过期**的检测点：本轮新窗口 = 阶梯下一档；
+                    # 仍在未来的窗口绝不缩短（"持续到对方处理完"的承诺不可回退）。
+                    self.lock_registry.register(
+                        self.defer_lock_key(), kind=KIND_DEFER, holder=self.reviewer,
+                        scope=(lock.scope if lock is not None
+                               else "状态卡正在被编辑"),
+                        reason="延迟后检测：对方仍在编辑 → 续期等待（锁不打开）",
+                        delay_step=step)
             new_lock = self.lock_registry.get(self.defer_lock_key())
             return ArbiterDecision(
                 action="retry", applied=False, conflict=False,
@@ -959,7 +1017,8 @@ class ReviewArbiter:
 
     def _update_deferred(self, scope: str = "", reason: str = "",
                          persistent: bool = False, retriggered: int = 0,
-                         retry_after: float = 0.0) -> ConflictCard:
+                         retry_after: float = 0.0,
+                         step: Optional[int] = None) -> ConflictCard:
         """把「延迟 + 挂锁」也登记成一张**冲突卡**（与人看的 `overview()` 对齐）。
 
         口径：冲突卡**至多一张**——延迟与真冲突都是"同一件待处理的事"，
@@ -973,12 +1032,13 @@ class ReviewArbiter:
             existing.retriggered = max(existing.retriggered, int(retriggered))
             existing.deferred_persistent = bool(existing.deferred_persistent
                                                 or persistent)
-            existing.retry_after = retry_after or (now + self.retry_delay_sec)
+            existing.retry_after = retry_after or (now + self._next_wait(step))
             existing.editing = True
+            wait_plan = self._wait_plan_text(step)
             existing.reason = reason or (
                 "先做其他，并挂锁：等对方处理完再检测"
                 + ("（持续锁，一直挂到对方处理完）" if existing.deferred_persistent
-                   else f"（延迟 {self.retry_delay_sec:.0f}s 后检测）"))
+                   else f"（{wait_plan}）"))
             existing.history.append({
                 "at": time.strftime("%Y-%m-%d %H:%M:%S"), "by": self.reviewer,
                 "action": "defer", "scope": scope, "reason": reason,
@@ -1005,10 +1065,10 @@ class ReviewArbiter:
             reason=reason or (
                 "先做其他，并挂锁：等对方处理完再检测"
                 + ("（持续锁，一直挂到对方处理完）" if persistent
-                   else f"（延迟 {self.retry_delay_sec:.0f}s 后检测）")),
+                   else f"（{self._wait_plan_text(step)}）")),
             detected_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             editing=True,
-            retry_after=retry_after or (now + self.retry_delay_sec),
+            retry_after=retry_after or (now + self._next_wait(step)),
             deferred=True,
             deferred_persistent=bool(persistent),
             retriggered=int(retriggered),
@@ -1020,6 +1080,19 @@ class ReviewArbiter:
         )
         self._atomic_write(self.conflict_path(), card.to_dict())
         return card
+
+    def _next_wait(self, step: Optional[int] = None) -> float:
+        """下一档等待时长（无阶梯 → 固定 ``retry_delay_sec`` 旧语义）。"""
+        if self.backoff is None:
+            return self.retry_delay_sec
+        return self.backoff.delay_for(0 if step is None else int(step))
+
+    def _wait_plan_text(self, step: Optional[int] = None) -> str:
+        """等待计划的人类可读说明（"下一档等多久 + 整条阶梯"）。"""
+        if self.backoff is None:
+            return f"延迟 {self.retry_delay_sec:.0f}s 后检测"
+        st = self.backoff.status(0 if step is None else int(step))
+        return f"阶梯第 {st.attempt + 1} 档：{st.label} 后检测（{self.backoff.human()}）"
 
     def deferred_status(self) -> Optional[dict]:
         """当前「先做其他，并挂锁」项的状态（无 → None）。"""
@@ -1039,6 +1112,7 @@ class ReviewArbiter:
             "lock_should_release": self.lock_registry.should_release(
                 self.defer_lock_key()),
             "editing": self._editing(),
+            "waiting": self.waiting_status(card.retriggered),
         }
 
     # ------------------------------------------------------------------
