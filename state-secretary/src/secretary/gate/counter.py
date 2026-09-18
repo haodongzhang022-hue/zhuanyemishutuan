@@ -7,15 +7,21 @@
 本模块把该口径做成**可执行守卫**——报表/留痕在任何时候都能调用
 :func:`assert_counter`，一旦出现「全量」措辞与本轮实跑数不符即拒绝。
 
-复评第 1 轮定点修复（🔴-3：守卫可绕过 → 绑定真实实跑数）：
+复评第 2 轮定点修复（🔴-1：守卫「语境盲区」清零）：
 
-1. **实跑数必须出现在文本中**——``assert_counter("本轮实跑 3 例", executed=59)``
-   必须失败（旧实现因"≤4 小数字旁路"而放行并返回 59）；
-2. 「全量」措辞 + 规模数 ≠ 实跑数 → 必须标出「已跑过/默认不重复」数，
-   否则拒绝（伪造「全量 308 项全部通过（296 例已跑过）」而实跑 12 → 拒绝）；
-3. 真全量（规模数 == 实跑数）放行——契约 15.6 的
-   「全量 pytest：341 passed + 3 skipped」按 ``executed=341`` 不再被误拒；
-4. 未声明计数一律拒绝（分项子计数 / 序号 / commit sha 除外）。
+旧实现只做**裸数字出现**判定（``_appears``），于是实跑数可被
+**序号 / 规模数 / 已跑过数**冒充，例如：
+
+- ``"复评第 6 轮：全量 359 项全部通过（308 例已跑过）"`` + ``executed=6``
+  → 6 只是「第 6 轮」序号，却曾被放行；
+- 同句 + ``executed=359`` → 359 是全量规模，走"真全量豁免"被放行；
+- 同句 + ``executed=308`` → 308 是「已跑过」数，被放行。
+
+现改为**绑定语境的实跑数匹配**（:func:`_appears_as_executed`）：
+``executed`` 必须命中**实跑数专属标记**（``本轮实跑 N`` / ``本轮跑 N`` /
+``实跑 N`` / ``executed: N`` / 规范式 ``跑 N 个测试``），且该命中不得
+紧后接规模 / 已跑过语境；「真全量豁免」也必须与实跑语境或 pytest
+结构化汇总证据（``N passed``）绑定后才生效。
 """
 from __future__ import annotations
 
@@ -52,6 +58,33 @@ _ORDINAL_RE = re.compile(r"第\s*(\d+)\s*(?:轮|次|版|步|条|点)")
 # 裸长数字（commit sha 等，无计数单位）——非计数（后随计数单位者仍算计数）。
 _COMMITISH_RE = re.compile(
     rf"(?<![\w,])\d{{7,}}(?![\w,])(?!(?:\s*)(?:{_COUNT_UNIT}))")
+
+# ----------------------------------------------------------------------
+# 🔴-1：实跑数**专属标记**（语境绑定）
+# ----------------------------------------------------------------------
+# 只有这些标记旁的数字才是「本轮真实实跑数」；序号 / 规模数 / 已跑过数
+# 即使数值相等也不得冒充。
+_CN_EXECUTED_MARKERS = ("本轮实跑", "本轮跑", "本次跑", "本次实跑",
+                        "本轮执行", "本轮实际跑", "实跑")
+_EN_EXECUTED_MARKERS = (r"executed", r"ran\s+now", r"run\s+now")
+
+# 「本轮实跑 N」：中文标记 + 数字（允许 "本轮实跑: 6 例" / "本轮实跑 6"）
+_EXECUTED_CN_RE = re.compile(
+    rf"(?:{'|'.join(_CN_EXECUTED_MARKERS)})\s*[：:]?\s*({_NUM_PATTERN})")
+# 「executed: N」/「executed N」
+_EXECUTED_EN_RE = re.compile(
+    rf"(?:{'|'.join(_EN_EXECUTED_MARKERS)})\s*[：:]?\s*({_NUM_PATTERN})",
+    re.IGNORECASE)
+# 规范渲染式「跑 N 个测试」（:func:`render_count` 的主语写法）
+_EXECUTED_CANON_RE = re.compile(
+    rf"跑\s*({_NUM_PATTERN})\s*(?:个|例|项|条)(?:测试|用例|case|tests?)?")
+
+# 命中实跑标记的数字若**紧后**接这些语境，说明它其实不是本轮实跑数：
+#   「本轮实跑 308 例已跑过」 → 该数字是已跑过数（自相矛盾写法）
+#   「本轮实跑 359 规模」     → 该数字是规模数
+_EXECUTED_NEG_SUFFIX_RE = re.compile(
+    rf"^\s*(?:{_COUNT_UNIT})?\s*(?:已跑过|此前已跑|默认不重复)"
+    rf"|^\s*(?:规模|全量)")
 
 
 class CounterWordingError(ValueError):
@@ -94,11 +127,60 @@ def render_count(executed: int, total_suite: int = 0,
 
 
 def _appears(text: str, value: int) -> bool:
-    """文本中是否出现该计数（支持千分位写法；须为独立数字）。"""
+    """文本中是否出现该数字（支持千分位；须为独立数字）。
+
+    仅用于**规模数 / 已跑过数**的松散存在性校验；实跑数请用
+    :func:`_appears_as_executed`（语境绑定）。
+    """
     for form in (str(value), f"{value:,}"):
         if re.search(rf"(?<![\d,]){re.escape(form)}(?![\d,])", text or ""):
             return True
     return False
+
+
+def _iter_executed_matches(text: str):
+    """产出文本中所有「实跑数专属标记 + 数字」的匹配（语境绑定）。"""
+    for regex in (_EXECUTED_CN_RE, _EXECUTED_EN_RE, _EXECUTED_CANON_RE):
+        for m in regex.finditer(text or ""):
+            yield m.group(1), m.start(1), m.end(1)
+
+
+def _appears_as_executed(text: str, value: int) -> bool:
+    """``value`` 是否以**实跑数语境**出现在文本中（🔴-1 核心守卫）。
+
+    判定要点（根治三条 CLI 反例）：
+
+    1. 必须命中「本轮实跑 N / 本轮跑 N / 实跑 N / executed: N / 跑 N 个测试」
+       这类**实跑专属标记**；裸数字一律不算——序号「第 6 轮」、规模数
+       「全量 359」、已跑过数「308 例已跑过」均不得冒充实跑数；
+    2. 命中数字的**紧后**上下文不得是规模 / 已跑过语境
+       （如「本轮实跑 308 例已跑过」这类自相矛盾写法）→ 拒绝；
+    3. 跨句指代（「本轮实跑见第 6 轮」）因标记后无数字而**天然不命中**。
+
+    这三点合起来即「绑定语境的实跑数匹配」，替代旧实现的裸数字出现判定。
+    """
+    text = text or ""
+    target = str(value).replace(",", "")
+    for raw, _start, end in _iter_executed_matches(text):
+        if raw.replace(",", "") != target:
+            continue
+        if _EXECUTED_NEG_SUFFIX_RE.match(text[end:end + 12]):
+            continue
+        return True
+    return False
+
+
+def _has_pytest_summary_for(text: str, value: int) -> bool:
+    """文本是否含该数的 **pytest 结构化汇总**证据（如 ``341 passed``）。
+
+    真全量豁免须有真实执行证据：裸写「全量 N 项全部通过」不构成证据
+    （无 ``N passed``），故不得借此把规模数冒充实跑数。
+    """
+    pattern = re.compile(
+        rf"(?<![\d,]){value}(?![\d,])\s+"
+        r"(?:passed|failed|errors?|skipped|xfailed|xpassed)",
+        re.IGNORECASE)
+    return bool(pattern.search(text or ""))
 
 
 def _strip_non_counts(text: str) -> str:
@@ -129,13 +211,15 @@ def assert_counter(text: str, executed: int, total_suite: int = 0,
                    remaining: Optional[int] = None) -> int:
     """校验一段留痕文字的计数口径，返回本轮实跑数。
 
-    规则（复评第 1 轮加固，🔴-3）：
+    规则（复评第 2 轮加固，🔴-1）：
 
-    1. **实跑数须出现**：``executed`` 必须以独立数字形式出现在 ``text`` 中，
-       否则拒绝——守卫不得对"未绑定真实实跑数"的文字放行；
+    1. **实跑数须以实跑语境出现**：``executed`` 必须命中「本轮实跑 N /
+       实跑 N / executed: N / 跑 N 个测试」这类专属标记，**不得**由序号
+       （第 N 轮）、规模数（全量 N）、已跑过数（N 例已跑过）冒充；
     2. **「全量」措辞**：出现「全量/全部通过/全绿」等措辞时——
        - 规模数 ≠ 实跑数 → 必须标出「已跑过/默认不重复」数，否则拒绝；
-       - 规模数 == 实跑数（真全量）→ 放行（实跑数已出现，无歧义）；
+       - 规模数 == 实跑数（真全量）→ **须与实跑语境或 pytest 汇总证据
+         绑定**才放行；
        - 未声明规模 → 须有规模标记（已跑过/默认不重复/规模），否则拒绝；
     3. **未声明计数**：文本中的计数须落在合法集合
        {executed, planned, total_suite, deferred, redundant, remaining} 内；
@@ -159,10 +243,15 @@ def assert_counter(text: str, executed: int, total_suite: int = 0,
     if not isinstance(text, str):
         raise CounterWordingError(f"计数文本须为字符串，实际 {type(text)!r}")
 
-    if not _appears(text, executed):
+    # 实跑数须有**语境绑定证据**：实跑专属标记，或 pytest 结构化汇总
+    # （``N passed`` = 真实执行产物，非裸措辞）。
+    if not (_appears_as_executed(text, executed)
+            or _has_pytest_summary_for(text, executed)):
         raise CounterWordingError(
-            f"文本未出现本轮实跑数 {executed} → 无法核对「跑多少写多少」，"
-            "拒绝对未绑定真实实跑数的文字落账。合法写法："
+            f"文本未以**实跑语境**出现本轮实跑数 {executed} → 无法核对"
+            "「跑多少写多少」，拒绝对未绑定真实实跑数的文字落账"
+            "（序号 / 规模数 / 已跑过数不得冒充实跑数；pytest 汇总行 "
+            "`N passed` 亦可作为证据）。合法写法："
             f"{render_count(executed, total_suite, deferred)}")
 
     lowered = (text or "").lower()
@@ -178,7 +267,16 @@ def assert_counter(text: str, executed: int, total_suite: int = 0,
                     "本轮实跑数。请改写为："
                     f"{render_count(executed, total_suite, deferred)}")
         elif total_suite and total_suite == executed:
-            pass  # 真全量：规模 == 实跑，无歧义（实跑数已出现，不会误读）
+            # 真全量：规模 == 实跑。**须与实跑语境 / pytest 汇总证据绑定**
+            # 才放行（🔴-1：旧实现仅凭"裸数字出现"即走本豁免，被规模数
+            # 「全量 359 项」冒充）。
+            if not (_appears_as_executed(text, executed)
+                    or _has_pytest_summary_for(text, executed)):
+                raise CounterWordingError(
+                    f"声明真全量（规模 == 实跑 {executed}）但既无实跑语境"
+                    "『本轮实跑 N』也无 pytest 汇总证据（如 `N passed`）→ "
+                    "无法确认本轮真的跑了全量。请改写为："
+                    f"{render_count(executed, total_suite)}")
         elif not _SCALE_MARKER.search(text):
             raise CounterWordingError(
                 "使用「全量/全部通过」等措辞却未标记『已跑过/默认不重复』→ "

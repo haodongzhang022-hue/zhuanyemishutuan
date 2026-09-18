@@ -11,11 +11,22 @@
 5. **过程可视化**。
 
 本文件用例均为**判别性**（反向对照 + 危险模式下必须失败），并以真实仓库
-历史（``a455608`` / ``798e80d`` / ``0ed083d`` 等）做跨版复核。
+历史（``a455608`` / ``e3195ea`` / ``d6abaab`` 等）做跨版复核。
+
+🟡6（复评第 2 轮）：原 docstring 仍列 ``798e80d / 0ed083d`` 为"跨版复核"修订，
+与 🟡10 的修复矛盾（这两修订在本仓库不存在 → git cat-file 失败 → 永久 skip）。
+此处同步为 ``LEGACY_BASE / LEGACY_BIG / LEGACY_MID`` 三个**真实存在**的修订。
 
 门禁不变量（贯穿全文件）：
 
     **计划跑测数 == 报告实跑数**，且**任何"全量"表述都必须同时给出「已跑过」数**。
+
+复评第 2 轮定点修复覆盖：
+
+- 🔴-1 计数守卫**语境绑定**（序号 / 规模数 / 已跑过数不得冒充实跑数）；
+- 🔴-2 回退分支**不得用计划数冒充实跑数**（无计数证据 → 拒绝报绿/落账）；
+- 🔴-3 不变量 1 显式守卫 + 全量规模取**实测收集数**（并集去重）；
+- 🟡1–🟡7 逐项处置（见各类 docstring）。
 """
 from __future__ import annotations
 
@@ -799,8 +810,9 @@ class TestG10EndToEndDiscriminative:
     def test_g10_assert_report_binds_real_executed(self):
         """🔴-3：``assert_report`` 须绑定**真实实跑数**（非计划数）。
 
-        判别方式：计划 2 例但只解析到 1 例真实执行结果时，传给守卫的
-        ``executed`` 必须是 1（真实），而不是 2（计划）。
+        判别方式：计划 2 例但只解析到 1 例真实执行结果 → 守卫须以
+        **计划 ≠ 实跑** 拒绝（不变量 1），且传给计数守卫的 ``executed``
+        必须是 1（真实），而不是 2（计划）。
         """
         import secretary.gate.incremental as inc
         sbx = _sandbox_repo()
@@ -813,6 +825,7 @@ class TestG10EndToEndDiscriminative:
         report.executed = ["state-secretary/tests/test_base.py::test_ok"]
         report.counts = {"passed": 1}
         report.counts_verified = True
+        report.counts_source = "junitxml"
         report.exit_code = 0
         captured = {}
         real = inc.assert_counter
@@ -823,16 +836,298 @@ class TestG10EndToEndDiscriminative:
 
         inc.assert_counter = spy
         try:
-            try:
+            # 🔴-3：计划 2 / 实跑 1 → 不变量 1 直接拒绝（GateError）
+            with pytest.raises(Exception) as ei:
                 sbx.gate.assert_report(report)
-            except CounterWordingError:
-                pass   # 计划 2 / 实跑 1 的不一致由守卫正常拒绝
+            assert "计划 2 例 ≠ 实跑 1 例" in str(ei.value), str(ei.value)
         finally:
             inc.assert_counter = real
-        assert captured["executed"] == 1, (
-            f"守卫须绑定真实实跑数 1，实测绑定 {captured['executed']}（=计划数？）")
         # 文本未含真实实跑数 → 拒绝（🔴-3 绕过路径）
         with pytest.raises(CounterWordingError):
             assert_counter("本轮实跑 7 例", executed=1)
         # 反向：真全量文字（规模 == 实跑）不得被误拒
         assert assert_counter("全量 pytest：1 passed", 1, total_suite=1) == 1
+        # 反向：计划 == 实跑 时，守卫须绑定真实实跑数（非计划数）
+        plan2 = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report2 = SweepReport(plan2)
+        report2.executed = ["state-secretary/tests/test_base.py::test_ok"]
+        report2.counts = {"passed": 1}
+        report2.counts_verified = True
+        report2.counts_source = "junitxml"
+        report2.exit_code = 0
+        inc.assert_counter = spy
+        try:
+            assert sbx.gate.assert_report(report2) == 1
+        finally:
+            inc.assert_counter = real
+        assert captured["executed"] == 1, (
+            f"守卫须绑定真实实跑数 1，实测绑定 {captured['executed']}（=计划数？）")
+
+
+# ======================================================================
+# G11 复评第 2 轮定点修复判别性回归（🔴-1 / 🔴-2 / 🔴-3）
+# ======================================================================
+
+class TestG11Round2PointFixes:
+    """复评第 2 轮：三条 CLI 反例 + 回退分支 + 不变量 1 + 规模并集。"""
+
+    # ---- 🔴-1：计数守卫语境绑定（序号/规模/已跑过数不得冒充实跑数）----
+
+    FORGED_TEXT = "复评第 6 轮：全量 359 项全部通过（308 例已跑过）"
+
+    @pytest.mark.parametrize("executed", [6, 359, 308])
+    def test_g11_forged_executed_numbers_rejected(self, executed):
+        """**判别性（🔴-1）**：序号 6 / 规模 359 / 已跑过 308 均不得放行。"""
+        with pytest.raises(CounterWordingError):
+            assert_counter(self.FORGED_TEXT, executed, total_suite=359,
+                           deferred=308)
+
+    def test_g11_cross_sentence_reference_rejected(self):
+        """**判别性（🔴-1 跨句指代）**：「本轮实跑见第 6 轮」→ 拒绝。"""
+        with pytest.raises(CounterWordingError):
+            assert_counter("本轮实跑见第 6 轮", 6)
+
+    def test_g11_bare_full_wording_true_full_rejected(self):
+        """**判别性（🔴-1）**：「全量 359 项全部通过」+ executed=359 → 拒绝。
+
+        旧实现把"规模数 == 实跑数"当"真全量"豁免，于是最典型的误读
+        「本轮跑了全量」被直接放行。现须有实跑语境或 pytest 汇总证据。
+        """
+        with pytest.raises(CounterWordingError):
+            assert_counter("全量 359 项全部通过", 359, total_suite=359,
+                           deferred=308)
+
+    def test_g11_pytest_summary_is_valid_evidence(self):
+        """真全量的**合法**证据：pytest 汇总行（``341 passed``）放行。"""
+        assert assert_counter("全量 pytest：341 passed + 3 skipped", 341,
+                              total_suite=341) == 341
+
+    def test_g11_context_bound_wording_accepted(self):
+        """合法写法（实跑语境）须放行，返回本轮实跑数。"""
+        text = render_count(59, total_suite=743, deferred=684)
+        assert assert_counter(text, 59, total_suite=743, deferred=684) == 59
+
+    # ---- 🔴-2：回退分支不得用计划数冒充实跑数 ----
+
+    def test_g11_fallback_must_not_use_plan_as_executed(self):
+        """**判别性（🔴-2）**：无 junitxml 且无 stdout 计数 → 不得用计划数。"""
+        gate = _gate()
+        plan = SweepPlan(base="x")
+        plan.targets = [SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_a",
+                                    kind=INCREMENT_ADDED, path=NEW_TEST_FILE,
+                                    name="test_a")]
+        report = SweepReport(plan)
+        report.exit_code = 0
+        report.summary_line = ""          # 无汇总行计数
+
+        class _Out:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+
+        gate._fill_results(report, "/nonexistent.xml", _Out())
+        assert report.executed_count == 0, (
+            f"无计数证据时不得用计划数冒充实跑数，实测 {report.executed_count}")
+        assert report.counts_source == "none"
+        assert report.green is False, "计数未核实却报绿 = 假绿"
+        with pytest.raises(Exception) as ei:
+            gate.assert_report(report)
+        assert "未核实" in str(ei.value) or "拒绝" in str(ei.value)
+
+    def test_g11_stdout_summary_fallback_is_reliable(self):
+        """有 pytest 汇总行（真实执行产物）→ 可落账（counts_source=stdout）。"""
+        gate = _gate()
+        plan = SweepPlan(base="x")
+        plan.targets = [SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_a",
+                                    kind=INCREMENT_ADDED, path=NEW_TEST_FILE,
+                                    name="test_a")]
+        report = SweepReport(plan)
+        report.exit_code = 0
+        report.summary_line = "1 passed in 0.1s"
+
+        class _Out:
+            stdout = "1 passed in 0.1s\n"
+            stderr = ""
+            returncode = 0
+
+        gate._fill_results(report, "/nonexistent.xml", _Out())
+        assert report.counts_source == "stdout"
+        assert report.executed_count == 1
+        assert report.degraded_reason, "🟡4：降级原因须留痕"
+
+    def test_g11_custom_runner_zero_exec_not_green(self):
+        """**判别性（🔴-2）**：``pytest_cmd=[自定义 runner]``（公开 API）→
+        真实执行 0 例时不得报绿 / 不得落账。"""
+        import shutil
+        runner = shutil.which("true") or "/bin/true"
+        sbx = _sandbox_repo()
+        gate = IncrementalGate(repo_root=sbx.root, pytest_cmd=[runner])
+        plan = _plan_for(
+            gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = gate.run(plan)
+        assert report.executed_count == 0
+        assert report.green is False, "真实执行 0 例却报绿 = 假绿（🔴-2）"
+
+    # ---- 🔴-3：不变量 1 + 全量规模并集 ----
+
+    def test_g11_invariant1_plan_equals_executed_rejects_file_level(self):
+        """**判别性（🔴-3 不变量 1）**：文件级标的 1 个 → 实跑该文件全部 3 例
+        → ``计划 1 / 实跑 3`` 须被拒绝。"""
+        sbx = _sandbox_repo(skipped=True)   # test_ok + test_skip = 2 例
+        plan = SweepPlan(base="HEAD")
+        plan.targets.append(SweepTarget(
+            nodeid="state-secretary/tests/test_base.py",
+            kind=INCREMENT_DISSOLVED,
+            path="state-secretary/tests/test_base.py"))
+        # run() 须 **fail-fast**（不变量 1 守卫在 run 内即拒绝）
+        with pytest.raises(Exception) as ei:
+            sbx.gate.run(plan)
+        assert "计划" in str(ei.value) and "实跑" in str(ei.value)
+
+    def test_g11_suite_total_is_union_not_sum(self):
+        """**判别性（🔴-3 规模口径）**：``excluded`` 与 ``deferred`` 重叠时
+        全量规模须取**并集**，不得重复计数。"""
+        plan = SweepPlan(base="x")
+        dup = f"{NEW_TEST_FILE}::test_dup"
+        plan.targets = [SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_a",
+                                    kind=INCREMENT_ADDED, path=NEW_TEST_FILE,
+                                    name="test_a")]
+        # 同一 nodeid 同时出现在 deferred 与 excluded（旧实现重复计数）
+        plan.deferred = [SweepTarget(nodeid=dup, kind=INCREMENT_LEGACY,
+                                     path=NEW_TEST_FILE, name="test_dup")]
+        plan.excluded = [SweepTarget(nodeid=dup, kind=INCREMENT_DISSOLVED,
+                                     path=NEW_TEST_FILE, name="test_dup",
+                                     risk="count-sync")]
+        assert plan.skipped_unique_count == 1, "并集须去重"
+        assert plan.suite_total_count == 2, (
+            f"规模 = 计划 1 + 并集 1 = 2，实测 {plan.suite_total_count}")
+        report = SweepReport(plan)
+        report.executed = [f"{NEW_TEST_FILE}::test_a"]
+        report.counts = {"passed": 1}
+        report.counts_source = "junitxml"
+        assert report.counter_claim.total_suite == 2
+
+    def test_g11_plan_deferred_excludes_excluded(self):
+        """**判别性（🔴-3）**：计划生成时 ``deferred`` 须剔除 ``excluded``。"""
+        _rev_or_skip(LEGACY_BASE)
+        gate = _gate()
+        plan = gate.plan_sweep(base=LEGACY_BASE, include_redundant=True)
+        deferred_ids = {t.nodeid for t in plan.deferred}
+        excluded_ids = {t.nodeid for t in plan.excluded}
+        assert not (deferred_ids & excluded_ids), (
+            f"deferred 与 excluded 重叠 {sorted(deferred_ids & excluded_ids)} "
+            "→ 全量规模会重复计数")
+
+    # ---- 🟡1：单一语义源（未知标签不得分歧）----
+
+    def test_g11_redundant_semantics_single_source(self):
+        """🟡1：``SweepTarget.is_redundant`` 与 ``SweepRules.is_redundant``
+        对未知标签须一致（不得 True/False 分歧）。"""
+        rules = SweepRules()
+        for risk in ("", "dissolve", "count-sync", "cosmetic", "doc-append",
+                     "some-unknown-label"):
+            t = SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_x",
+                            kind=INCREMENT_DISSOLVED, path=NEW_TEST_FILE,
+                            name="test_x", risk=risk)
+            assert t.is_redundant == rules.is_redundant(t), (
+                f"risk={risk!r} 判定分歧: target={t.is_redundant} "
+                f"rules={rules.is_redundant(t)}")
+        # 未知标签 → 两边都不得判为冗余（否则会被静默跳过）
+        unknown = SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_y",
+                              kind=INCREMENT_DISSOLVED, path=NEW_TEST_FILE,
+                              name="test_y", risk="some-unknown-label")
+        assert unknown.is_redundant is False
+        assert rules.is_redundant(unknown) is False
+
+    # ---- 🟡2：整文件重写判定接线 ----
+
+    def test_g11_whole_file_rewrite_is_wired(self):
+        """🟡2：``is_whole_file_rewrite`` 须在门禁路径上生效。
+
+        构造改动比例 ≥ 阈值（或高风险关键词）的既有测试文件 → 计划须把
+        **全部改动用例**升级为消解（补入整文件消解）。
+        """
+        rules = SweepRules(dissolve_ratio=0.01)
+        item = {"path": NEW_TEST_FILE, "is_new": False,
+                "changed_lines": 10, "total_lines": 100,
+                "added_tests": [], "changed_tests": ["test_one"]}
+        assert rules.is_whole_file_rewrite(item) is True
+        added, to_dissolve = rules.rewrite_names(
+            item, [], ["test_one"])
+        assert to_dissolve == ["test_one"]
+        # 低改动比例 + 无高风险关键词 → 不触发
+        low = {"path": "state-secretary/tests/test_plain.py", "is_new": False,
+               "changed_lines": 1, "total_lines": 1000}
+        assert rules.is_whole_file_rewrite(low) is False
+
+    # ---- 🔴-1 端到端：CLI 反例必须 rc=1 ----
+
+    def _cli(self, *args):
+        return subprocess.run(
+            [sys.executable,
+             os.path.join(REPO_ROOT, "state-secretary", "poc",
+                          "incremental_gate.py"), "counter", *args],
+            cwd=REPO_ROOT, capture_output=True, text=True)
+
+    def test_g11_cli_forged_numbers_all_rejected(self):
+        """**判别性（🔴-1 CLI 端到端）**：三条反例 CLI 必须 rc=1。
+
+        反例（旧实现全 rc=0 假绿）：
+        ``复评第 6 轮：全量 359 项全部通过（308 例已跑过）`` 分别以
+        6（序号）/ 359（规模）/ 308（已跑过）作为 ``--executed``。
+        """
+        text = self.FORGED_TEXT
+        for executed in ("6", "359", "308"):
+            r = self._cli("--text", text, "--executed", executed,
+                          "--total", "359", "--deferred", "308")
+            assert r.returncode == 1, (
+                f"executed={executed} 应 rc=1（语境盲区），实测 rc="
+                f"{r.returncode}；stdout={r.stdout!r}")
+            assert "实跑语境" in (r.stdout + r.stderr)
+
+    def test_g11_cli_legit_wording_accepted(self):
+        """**反向对照**：合法写法 CLI 须 rc=0（守卫不得过度收紧）。"""
+        r = self._cli("--text", "本轮实跑 69 例（计划 69）", "--executed", "69")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert "本轮实跑 69 例" in r.stdout
+
+    def test_g11_cli_true_full_run_accepted(self):
+        """**反向对照**：真全量（pytest 汇总证据）CLI 须 rc=0。"""
+        r = self._cli("--text", "全量 pytest：341 passed + 3 skipped",
+                      "--executed", "341", "--total", "341")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+
+    # ---- 🟡3 / 🟡5：接线与留痕一致性 ----
+
+    def test_g11_src_pythonpath_is_wired(self):
+        """🟡3：``src_pythonpath`` 须接线到 pytest（不得是未引用形参）。"""
+        sbx = _sandbox_repo()
+        gate = IncrementalGate(repo_root=sbx.root,
+                               src_pythonpath="src")
+        plan = _plan_for(
+            gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = gate.run(plan)
+        assert "pythonpath=src" in report.command, report.command
+
+    def test_g11_command_includes_junitxml(self):
+        """🟡5：留痕命令须与实际执行一致（含 ``--junitxml=``）。"""
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert "--junitxml=" in report.command, report.command
+
+    def test_g11_no_extra_undeclared_number_in_render(self):
+        """🟡5 邻接：报告渲染不得出现未声明的第 4 个计数（如"合计"）。"""
+        sbx = _sandbox_repo()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        # 守卫自身须能通过（否则报告文字与计数主张不一致）
+        assert sbx.gate.assert_report(report) == 1

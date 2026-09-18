@@ -45,14 +45,17 @@ def cmd_plan(args) -> int:
 
 
 def cmd_full(args) -> int:
+    """全量告警视图。
+
+    🔴-3③：未显式给 ``--executed`` 时**不得**把计划集合写成"本轮实跑"
+    （计划只是"要跑"，不是"已跑"）。此时 ``executed_now`` 为空 → 视图
+    显式提示"本轮实跑未提供"，绝不冒充。
+    """
     gate = IncrementalGate(repo_root=args.repo)
     if args.executed:
         executed = [x for x in args.executed.split(",") if x]
     else:
-        # 未显式给实跑集合时，以本轮计划（= 真实要跑的集合）为实跑口径，
-        # 避免把「已跑过」误算成本轮实跑。
-        executed = [t.nodeid for t in
-                    gate.plan_sweep(base=args.base, head=args.head).targets]
+        executed = []   # 未提供 → 不冒充（旧实现用 plan.targets 冒充实跑）
     view = gate.full_sweep_view(base=args.base, head=args.head,
                                 executed_now=executed)
     if args.json:

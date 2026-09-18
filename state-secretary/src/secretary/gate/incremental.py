@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .counter import assert_counter
@@ -48,8 +49,13 @@ class GateError(RuntimeError):
     """门禁执行错误（仓库/路径/pytest 不可用等）。"""
 
 
-_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(")
-_CLASS_RE = re.compile(r"^\s*class\s+([A-Za-z0-9_]+)\s*[:(]")
+# 顶层用例（缩进 0）与类内方法（缩进 4）：pytest 只收集这两层。
+# 嵌套函数（缩进 ≥ 8，如测试内部 helper）**不是**用例，若被误收会产生
+# 不存在的 nodeid → pytest rc=4（🔴-3 实测暴露）。
+_DEF_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(")
+_CLASS_RE = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z0-9_]+)\s*[:(]")
+_TOP_INDENT = ("", "    ")   # 顶层 / 类内一层
 _NODEID_RE = re.compile(
     r"^(?P<path>[^:]+\.py)(?:::?(?P<rest>.*))?$")
 
@@ -111,6 +117,8 @@ class IncrementalGate:
         if not _is_git_repo(self.repo_root):
             raise GateError(f"不是 git 仓库（缺 .git）: {self.repo_root}")
         self.test_root = test_root.replace("\\", "/").strip("/")
+        # 🟡3：形参真正接线——以 pytest 的 `pythonpath` ini 选项注入
+        # （不再"赋值后无任何引用"）。
         self.src_pythonpath = src_pythonpath
         self.rules = rules or DEFAULT_RULES
         self._pytest = list(pytest_cmd or [sys.executable, "-m", "pytest"])
@@ -153,12 +161,14 @@ class IncrementalGate:
                     "path": path,
                     "is_new": not self._tracked_in_base(base, path),
                     "changed_lines": int(add) if add.isdigit() else 0,
+                    "total_lines": self._total_lines(path),
                 }
             for path in untracked.stdout.splitlines():
                 path = path.strip()
                 if path:
                     entries[path] = {"path": path, "is_new": True,
-                                     "changed_lines": 0}
+                                     "changed_lines": 0,
+                                     "total_lines": self._total_lines(path)}
             return list(entries.values())
 
         out = _run(["git", "diff", "--numstat", base, head], self.repo_root)
@@ -175,8 +185,18 @@ class IncrementalGate:
                 "path": path,
                 "is_new": path in new_paths,
                 "changed_lines": int(add) if add.isdigit() else 0,
+                "total_lines": self._total_lines(path),
             }
         return list(entries.values())
+
+    def _total_lines(self, path: str) -> int:
+        """工作区该文件总行数（🟡2：整文件重写比例判定的分母）。"""
+        full = os.path.join(self.repo_root, path)
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                return sum(1 for _ in f)
+        except OSError:
+            return 0
 
     def _tracked_in_base(self, base: str, path: str) -> bool:
         out = _run(["git", "cat-file", "-e", f"{base}:{path}"], self.repo_root)
@@ -277,11 +297,15 @@ class IncrementalGate:
         for line in (source_text or "").splitlines():
             mc = _CLASS_RE.match(line)
             if mc:
-                cls = mc.group(1)
+                # 仅**顶层类**（缩进 0）切换当前类；方法内嵌套类（如测试内
+                # 部的 `class _Out`）须被忽略，不得重置当前类上下文
+                # （否则其后的类内用例会退化为顶层 nodeid → rc=4）。
+                if mc.group("indent") == "":
+                    cls = mc.group(2)
                 continue
             md = _DEF_RE.match(line)
-            if md:
-                name = md.group(1)
+            if md and md.group("indent") in _TOP_INDENT:
+                name = md.group(2)
                 out.append(f"{cls}::{name}" if cls else name)
         return out
 
@@ -343,14 +367,16 @@ class IncrementalGate:
         for line in (source or "").splitlines():
             mc = _CLASS_RE.match(line)
             if mc:
-                flush()
-                cur_name, buf = None, []
-                cls = mc.group(1)
+                # 嵌套类忽略（不重置 cls）；仅顶层类切换类上下文
+                if mc.group("indent") == "":
+                    flush()
+                    cur_name, buf = None, []
+                    cls = mc.group(2)
                 continue
             md = _DEF_RE.match(line)
-            if md:
+            if md and md.group("indent") in _TOP_INDENT:
                 flush()
-                cur_name, buf = md.group(1), [line]
+                cur_name, buf = md.group(2), [line]
                 continue
             if cur_name is not None:
                 buf.append(line)
@@ -378,6 +404,12 @@ class IncrementalGate:
         # 再把 diff 元数据（is_new / changed_lines）贴回。
         by_path = {c["path"]: c for c in changed}
         test_changes = [by_path[p] for p in changed_test_files(changed)]
+
+        # 🔴-3：实测全量规模（``collect(head)`` 真实收集数）——规模口径的
+        # 权威来源，避免并集口径把陈旧基线 nodeid 计入（规模虚高）。
+        # 注：须在 ``changed_files`` **之后**采集——pytest 会写 ``__pycache__``，
+        # 提前采集会把它当成未跟踪新增文件。
+        plan.measured_suite_total = len(self.collect(head))
 
         # 采集当前用例全集（限定到变更文件，避免全树采集开销）
         scope = [self._pytest_rel(c["path"]) for c in test_changes]
@@ -409,6 +441,18 @@ class IncrementalGate:
                 n for n in now_defs
                 if n in set(old_defs) and n in new_fp
                 and old_fp.get(n) != new_fp.get(n)]
+            # 🟡2 接线：整文件重写（改动比例 ≥ dissolve_ratio / 高风险关键词）
+            # → 除新增外**全部用例**升级为消解（宁多跑，不漏跑）。此前
+            # `is_whole_file_rewrite` 不在门禁路径上（仅测试调用）→ 判定不生效。
+            if self.rules.is_whole_file_rewrite(change):
+                extra = [n for n in now_defs
+                         if n not in set(added) and n not in set(changed_names)]
+                if extra:
+                    changed_names = changed_names + extra
+                    plan.note.append(
+                        f"{rel}: 整文件重写（改动比例 ≥ "
+                        f"{self.rules.dissolve_ratio} 或高风险关键词）→ "
+                        f"全文件消解（补入 {len(extra)} 例）")
             for name in added:
                 for nodeid in self._expand_nodeids(head, rel, [name]):
                     targets.append(SweepTarget(
@@ -442,10 +486,13 @@ class IncrementalGate:
             else:
                 plan.excluded.append(t)
 
-        # 已跑过（基线全集 - 计划内集合）= 默认不重复项
+        # 已跑过（基线全集 - 计划内集合 - 冗余剔除集合）= 默认不重复项
+        # 🔴-3：**必须剔除 excluded**，否则同一用例会同时落在 deferred 与
+        # excluded → 全量规模重复计数（实测 362 vs 真实 361）。
         planned_ids = {t.nodeid for t in plan.targets}
+        excluded_ids = {t.nodeid for t in plan.excluded}
         for nodeid in baseline:
-            if nodeid in planned_ids:
+            if nodeid in planned_ids or nodeid in excluded_ids:
                 continue
             plan.deferred.append(SweepTarget(
                 nodeid=nodeid, kind=INCREMENT_LEGACY, path=nodeid.split("::")[0],
@@ -575,6 +622,8 @@ class IncrementalGate:
             # 无增量 → 计划 0 例：不跑、不报绿歧义（rc=0，实跑 0）
             report.exit_code = 0
             report.summary_line = "无增量 → 本轮 0 例（不跑）"
+            # 空计划无计数需求 → counts_source="empty"（视为已核实，可落账）
+            report.counts_source = "empty"
             return report
 
         selectors, files = self._runnable(plan)
@@ -586,14 +635,19 @@ class IncrementalGate:
 
         pkg = os.path.join(self.repo_root, "state-secretary")
         cmd = self._pytest + ["-q", "-p", "no:cacheprovider"]
+        # 🟡3：src_pythonpath 接线为 pytest `pythonpath` ini（子进程 cwd 为
+        # state-secretary/，此处传相对路径即可）。
+        if self.src_pythonpath:
+            cmd += ["-o", f"pythonpath={self.src_pythonpath}"]
         cmd += list(extra_args)
         cmd += selectors + files
-        report.command = " ".join(cmd)
 
         import tempfile
         fd, xml_path = tempfile.mkstemp(prefix="gate-junit-", suffix=".xml")
         os.close(fd)
         cmd += [f"--junitxml={xml_path}"]
+        # 🟡5：留痕命令须与**实际执行**一致 → 在拼接 `--junitxml=` 之后生成。
+        report.command = " ".join(cmd)
         start = time.time()
         out = _run(cmd, pkg, timeout=timeout)
         report.duration_sec = time.time() - start
@@ -633,16 +687,34 @@ class IncrementalGate:
 
     def _fill_results(self, report: SweepReport, xml_path: str,
                       out: subprocess.CompletedProcess) -> None:
-        """用 pytest 真实执行结果填充报告（🔴-1：不再构造式赋值）。"""
+        """用 pytest 真实执行结果填充报告。
+
+        🔴-2 定点修复（回退分支不得用计划数冒充实跑数）：
+
+        - **junitxml 可用** → 结构化计数（``counts_source="junitxml"``，
+          最权威，可复核）；
+        - **junitxml 不可用但汇总行有计数** → 汇总行计数
+          （``counts_source="stdout"``，真实执行产物，可落账）；
+        - **两者皆无** → ``counts_source="none"``，``executed`` 保持已解析到
+          的真实结果（通常 0），**绝不**用 ``plan.targets`` 填充；
+          该报告 ``green=False`` 且 ``assert_report`` 一律抛错（拒绝落账）。
+        """
         counts: Optional[Dict[str, int]] = None
+        if not os.path.isfile(xml_path):
+            report.degraded_reason = (
+                "无 junitxml 产物（runner 未产出 / 被替换）→ 回退 pytest 汇总行计数")
         if os.path.isfile(xml_path):
             try:
                 counts, nodeids = self._parse_junit(xml_path)
-            except Exception:  # pragma: no cover - XML 损坏时回退汇总行
+            except (ET.ParseError, OSError) as exc:
+                # 🟡4：收窄异常范围（原 `except Exception` 吞掉全部解析异常），
+                # 并**记录降级原因**（否则回退路径静默）。
                 counts, nodeids = None, None
+                report.degraded_reason = (
+                    f"junitxml 解析失败（{type(exc).__name__}: {exc}）→ "
+                    "回退 pytest 汇总行计数")
             else:
-                for nodeid in nodeids:
-                    kind = nodeids[nodeid] if isinstance(nodeids, dict) else None
+                for nodeid, kind in nodeids.items():
                     report.executed.append(nodeid)
                     if kind == "passed":
                         report.passed.append(nodeid)
@@ -653,9 +725,10 @@ class IncrementalGate:
                     elif kind == "skipped":
                         report.skipped.append(nodeid)
                 report.counts_verified = True
+                report.counts_source = "junitxml"
 
         if counts is None:
-            # 回退：汇总行计数 + FAILED/ERROR 行
+            # 回退：汇总行计数 + FAILED/ERROR 行（**真实执行产物**）
             counts = self._parse_summary(report.summary_line)
             for line in (out.stdout or "").splitlines():
                 t = line.strip()
@@ -664,11 +737,18 @@ class IncrementalGate:
                      else report.errors).append(t.split(" ", 1)[-1])
             report.executed = (list(report.passed) + list(report.failed)
                                + list(report.errors) + list(report.skipped))
-            if not report.executed:
-                # 无结构化结果：以 selectors 计划面为上限，但计数标注为未核实
-                report.executed = [t.nodeid for t in report.plan.targets]
-                report.passed = []
-            report.counts_verified = False
+            if counts:
+                report.counts_verified = False
+                report.counts_source = "stdout"
+            else:
+                # 🔴-2：无结构化结果且**无 stdout 计数** → 不得用计划数冒充。
+                # executed 保持已解析到的真实 nodeid（通常 0），计数标为未核实，
+                # green 自动为 False，assert_report 拒绝落账。
+                report.counts_verified = False
+                report.counts_source = "none"
+                report.degraded_reason = report.degraded_reason or (
+                    "无 junitxml 且 pytest 汇总行无计数 → 本轮实跑数不可核实"
+                    "（拒绝报绿 / 拒绝落账）")
             report.counts = dict(counts)
             report.suite_total = sum(counts.values())
             return
@@ -682,8 +762,6 @@ class IncrementalGate:
         nodeid 重建口径：``classname`` 的点分路径还原为 ``tests/x.py::Cls``，
         再拼接 ``name``（含参数化 ``[..]``），最后 ``_relativize`` 到仓库相对。
         """
-        import xml.etree.ElementTree as ET
-
         counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
         nodeids: Dict[str, str] = {}
         tree = ET.parse(xml_path)
@@ -717,13 +795,29 @@ class IncrementalGate:
 
     def _verify_consistency(self, report: SweepReport,
                             requested: Sequence[str]) -> None:
-        """校验 rc 与汇总一致（🔴-1：至少校验 rc 与汇总一致）。"""
+        """校验 rc / 汇总 / 计划三者一致。
+
+        🔴-2：``counts_source == "none"``（无任何真实计数证据）→ 拒绝落账；
+        🔴-3：**不变量 1「计划跑测数 == 报告实跑数」**须显式校验
+        （文件级标的 1 个 → pytest 实跑该文件全部 3 例 → 必须拦截）。
+        """
         rc = report.exit_code
         counts = report.counts
         n_fail = report.failed_count
         n_err = report.errors_count
         total = report.executed_count
 
+        if rc == 4:
+            raise GateError(
+                "pytest rc=4（用法错误 / 路径未找到）→ selector 路径口径错误，"
+                f"一个用例都没跑。原始输出尾部: {report.raw_output[-300:]}")
+        if rc == 5 and total:
+            raise GateError("rc=5（未收集到用例）却解析出实跑计数 → 结果不可信。")
+        if not report.counts_reliable:
+            # 🔴-2：无任何真实执行计数证据 → 实跑数不可核实。此处**不**用
+            # 计划数填充、也不误报 rc/汇总不一致；报告保持 green=False，
+            # 落账由 assert_report 明确拒绝（run() 仍返回可诊断的报告）。
+            return
         if rc == 0 and (n_fail or n_err):
             raise GateError(
                 f"rc=0 但汇总含失败 {n_fail} / 错误 {n_err} → rc 与汇总不一致，"
@@ -732,19 +826,21 @@ class IncrementalGate:
             raise GateError(
                 "rc=1 但汇总无失败/错误 → rc 与汇总不一致（可能选择器未命中或"
                 f"结果解析失败）。pytest: {report.summary_line or report.raw_output[-200:]}")
-        if rc == 4:
-            raise GateError(
-                "pytest rc=4（用法错误 / 路径未找到）→ selector 路径口径错误，"
-                f"一个用例都没跑。原始输出尾部: {report.raw_output[-300:]}")
-        if rc == 5 and total:
-            raise GateError("rc=5（未收集到用例）却解析出实跑计数 → 结果不可信。")
         if rc == 0 and requested and total == 0:
             raise GateError(
                 f"rc=0 但实跑 0 例（请求 {len(requested)} 个 selector）→ "
                 "计划非空却未跑任何用例，拒绝报绿。")
-        if counts and sum(counts.values()) != total and report.counts_verified:
+        if counts and sum(counts.values()) != total:
             raise GateError(
                 f"分项计数之和 {sum(counts.values())} ≠ 实跑 {total} → 计数不自洽。")
+        # 🔴-3 不变量 1：计划跑测数 == 报告实跑数
+        planned = report.plan.planned_count
+        if report.counts_reliable and rc == 0 and planned and total != planned:
+            raise GateError(
+                f"计划 {planned} 例 ≠ 实跑 {total} 例 → 违反不变量 1"
+                "「计划跑测数 == 报告实跑数」（文件级标的须展开到 nodeid，"
+                "或修正计划口径），拒绝落账。"
+                f"pytest: {report.summary_line or '(无汇总)'}")
 
     # ------------------------------------------------------------------
     # 全量告警视图
@@ -766,10 +862,25 @@ class IncrementalGate:
     def assert_report(self, report: SweepReport) -> int:
         """校验报告文字的计数口径（跑多少写多少，不得写"全量"）。
 
+        🔴-2：``counts_reliable is False``（计数未核实）→ **必须抛错**，
+        不得对未核实计数报绿 / 落账。
+
         🔴-3：绑定**真实实跑数**（``report.executed_count`` = pytest 汇总口径），
-        并校验其实跑数确实出现在报告文本中；同时要求报告非绿时不得以
-        "通过"口径落账。
+        并校验其实跑数确实出现在报告文本中。
         """
+        if not report.counts_reliable:
+            raise GateError(
+                "计数未经核实（counts_source="
+                f"{report.counts_source!r}）→ 拒绝报绿 / 拒绝落账。"
+                f"降级原因: {report.degraded_reason or '(未记录)'}")
+        # 🔴-3 不变量 1：计划跑测数 == 报告实跑数（显式拒绝，不靠"计划构造得对"）
+        planned = report.plan.planned_count
+        executed = report.executed_count
+        if planned and executed and planned != executed:
+            raise GateError(
+                f"计划 {planned} 例 ≠ 实跑 {executed} 例 → 违反不变量 1"
+                "「计划跑测数 == 报告实跑数」，拒绝落账（文件级标的须展开到 "
+                "nodeid 或修正计划口径）。")
         return assert_counter(
             report.render(),
             executed=report.executed_count,

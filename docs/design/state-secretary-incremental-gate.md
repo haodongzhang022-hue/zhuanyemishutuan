@@ -2,7 +2,7 @@
 
 > version: v1.0 · Issue #14
 > 模块：`state-secretary/src/secretary/gate/`
-> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（51 项）
+> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（72 项）
 > CLI：`state-secretary/poc/incremental_gate.py`
 
 ## 1. 用户口径（原文要点）
@@ -63,13 +63,16 @@
 
 `assert_counter(text, executed, total_suite, deferred)` 拒绝：
 
-- **文本未出现本轮实跑数** → 拒绝（守卫必须绑定真实实跑数，不得对
-  未含实跑数的文字放行——如 `assert_counter("本轮实跑 3 例", executed=59)`）；
+- **文本未以实跑语境出现本轮实跑数** → 拒绝。实跑数须命中专属标记
+  （`本轮实跑 N` / `本轮跑 N` / `实跑 N` / `executed: N` / `跑 N 个测试`），
+  **裸数字不算**——序号（`第 6 轮`）、规模数（`全量 359`）、已跑过数
+  （`308 例已跑过`）均不得冒充实跑数（🔴-1 定点修复）；
 - 「全量/全部通过」等措辞 + 规模数 ≠ 实跑数却**未标记**『已跑过/默认不重复』；
 - 声明全量规模但**未给出**已跑过数（读者仍会误读）；
 - 出现**未声明**的计数（防台账漂移 / 拼凑数字）；
-- 例外：**真全量**（规模数 == 实跑数）放行——如「全量 pytest：359 passed」
-  按 `executed=359` 通过，不再误拒真实台账。
+- 例外：**真全量**（规模数 == 实跑数）放行，但**须绑定实跑语境或 pytest
+  汇总证据**（`N passed`）——如「全量 pytest：359 passed」按 `executed=359`
+  通过；而裸写「全量 359 项全部通过」不构成证据 → 拒绝（🔴-1）。
 
 合法写法由 `render_count()` 生成：
 
@@ -90,9 +93,9 @@
 == 全量跑测告警（已跑过项须标记）==
   全量用例: 359 例
   已跑过（默认不重复）: 308 例 ← 须标记
-  本轮实跑: 51 例
-  未消解差异: 0 例
-  计数口径: 本轮实跑 51 例（计划 51）· 已跑过不重复 308 · 冗余剔除 0 · 全量规模 359
+  本轮实跑: 0 例（未提供 --executed 时不冒充；旧实现用计划冒充实跑）
+  未消解差异: 69 例
+  计数口径: 本轮实跑 0 例（计划 0）· 已跑过不重复 308 · 冗余剔除 69 · 全量规模 377
   ⚠ 不得把上述全量数当作「本轮实跑数」上报。
 ```
 
@@ -111,7 +114,7 @@ python3 state-secretary/poc/incremental_gate.py run  --base a455608
 python3 state-secretary/poc/incremental_gate.py full --base a455608
 # 校验留痕文字计数口径（合法写法；写法不合口径则 rc=1 并打印违规原因）
 python3 state-secretary/poc/incremental_gate.py counter \
-    --text "跑 51 个测试（全量 359 例中 308 例已跑过、默认不重复；本轮实跑 51 例）" \
+    --text "跑 69 个测试（全量 377 例中 308 例已跑过、默认不重复；本轮实跑 69 例）" \
     --executed 51 --total 359 --deferred 308
 # 反例（会被拒绝）：文本未含实跑数 51 → rc=1
 python3 state-secretary/poc/incremental_gate.py counter \
@@ -132,17 +135,34 @@ python3 state-secretary/poc/incremental_gate.py counter \
 
 ## 10. 跨版判别力（防恒真）
 
-| 场景 | 结果（复评第 1 轮实测） |
+| 场景 | 结果（复评第 2 轮实测） |
 |---|---|
-| 当前 head（门禁实现 + 用例） | **51 passed**（0 skipped；历史节点改用真实修订） |
+| 当前 head（门禁实现 + 用例） | **72 passed**（0 skipped；门禁文件） |
 | 移植到旧 head（未解决 Issue #14） | 收集期即失败（无 `secretary.gate` 模块） |
-| 变异体 **M1**：`run()` selector 回退仓库相对口径 | **8 FAIL**（rc=4 / 假绿 / 路径口径） |
-| 变异体 **M2**：`green` 不纳入 `exit_code` | **1 FAIL**（rc≠0 报绿） |
-| 变异体 **M3**：计数守卫去掉"实跑数须出现" | **1 FAIL**（伪造文字被放行） |
-| 变异体 **M4**：空计划裸跑全量 | **1 FAIL**（退化为全量） |
-| 变异体 **M5**：静默丢弃标的（both-empty 不 fail-fast） | **1 FAIL**（裸跑全量） |
-| 变异体 **M6**：计划口径回退 def 级（参数化不展开） | **1 FAIL**（计划数 ≠ 收集数） |
-| 变异体 **M7**：`plan_sweep` 退化为"总是全量" | G1/G8 范围断言失败 |
+| 变异体 **M1**：`plan_sweep` 退化为"总是全量" | **10 FAIL** |
+| 变异体 **M2**：计数守卫去掉"全量须标已跑过" | **11 FAIL** |
+| 变异体 **M4**：`green` 不纳入 `exit_code` / 计数可信度 | **12 FAIL** |
+| 变异体 **M5**：空计划裸跑全量 | **11 FAIL** |
+| 变异体 **M6**：`run()` selector 回退仓库相对口径 | **22 FAIL**（rc=4 / 假绿 / 路径口径） |
+| 变异体 **M7**：静默丢弃标的（both-empty 不 fail-fast） | **11 FAIL** |
+| 变异体 **M8**：`_appears` 退化为"含任意数字" | **16 FAIL**（复评第 1 轮仅 1 FAIL → 判别性已加厚） |
+| 变异体 **M9**：回退分支用计划数冒充实跑数 | **11 FAIL** |
+| 变异体 **M10**：去掉不变量 1（计划 ≠ 实跑不拦） | **11 FAIL** |
+| 变异体 **M11**：`deferred` 不剔除 `excluded`（规模重复计数） | **10 FAIL** |
+| 变异体 **M12**：全量规模回退为 `planned+deferred+excluded` | **11 FAIL** |
+| 变异体 **M13**：未核实计数仍放行落账 | **10 FAIL** |
+
+## 10.1 复评第 2 轮定点修复（🔴-1 / 🔴-2 / 🔴-3 清零）
+
+| 项 | 旧病灶 | 修复 |
+|---|---|---|
+| 🔴-1 | `_appears()` 只做裸数字出现判定 → 序号（第 6 轮）/ 规模数（全量 359）/ 已跑过数（308）可冒充实跑数；"真全量豁免"凭裸数字直接放行 | `_appears_as_executed()` **语境绑定**：必须命中「本轮实跑 N / 实跑 N / executed: N / 跑 N 个测试」专属标记，且紧后不得接规模/已跑过语境；真全量豁免须绑定实跑语境或 pytest 汇总证据（`N passed`） |
+| 🔴-2 | junitxml 解析失败回退时用 `plan.targets` 填充 `executed`，并清空 `passed` → 计划数冒充实跑数、`green=True`、`assert_report` 放行 | 回退分支**不得**用计划数：`counts_source ∈ {junitxml, stdout, none}`；`none` 时 `executed=0`、`green=False`、`assert_report` 抛错；`except Exception` 收窄为 `ET.ParseError/OSError` 且记录降级原因 |
+| 🔴-3 | 计划数 ≠ 实跑数无守卫（文件级标的 1 个 → 实跑 3 例放行）；全量规模 `planned+deferred+excluded` 重复计数；`cmd_full` 用计划冒充实跑 | ① `run()`/`assert_report` 显式校验**不变量 1**（计划 == 实跑）；② 规模口径优先取 `collect(head)` **实测收集数**（并集去重仅作回退）；③ `cmd_full` 未给 `--executed` 时 `executed_now=[]`，不冒充 |
+
+顺带处置：🟡1 冗余判定单一语义源（`REDUNDANT_LABELS`）、🟡2 整文件重写判定接线、
+🟡3 `src_pythonpath` 接线为 pytest `pythonpath` ini、🟡4 异常收窄 + 降级原因留痕、
+🟡5 留痕命令在拼接 `--junitxml=` **之后**生成、🟡6 docstring 修订同步、🟡7 跨句指代反例。
 
 ## 11. 与既有门禁的关系
 

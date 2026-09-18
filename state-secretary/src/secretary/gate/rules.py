@@ -26,7 +26,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .models import (
     INCREMENT_ADDED, INCREMENT_DISSOLVED, INCREMENT_LEGACY,
-    SweepTarget,
+    REDUNDANT_LABELS, SweepTarget,
 )
 
 # ---- 「冗余」路径规则（默认不重复；除非消解阈值触发） ----
@@ -123,8 +123,7 @@ class SweepRules:
 
     def __init__(self, test_root: str = "state-secretary/tests",
                  dissolve_ratio: float = DEFAULT_DISSOLVED_RATIO,
-                 redundant_labels: Iterable[str] = ("doc-append", "count-sync",
-                                                    "cosmetic")):
+                 redundant_labels: Iterable[str] = REDUNDANT_LABELS):
         self.test_root = test_root
         self.dissolve_ratio = float(dissolve_ratio)
         self.redundant_labels = set(redundant_labels)
@@ -189,6 +188,24 @@ class SweepRules:
                     kind=INCREMENT_DISSOLVED, path=path, name=n,
                     reason="用例已跑过但其主体已改 → 消解", risk=base.risk))
         return out
+
+    def rewrite_names(self, item: dict,
+                      added: Sequence[str], changed: Sequence[str]
+                      ) -> Tuple[List[str], List[str]]:
+        """整文件重写判定（🟡2 接线点）：命中则把**全部改动用例**升级为消解。
+
+        ``plan_sweep`` 原先未调用 :meth:`classify` / :meth:`is_whole_file_rewrite`，
+        导致「整文件重写判定」实际不生效。此处把它抽成**可接线的最小入口**：
+        命中（改动比例 ≥ ``dissolve_ratio`` 或高风险关键词）时，返回
+        ``(added, changed + 其余未改用例)`` 由调用方把文件级消解落实。
+
+        返回值语义：``(added, to_dissolve)``——``to_dissolve`` 为空表示
+        未命中重写（保持细粒度判定）。
+        """
+        if not self.is_whole_file_rewrite(item):
+            return list(added), []
+        # 命中：整文件消解 → 除新增外全部用例都须复跑（宁多跑，不漏跑）
+        return list(added), list(changed)
 
     def is_whole_file_rewrite(self, item: dict) -> bool:
         """改动比例 ≥ ``dissolve_ratio``（或命中高风险关键词）→ 整文件消解。"""

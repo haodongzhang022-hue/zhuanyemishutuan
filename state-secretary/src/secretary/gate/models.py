@@ -24,6 +24,11 @@ INCREMENT_KINDS = (INCREMENT_ADDED, INCREMENT_DISSOLVED, INCREMENT_LEGACY)
 # 用户口径：高重复/无消解风险的跑测标记为冗余（默认跳过）
 REDUNDANT_BACKLOG = ("redundant", "low-quality-redundant")
 
+# 🟡1：**唯一语义源**——冗余风险标签集合。``SweepTarget.is_redundant`` 与
+# ``SweepRules.is_redundant`` 均以此为准（不再各写一套判定，避免
+# ``risk="some-unknown-label"`` 出现 True/False 分歧）。
+REDUNDANT_LABELS: tuple = ("doc-append", "count-sync", "cosmetic")
+
 
 def _stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
@@ -65,13 +70,17 @@ class SweepTarget:
 
     @property
     def is_redundant(self) -> bool:
-        """是否属「冗余」：非消解路径（risk 未标记消解）→ 不重复跑。
+        """是否属「冗余」（默认不重复跑）。
 
-        🟡9：唯一语义源为 :attr:`SweepRules.redundant_labels`（见
-        :meth:`SweepRules.is_redundant`）；此处为**无规则集时**的便捷判定，
-        供外部/CLI 单点使用，不再是第二套独立实现。
+        🟡1：**单一语义源** = :data:`REDUNDANT_LABELS`（``SweepRules`` 同源）。
+        新增永不算冗余；``risk=""`` / ``risk="dissolve"`` 以及**未知标签**
+        均不算冗余——旧实现 ``risk not in ("", "dissolve")`` 会把
+        ``risk="some-unknown-label"`` 判成冗余，与 ``SweepRules.is_redundant``
+        分歧（复评 🟡1）。
         """
-        return self.risk not in ("", "dissolve")
+        if self.kind == INCREMENT_ADDED:
+            return False
+        return self.risk in REDUNDANT_LABELS
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -106,6 +115,11 @@ class SweepPlan:
         self.deferred: List[SweepTarget] = []   # 已跑过、默认不重复（增量）
         self.excluded: List[SweepTarget] = []   # 标记为冗余，不跑
         self.note: List[str] = []
+        # 🔴-3：**实测全量规模**（``collect(head)`` 的真实收集数）。
+        # 0 表示未测（回退为并集口径）。用于根治"规模虚高"——基线
+        # ``deferred`` 可能含**已重命名/删除**的陈旧 nodeid，并集口径会把它
+        # 也算进当前全量（实测 e3195ea → 378 vs 真实 377）。
+        self.measured_suite_total: int = 0
 
     # ---- 统计（权责一致口径） ----
 
@@ -121,6 +135,39 @@ class SweepPlan:
     @property
     def excluded_count(self) -> int:
         return len(self.excluded)
+
+    @property
+    def skipped_unique_ids(self) -> List[str]:
+        """「已跑过 ∪ 冗余剔除」去重后的 nodeid 清单（🔴-3 口径）。
+
+        旧口径 ``planned + deferred + excluded`` 会把同时落在
+        ``deferred`` 与 ``excluded`` 的用例**重复计数**，导致全量规模虚高
+        （实测 362 vs 真实 361）。规模口径须为**并集**。
+        """
+        seen: List[str] = []
+        for t in list(self.deferred) + list(self.excluded):
+            if t.nodeid not in seen:
+                seen.append(t.nodeid)
+        return seen
+
+    @property
+    def skipped_unique_count(self) -> int:
+        """「已跑过 ∪ 冗余剔除」去重后的用例数（不重复计数）。"""
+        return len(self.skipped_unique_ids)
+
+    @property
+    def suite_total_count(self) -> int:
+        """全量规模口径。
+
+        优先级（🔴-3）：
+
+        1. **实测全量**（``measured_suite_total`` = ``collect(head)`` 真实收集数）
+           —— 最权威，且不受陈旧基线 nodeid 干扰；
+        2. 回退：``计划 + |已跑过 ∪ 冗余剔除|``（并集，不重复计数）。
+        """
+        if self.measured_suite_total:
+            return self.measured_suite_total
+        return self.planned_count + self.skipped_unique_count
 
     @property
     def planned_files(self) -> List[str]:
@@ -188,6 +235,11 @@ class SweepReport:
         self.skipped: List[str] = []
         self.counts: Dict[str, int] = {}   # 结构化汇总（权威计数）
         self.counts_verified = False       # 是否来自 junitxml（可复核）
+        # 🔴-2：计数来源三态 —— junitxml / stdout（汇总行）/ none。
+        # ``none`` 表示**无任何真实执行计数证据**：不得报绿、不得落账，
+        # 更不得用计划数冒充实跑数（旧实现即如此）。
+        self.counts_source: str = "none"
+        self.degraded_reason: str = ""     # 🟡4：降级原因（回退路径留痕）
         self.duration_sec: float = 0.0
         self.exit_code: Optional[int] = None
         self.raw_output: str = ""          # pytest 原始输出（事后可复核）
@@ -198,9 +250,23 @@ class SweepReport:
     # ---- 权威计数（真实实跑，非计划推断） ----
 
     @property
+    def counts_reliable(self) -> bool:
+        """计数是否有**真实执行证据**（junitxml 结构化 / pytest 汇总行）。
+
+        🔴-2：``counts_source == "none"`` 时无任何真实计数 → 不得报绿、
+        不得落账（旧实现用计划数填充 ``executed`` 并报绿）。
+        """
+        # "empty" = 计划为空（本轮不跑，无计数需求）：视为已核实。
+        return self.counts_source in ("junitxml", "stdout", "empty")
+
+    @property
     def executed_count(self) -> int:
-        """本轮**真实实跑**用例数（通过+失败+错误+跳过）。"""
-        if self.counts_verified:
+        """本轮**真实实跑**用例数（通过+失败+错误+跳过）。
+
+        🔴-2：仅在**有真实计数证据**时返回汇总值；无证据时返回已解析到的
+        真实 nodeid 数（通常 0），**绝不**回退为计划数。
+        """
+        if self.counts_reliable:
             return sum(self.counts.values())
         return len(self.executed)
 
@@ -232,14 +298,17 @@ class SweepReport:
 
     @property
     def counter_claim(self) -> "CounterClaim":
-        """计数主张：**跑多少写多少**（不得写"全量"）。"""
+        """计数主张：**跑多少写多少**（不得写"全量"）。
+
+        🔴-3：全量规模口径改为 ``计划 + |已跑过 ∪ 冗余剔除|``（并集去重），
+        不再把 ``excluded`` 与 ``deferred`` 重复计数。
+        """
         return CounterClaim(
             executed=self.executed_count,
             planned=self.plan.planned_count,
             deferred=self.plan.deferred_count,
             redundant=len(self.plan.excluded),
-            total_suite=self.plan.planned_count + self.plan.deferred_count
-            + len(self.plan.excluded),
+            total_suite=self.plan.suite_total_count,
         )
 
     @property
@@ -249,7 +318,9 @@ class SweepReport:
         🔴-1：旧实现只看 failed/errors 列表 → pytest rc=4（not found）时
         列表为空即报 green=True（假绿）。rc 必须参与判定。
         """
-        return (self.failed_count == 0 and self.errors_count == 0
+        # 🔴-2：计数未经核实（无 junitxml / 无汇总行）→ 一律不得报绿。
+        return (self.counts_reliable
+                and self.failed_count == 0 and self.errors_count == 0
                 and self.exit_code == 0)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -259,6 +330,9 @@ class SweepReport:
             "executed_count": self.executed_count,
             "counts": dict(self.counts),
             "counts_verified": self.counts_verified,
+            "counts_source": self.counts_source,
+            "counts_reliable": self.counts_reliable,
+            "degraded_reason": self.degraded_reason,
             "suite_total": self.suite_total,
             "passed": self.passed_count,
             "failed": list(self.failed),
@@ -282,13 +356,16 @@ class SweepReport:
             f"（通过 {self.passed_count} / 失败 {self.failed_count}"
             f" / 错误 {self.errors_count} / 跳过 {self.skipped_count}）",
             f"  跳过重复: {self.plan.deferred_count} 例已跑过 + "
-            f"{len(self.plan.excluded)} 例冗余（合计 {self.redundant_saved} 例省下）",
+            f"{len(self.plan.excluded)} 例冗余（默认不重复）",
             f"  全量规模: {c.total_suite} 例"
             f"（如写全量须标记 {self.plan.deferred_count} 例已跑过）",
             f"  计数口径: {c.render()}",
             f"  退出码  : {self.exit_code}（rc≠0 不得报绿）",
             f"  pytest  : {self.summary_line or '(无汇总)'}",
             f"  信号灯  : {'🟢 通过' if self.green else '🔴 未通过'}",
+            f"  计数来源: {self.counts_source}"
+            + (f"（降级原因: {self.degraded_reason}）" if self.degraded_reason
+               else ""),
         ]
         return "\n".join(lines)
 
