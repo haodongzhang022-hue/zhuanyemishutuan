@@ -41,17 +41,33 @@ from .rules import (
     DEFAULT_RULES, SweepRules, changed_test_files, looks_like_test_path,
 )
 
-__all__ = ["IncrementalGate", "GateError", "looks_like_test_path",
-           "parse_pytest_nodeids"]
+__all__ = ["IncrementalGate", "GateError", "JUnitParseError",
+           "looks_like_test_path", "parse_pytest_nodeids"]
 
 
 class GateError(RuntimeError):
     """门禁执行错误（仓库/路径/pytest 不可用等）。"""
 
 
+class JUnitParseError(GateError):
+    """junitxml 结构不可信（未知状态 / 字段口径不符）。
+
+    🔴-B：解析层**不得**向上抛裸 ``KeyError``（会破坏公开 API 契约与 CLI
+    可诊断性）。统一抛本异常 → ``_fill_results`` 收窄捕获 → 明确降级
+    （``counts_source="none"`` 或回退汇总行），绝不崩栈。
+    """
+
+
 # 顶层用例（缩进 0）与类内方法（缩进 4）：pytest 只收集这两层。
 # 嵌套函数（缩进 ≥ 8，如测试内部 helper）**不是**用例，若被误收会产生
 # 不存在的 nodeid → pytest rc=4（🔴-3 实测暴露）。
+# 🔴-B：junitxml 状态标签 → 计数键（单数 ``error`` → 复数 ``errors``）。
+_JUNIT_STATUS_TO_COUNT = {
+    "passed": "passed", "failed": "failed",
+    "error": "errors", "errors": "errors",
+    "skipped": "skipped",
+}
+
 _DEF_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(")
 _CLASS_RE = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z0-9_]+)\s*[:(]")
@@ -102,7 +118,9 @@ class IncrementalGate:
     Args:
         repo_root: 仓库根（含 .git）。
         test_root: 测试根（仓库相对），默认 ``state-secretary/tests``。
-        src_pythonpath: pytest 的 ``pythonpath``（默认 ``state-secretary/src``）。
+        src_pythonpath: pytest 的 ``pythonpath``（默认 ``state-secretary/src``，
+            **仓库根相对**；注入前会转成 pytest 运行目录相对，见
+            :meth:`pythonpath_ini_value`）。
         rules: 跑测规则集。
     """
 
@@ -118,7 +136,7 @@ class IncrementalGate:
             raise GateError(f"不是 git 仓库（缺 .git）: {self.repo_root}")
         self.test_root = test_root.replace("\\", "/").strip("/")
         # 🟡3：形参真正接线——以 pytest 的 `pythonpath` ini 选项注入
-        # （不再"赋值后无任何引用"）。
+        # （不再"赋值后无任何引用"）。🔴-A：注入时须转 pytest 运行目录相对。
         self.src_pythonpath = src_pythonpath
         self.rules = rules or DEFAULT_RULES
         self._pytest = list(pytest_cmd or [sys.executable, "-m", "pytest"])
@@ -517,6 +535,29 @@ class IncrementalGate:
                 plan.deferred.remove(t)
         return plan
 
+    def pythonpath_ini_value(self) -> str:
+        """把 ``src_pythonpath`` 转成 pytest ``pythonpath`` ini 的**正确口径**。
+
+        🔴-A 定点修复：pytest 的 ``pythonpath`` ini 相对 **rootdir** 解析
+        （本仓库 rootdir = ``state-secretary/``，由 ``state-secretary/pytest.ini``
+        决定），而形参默认值 ``state-secretary/src`` 是**仓库根相对** →
+        直接注入会解析为 ``state-secretary/state-secretary/src``（不存在）
+        → 目标模块 import 失败 → **rc=2 collection error**
+        （真实基线 ``e3195ea`` / ``d6abaab`` 端到端 ``run`` 实测失败）。
+
+        口径（与 ``_pytest_rel`` 同源，避免两处路径语义分歧）：
+
+        - 绝对路径 → 原样（pytest 直接可用）；
+        - 其余 → 去 ``state-secretary/`` 前缀，即**运行目录相对**
+          （``state-secretary/src`` → ``src``；已是 ``src`` 的保持不变）。
+        """
+        raw = (self.src_pythonpath or "").strip()
+        if not raw:
+            return ""
+        if os.path.isabs(raw):
+            return raw
+        return self._pytest_rel(raw)
+
     def _pytest_rel(self, path: str) -> str:
         """仓库相对路径 → pytest 运行目录（state-secretary/）相对路径。"""
         norm = path.replace("\\", "/")
@@ -635,10 +676,15 @@ class IncrementalGate:
 
         pkg = os.path.join(self.repo_root, "state-secretary")
         cmd = self._pytest + ["-q", "-p", "no:cacheprovider"]
-        # 🟡3：src_pythonpath 接线为 pytest `pythonpath` ini（子进程 cwd 为
-        # state-secretary/，此处传相对路径即可）。
-        if self.src_pythonpath:
-            cmd += ["-o", f"pythonpath={self.src_pythonpath}"]
+        # 🟡3：src_pythonpath 接线为 pytest `pythonpath` ini。
+        # 🔴-A：pytest 的 `pythonpath` ini 相对 **rootdir**（由 pytest.ini
+        # 决定 = state-secretary/）解析，而形参默认值是**仓库根相对**
+        # （`state-secretary/src`）→ 直接注入会指向
+        # `state-secretary/state-secretary/src`（不存在）→ collection error
+        # （rc=2）。故注入前一律转运行目录相对（`pythonpath_ini_value()`）。
+        ini_value = self.pythonpath_ini_value()
+        if ini_value:
+            cmd += ["-o", f"pythonpath={ini_value}"]
         cmd += list(extra_args)
         cmd += selectors + files
 
@@ -706,12 +752,14 @@ class IncrementalGate:
         if os.path.isfile(xml_path):
             try:
                 counts, nodeids = self._parse_junit(xml_path)
-            except (ET.ParseError, OSError) as exc:
+            except (ET.ParseError, OSError, JUnitParseError) as exc:
                 # 🟡4：收窄异常范围（原 `except Exception` 吞掉全部解析异常），
                 # 并**记录降级原因**（否则回退路径静默）。
+                # 🔴-B：加入 `JUnitParseError`（未知状态 / 字段口径不符）——
+                # 解析不可信 → 明确降级，**绝不**崩栈（旧实现 KeyError 逃逸）。
                 counts, nodeids = None, None
                 report.degraded_reason = (
-                    f"junitxml 解析失败（{type(exc).__name__}: {exc}）→ "
+                    f"junitxml 解析不可信（{type(exc).__name__}: {exc}）→ "
                     "回退 pytest 汇总行计数")
             else:
                 for nodeid, kind in nodeids.items():
@@ -773,7 +821,16 @@ class IncrementalGate:
                 status = "error"
             elif case.find("skipped") is not None:
                 status = "skipped"
-            counts[status] += 1
+            # 🔴-B 定点修复：``status``（junitxml 标签口径，单数 ``error``）
+            # 与 ``counts`` 键（复数 ``errors``）**不同名**；旧实现直接
+            # ``counts[status]`` → 任何含 ``<error>`` 的 junitxml（collection
+            # error / fixture / setup 错误）都抛 ``KeyError('error')``（非
+            # GateError）→ 破坏公开 API 契约与 CLI 可诊断性。此处显式映射，
+            # 未知状态一律 ``JUnitParseError``（由 ``_fill_results`` 收窄捕获）。
+            key = _JUNIT_STATUS_TO_COUNT.get(status)
+            if key is None:  # pragma: no cover - 未来 pytest 新增标签时兜底
+                raise JUnitParseError(f"未知 junitxml 状态: {status!r}")
+            counts[key] += 1
             nodeid = self._nodeid_from_junit(
                 case.get("classname") or "", case.get("name") or "")
             nodeids[nodeid] = status

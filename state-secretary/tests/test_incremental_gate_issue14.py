@@ -456,16 +456,32 @@ class TestG8RealRepoEndToEnd:
     """用本仓库真实历史节点做增量判定，避免"只在合成数据上成立"。"""
 
     def test_g8_real_pr_increment_is_small_not_full(self):
-        """真实增量（本 PR）→ 计划须远小于全量 308（**判别性**）。"""
+        """真实增量（本 PR）→ 计划须远小于全量（**判别性**）。
+
+        🟡 阈值口径（复评第 3 轮调整）：原断言用固定比例 ``< full * 0.2``，
+        与**用例数耦合**——本 PR 的增量主体就是门禁用例本身，随判别性回归
+        增补用例，比例自然上升（实测 72/380=18.9% → 81/389=20.8%）→ 脆弱。
+        改为**语义不变量**（不随规模漂移）：
+
+        - 计划 ⊆ diff 触及文件（另见 ``test_g8_big_increment_plan_matches_real_diff``）；
+        - 计划数 **严格小于** 已跑过数（增量小于既有 → 确实"只跑增量"）；
+        - 已跑过占多数（> 50%）。
+
+        判别力：变异体 M1（"总是全量"）→ ``deferred≈0`` 且
+        ``planned == full`` → 三条断言全数失败。
+        """
         _rev_or_skip(LEGACY_BASE)
         gate = _gate()
         full = gate.collect("WORKTREE")
         plan = gate.plan_sweep(base=LEGACY_BASE)
         assert len(full) >= 250, "前置：全量规模须 > 250"
-        assert plan.planned_count < len(full) * 0.2, (
+        assert plan.planned_count < plan.deferred_count, (
+            f"增量计划 {plan.planned_count} 例 ≥ 已跑过 {plan.deferred_count} 例 "
+            "→ 未体现『只跑增量』（增量须小于既有）")
+        assert plan.planned_count < len(full) * 0.5, (
             f"增量计划 {plan.planned_count} 例 / 全量 {len(full)} 例 → 未体现"
             "『只跑增量』（应远小于全量）")
-        assert plan.deferred_count > len(full) * 0.8, \
+        assert plan.deferred_count > len(full) * 0.5, \
             "绝大多数既有用例须被标为『已跑过、默认不重复』"
 
     def test_g8_big_increment_plan_matches_real_diff(self):
@@ -1131,3 +1147,422 @@ class TestG11Round2PointFixes:
         report = sbx.gate.run(plan)
         # 守卫自身须能通过（否则报告文字与计数主张不一致）
         assert sbx.gate.assert_report(report) == 1
+
+
+# ======================================================================
+# G12 复评第 3 轮定点修复（🔴-A src_pythonpath 路径口径 / 🔴-B junitxml <error>）
+# ======================================================================
+#
+# 病灶一（🔴-A，回归）：pytest 的 `pythonpath` ini 相对 **rootdir**
+# （= `state-secretary/`，由 pytest.ini 决定）解析，而形参默认值
+# `state-secretary/src` 是**仓库根相对** → 实际指向
+# `state-secretary/state-secretary/src`（不存在）→ 目标模块 import 失败 →
+# **rc=2 collection error**。真实基线端到端 `run --base e3195ea/d6abaab`
+# 实测失败（掩盖原因：端到端自测只跑 `--base a455608`，该文件自带
+# `sys.path.insert`，未暴露）。
+#
+# 病灶二（🔴-B，本轮因 🔴-A 成为默认路径必现）：`_parse_junit` 的
+# `counts[status]` 键名不符（`counts` 键为复数 `errors`，`status` 取单数
+# `error`）→ **任何** junitxml 含 `<error>`（collection error / fixture /
+# setup 错误）→ `KeyError('error')`（**非** `GateError`）→ 破坏公开 API
+# 契约与 CLI 可诊断性（只打印 `[门禁拒绝] 'error'`）。
+
+
+def _sandbox_repo_with_src() -> _Sandbox:
+    """沙箱：``pytest.ini`` 声明 ``pythonpath = src``，测试 import ``src`` 下模块。
+
+    这是 🔴-A 的**最小复现环境**：只有真正把 ``pythonpath`` 指到存在的
+    ``src/`` 时 collection 才成功；指向 ``state-secretary/src``（不存在）
+    即 rc=2 collection error。
+    """
+    root = tempfile.mkdtemp(prefix="gate-sbx-pp-")
+    pkg = os.path.join(root, "state-secretary")
+    tests = os.path.join(pkg, "tests")
+    src = os.path.join(pkg, "src")
+    os.makedirs(tests, exist_ok=True)
+    os.makedirs(src, exist_ok=True)
+    with open(os.path.join(pkg, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write("[pytest]\npythonpath = src\n")
+    with open(os.path.join(src, "sbxlib.py"), "w", encoding="utf-8") as f:
+        f.write("VALUE = 41\n")
+    with open(os.path.join(tests, "test_base.py"), "w", encoding="utf-8") as f:
+        f.write("from sbxlib import VALUE\n\n"
+                "def test_ok():\n    assert VALUE + 1 == 42\n")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    return _Sandbox(root, IncrementalGate(repo_root=root))
+
+
+def _sandbox_repo_with_erroring_fixture() -> _Sandbox:
+    """沙箱：``test_base.py`` 内 fixture 抛错 → junitxml 含 ``<error>``。
+
+    🔴-B 的最小复现：任何含 ``<error>`` 的 junitxml 旧实现都抛
+    ``KeyError('error')``。
+    """
+    root = tempfile.mkdtemp(prefix="gate-sbx-err-")
+    pkg = os.path.join(root, "state-secretary")
+    tests = os.path.join(pkg, "tests")
+    os.makedirs(tests, exist_ok=True)
+    with open(os.path.join(pkg, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write("[pytest]\n")
+    with open(os.path.join(tests, "test_base.py"), "w", encoding="utf-8") as f:
+        f.write("import pytest\n\n"
+                "@pytest.fixture\n"
+                "def boom():\n"
+                "    raise RuntimeError('fixture boom')\n\n"
+                "def test_uses_boom(boom):\n    assert True\n")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    return _Sandbox(root, IncrementalGate(repo_root=root))
+
+
+class TestG12Round3PointFixes:
+    """复评第 3 轮：🔴-A 路径口径 + 🔴-B junitxml ``<error>`` 键名。"""
+
+    # ---- 🔴-A：src_pythonpath 须转 pytest 运行目录相对 ----
+
+    def test_g12_pythonpath_ini_value_is_run_dir_relative(self):
+        """**判别性（🔴-A 单元）**：默认仓库根相对值 → 运行目录相对。
+
+        ``state-secretary/src`` → ``src``（旧实现原样注入 → 指向
+        ``state-secretary/state-secretary/src``）。
+        """
+        sbx = _sandbox_repo_with_src()
+        assert sbx.gate.src_pythonpath == "state-secretary/src", "前置：默认值"
+        assert sbx.gate.pythonpath_ini_value() == "src", (
+            "🔴-A：注入值须为运行目录相对（src），实测 "
+            f"{sbx.gate.pythonpath_ini_value()!r}")
+        # 已是运行目录相对 → 保持不变（不得二次去前缀）
+        g2 = IncrementalGate(repo_root=sbx.root, src_pythonpath="src")
+        assert g2.pythonpath_ini_value() == "src"
+        # 绝对路径 → 原样（pytest 直接可用）
+        abs_p = os.path.join(sbx.root, "state-secretary", "src")
+        g3 = IncrementalGate(repo_root=sbx.root, src_pythonpath=abs_p)
+        assert g3.pythonpath_ini_value() == abs_p
+        # 空值 → 空（不注入 pythonpath）
+        g4 = IncrementalGate(repo_root=sbx.root, src_pythonpath="")
+        assert g4.pythonpath_ini_value() == ""
+
+    def test_g12_pythonpath_default_end_to_end_is_green(self):
+        """**判别性（🔴-A 端到端）**：默认 ``src_pythonpath`` 下真实子进程
+        须 rc=0 且恰好 1 例通过。
+
+        旧实现注入 ``pythonpath=state-secretary/src`` → collection error
+        rc=2（模块 import 失败）→ 真实基线端到端 ``run`` 全红。
+        """
+        sbx = _sandbox_repo_with_src()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_ok"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)
+        assert "pythonpath=src" in report.command, report.command
+        assert report.exit_code == 0, (
+            f"🔴-A：默认 pythonpath 注入口径错误 → rc={report.exit_code}；"
+            f"{report.raw_output[-400:]}")
+        assert report.executed_count == 1
+        assert report.passed_count == 1
+        assert report.green is True, report.render()
+
+    def test_g12_repo_relative_pythonpath_would_be_collection_error(self):
+        """**判别性（🔴-A 反证）**：旧口径（仓库根相对）确实 collection error。
+
+        rc 口径随 selector 形态而异（均为"一个用例都没跑"）：
+
+        - **文件级** selector → rc=**2**（collection error，pytest 汇总报错）；
+        - **nodeid 级** selector（门禁实际用法）→ rc=**4**
+          （``found no collectors``，因该 nodeid 无法收集）。
+
+        两者都伴随 ``ModuleNotFoundError``。门禁实际走 nodeid → rc=4，但
+        junitxml 仍产出 ``<error>`` 节点 → 旧实现 ``_parse_junit`` 抛
+        ``KeyError('error')`` 逃逸（🔴-B）→ CLI 只打印 ``[门禁拒绝] 'error'``。
+        """
+        sbx = _sandbox_repo_with_src()
+        pkg = os.path.join(sbx.root, "state-secretary")
+        # (1) 文件级 selector → rc=2
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "-o", "pythonpath=state-secretary/src", "tests/test_base.py"],
+            cwd=pkg, capture_output=True, text=True)
+        assert out.returncode == 2, (
+            f"旧口径（文件级）应 rc=2 collection error，实测 rc={out.returncode}；"
+            f"{out.stdout[-300:]}")
+        assert "ModuleNotFoundError" in (out.stdout + out.stderr), \
+            "反证：须是 import 失败（模块不在 sys.path）"
+        # (2) nodeid 级 selector（门禁实际用法）→ rc=4，一个用例都没跑
+        out_nid = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "-o", "pythonpath=state-secretary/src",
+             "tests/test_base.py::test_ok"],
+            cwd=pkg, capture_output=True, text=True)
+        assert out_nid.returncode == 4, (
+            f"旧口径（nodeid 级）应 rc=4（no collectors），实测 "
+            f"rc={out_nid.returncode}；{out_nid.stdout[-300:]}")
+        # 反向对照：正确口径（运行目录相对）两种 selector 均 rc=0
+        for sel in ("tests/test_base.py", "tests/test_base.py::test_ok"):
+            ok = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                 "-o", "pythonpath=src", sel],
+                cwd=pkg, capture_output=True, text=True)
+            assert ok.returncode == 0, (sel, ok.stdout[-300:])
+
+    # ---- 🔴-B：junitxml ``<error>`` 键名映射 ----
+
+    def test_g12_parse_junit_error_status_maps_to_errors(self):
+        """**判别性（🔴-B 单元）**：含 ``<error>`` 的 junitxml 须解析为
+        ``counts['errors']``，**不得**抛 ``KeyError('error')``。"""
+        gate = _gate()
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" tests="2">\n'
+            '  <testcase classname="tests.test_a" name="test_ok" time="0"/>\n'
+            '  <testcase classname="tests.test_a" name="test_err" time="0">\n'
+            '    <error message="fixture boom">RuntimeError: boom</error>\n'
+            '  </testcase>\n'
+            '</testsuite></testsuites>\n')
+        fd, path = tempfile.mkstemp(prefix="gate-junit-", suffix=".xml")
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(xml)
+            counts, nodeids = gate._parse_junit(path)
+        finally:
+            os.unlink(path)
+        assert counts["errors"] == 1, counts
+        assert counts["passed"] == 1, counts
+        assert sum(counts.values()) == 2
+        assert sorted(nodeids.values()) == ["error", "passed"]
+
+    def test_g12_erroring_fixture_run_no_keyerror(self):
+        """**判别性（🔴-B 端到端）**：fixture 抛错 → ``run()`` 须返回报告
+        （**不得** ``KeyError``），``errors_count == 1``、``green is False``、
+        ``assert_report`` 抛 ``GateError``（**非** ``KeyError``）。"""
+        from secretary.gate import GateError
+        sbx = _sandbox_repo_with_erroring_fixture()
+        plan = _plan_for(
+            sbx.gate, ["state-secretary/tests/test_base.py::test_uses_boom"],
+            "state-secretary/tests/test_base.py")
+        report = sbx.gate.run(plan)   # 旧实现：KeyError('error') 崩栈
+        assert report.exit_code == 1, report.raw_output[-400:]
+        assert report.counts_source == "junitxml", report.render()
+        assert report.errors_count == 1, report.render()
+        assert report.green is False, "含 error 却报绿 = 假绿"
+        # 公开 API 契约：解析层**不得**抛裸 KeyError；报告可诊断
+        try:
+            n = sbx.gate.assert_report(report)
+        except GateError:
+            n = None   # 计数口径守卫拒绝亦属合法（此处不拒绝，见下断言）
+        except KeyError as exc:  # pragma: no cover - 旧实现路径
+            raise AssertionError(
+                f"🔴-B：assert_report 抛裸 KeyError({exc!r}) → 破坏 CLI 可诊断性")
+        assert n == report.executed_count, (
+            "计数口径守卫须以真实实跑数为准放行（error 属真实执行产物）")
+        # CLI 端到端：rc=1（非绿）且 **不得**打印裸 KeyError
+        cli = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "state-secretary", "poc",
+                                          "incremental_gate.py"),
+             "--repo", sbx.root, "run", "--base", "HEAD"],
+            cwd=REPO_ROOT, capture_output=True, text=True)
+        assert cli.returncode == 1, (cli.stdout[-300:], cli.stderr[-300:])
+        assert "KeyError" not in cli.stderr and "'error'" not in cli.stderr, (
+            f"🔴-B：CLI 不得输出裸 KeyError 形貌；stderr={cli.stderr[-300:]!r}")
+
+    def test_g12_unknown_junit_status_degrades_not_crashes(self):
+        """**判别性（🔴-B 收窄捕获）**：``_parse_junit`` 抛
+        ``JUnitParseError``（解析不可信）→ ``_fill_results`` **必须**捕获
+        并明确降级（``counts_source="none"``），**绝不**崩栈。
+
+        判别力：变异体（不把 ``JUnitParseError`` 纳入 ``except``）→
+        异常逃逸 → 本用例失败。
+        """
+        from secretary.gate import JUnitParseError
+        gate = _gate()
+        plan = SweepPlan(base="x")
+        plan.targets = [SweepTarget(nodeid=f"{NEW_TEST_FILE}::test_a",
+                                    kind=INCREMENT_ADDED,
+                                    path=NEW_TEST_FILE, name="test_a")]
+        report = SweepReport(plan)
+        report.exit_code = 0
+        report.summary_line = ""
+
+        def _boom(_path):
+            raise JUnitParseError("未知 junitxml 状态: 'weird'")
+
+        real = gate._parse_junit
+        gate._parse_junit = _boom
+        try:
+            class _Out:
+                stdout = ""
+                stderr = ""
+                returncode = 0
+
+            gate._fill_results(report, __file__, _Out())
+        finally:
+            gate._parse_junit = real
+        assert report.counts_source == "none", report.render()
+        assert report.counts_verified is False
+        assert report.green is False, "解析不可信却报绿 = 假绿"
+        assert "解析不可信" in report.degraded_reason, report.degraded_reason
+
+    def test_g12_junit_status_map_is_single_source(self):
+        """**判别性（🔴-B 键名）**：``status → counts 键`` 映射须单源且
+        覆盖 pytest 的四种标签；``error``（单数）必须映射到 ``errors``。"""
+        from secretary.gate.incremental import _JUNIT_STATUS_TO_COUNT
+        assert _JUNIT_STATUS_TO_COUNT["error"] == "errors"
+        assert _JUNIT_STATUS_TO_COUNT["errors"] == "errors"
+        for tag in ("passed", "failed", "skipped"):
+            assert _JUNIT_STATUS_TO_COUNT[tag] == tag
+        # 键必须与 `_parse_junit` 初始化的一致（防再次键名漂移）
+        assert set(_JUNIT_STATUS_TO_COUNT.values()) == {
+            "passed", "failed", "errors", "skipped"}
+
+    # ---- 多基线端到端 run（🔴-A 回归防线） ----
+
+    @staticmethod
+    def _plan_without_self(gate, base: str):
+        """真实仓库计划，**剔除本门禁用例文件**后返回。
+
+        防递归：``test_incremental_gate_issue14.py`` 内含 ``gate.run()``
+        用例，若端到端 ``run`` 把它纳入 selector → 嵌套跑测无限递归。
+        剔除后仍含 ``test_acceptance_matrix_issue4.py`` /
+        ``test_secretary_session.py``（二者**无** ``sys.path.insert``，
+        正是 🔴-A 的判别面）。
+        """
+        plan = gate.plan_sweep(base=base)
+        plan.targets = [t for t in plan.targets if t.path != NEW_TEST_FILE]
+        return plan
+
+    @pytest.mark.parametrize("base", [LEGACY_BIG, LEGACY_MID])
+    def test_g12_real_repo_multi_base_run_is_green(self, base):
+        """**判别性（🔴-A 多基线回归）**：真实仓库多基线端到端 ``run`` 须
+        rc=0 / 计数来源 junitxml / 实跑数 == 计划数 / 🟢。
+
+        旧实现：``--base e3195ea`` / ``--base d6abaab`` → rc=1，
+        stderr ``[门禁拒绝] 'error'``（🔴-A 致 collection error，🔴-B 致
+        KeyError）。端到端自测只跑 ``--base a455608``（该文件自带
+        ``sys.path.insert``）→ 未暴露。
+
+        判别面：``test_acceptance_matrix_issue4.py`` / ``test_secretary_session.py``
+        **无** ``sys.path.insert`` → 仅靠 ``pythonpath`` ini 找 ``secretary``
+        包 → 旧口径（``state-secretary/src``）必然 collection error。
+        """
+        _rev_or_skip(base)
+        gate = _gate()
+        plan = self._plan_without_self(gate, base)
+        assert plan.planned_count > 0, f"前置：base={base} 须有增量"
+        assert any(p != NEW_TEST_FILE for p in plan.planned_files), \
+            "前置：须含非本门禁文件的判别面"
+        report = gate.run(plan)
+        assert report.exit_code == 0, (
+            f"base={base} rc={report.exit_code}；"
+            f"{report.raw_output[-400:]}")
+        assert report.counts_source == "junitxml", report.render()
+        assert report.green is True, report.render()
+        assert report.executed_count == plan.planned_count, (
+            f"base={base}：计划 {plan.planned_count} 例 ≠ 实跑 "
+            f"{report.executed_count} 例 → 违反不变量 1")
+        # 计数口径守卫须放行（报告文字与真实实跑数一致）
+        assert gate.assert_report(report) == report.executed_count
+
+    def test_g12_real_repo_default_pythonpath_is_run_dir_relative(self):
+        """**判别性（🔴-A 真实仓库）**：真实仓库默认口径须转 ``src``
+        （旧实现原样 ``state-secretary/src`` → 真实基线 rc=2/1）。"""
+        gate = _gate()
+        assert gate.pythonpath_ini_value() == "src", (
+            f"实测 {gate.pythonpath_ini_value()!r}")
+        assert os.path.isdir(
+            os.path.join(gate.repo_root, "state-secretary", "src")), \
+            "前置：src 目录确实存在（口径正确性前提）"
+
+
+# ======================================================================
+# G13 🟡-B：`is_whole_file_rewrite` 的**比例分支**可复现判别用例
+# ======================================================================
+#
+# 🟡-B（复评第 2 轮）：比例分支（分母 = 工作区全文行数）极难触发——正常编辑
+# 比例 < 0.5 → 复现不出"改动比例 ≥ 0.5 → 计划 5 例"。本组用**沙箱**构造
+# "小文件被整文件重写"（changed/total ≥ 0.5）→ 比例分支必然命中，端到端
+# 判别（不经关键词分支）。
+
+
+def _sandbox_repo_for_rewrite() -> _Sandbox:
+    """沙箱：基线含 4 行测试文件（3 例），随后**整文件重写**（改动比例 ≥ 0.5）。"""
+    root = tempfile.mkdtemp(prefix="gate-sbx-rw-")
+    pkg = os.path.join(root, "state-secretary")
+    tests = os.path.join(pkg, "tests")
+    os.makedirs(tests, exist_ok=True)
+    with open(os.path.join(pkg, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write("[pytest]\n")
+    path = os.path.join(tests, "test_rw.py")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    # 基线：4 行、3 例
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("def test_a():\n    assert True\n\n"
+                "def test_b():\n    assert True\n\n"
+                "def test_c():\n    assert True\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    # 整文件重写：8 行全改（git numstat 记 8 增；工作区 8 行 → 比例 1.0）
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("def test_a():\n    assert 1 == 1\n\n"
+                "def test_b():\n    assert 2 == 2\n\n"
+                "def test_c():\n    assert 3 == 3\n\n"
+                "def test_d():\n    assert 4 == 4\n")
+    return _Sandbox(root, IncrementalGate(repo_root=root))
+
+
+class TestG13WholeFileRewriteRatioBranch:
+    """🟡-B：整文件重写**比例分支**可复现判别（非关键词分支）。"""
+
+    def test_g13_ratio_branch_is_reachable_end_to_end(self):
+        """**判别性（🟡-B）**：小文件整文件重写 → 比例 ≥ 0.5 → 比例分支命中
+        （`DISOLVE_KEYWORDS` 不匹配 `test_rw.py` 路径/无 summary 关键词）→
+        全部既有用例升级为消解。"""
+        sbx = _sandbox_repo_for_rewrite()
+        changes = sbx.gate.changed_files(base="HEAD")
+        entry = [c for c in changes if c["path"].endswith("test_rw.py")]
+        assert entry, changes
+        entry = entry[0]
+        assert entry["total_lines"] > 0, entry
+        ratio = entry["changed_lines"] / entry["total_lines"]
+        assert ratio >= 0.5, (
+            f"前置：改动比例须 ≥ 0.5（实测 {ratio}）→ 否则比例分支不可达")
+        # 比例分支确实命中（关键词分支对 test_rw.py 不匹配）
+        assert sbx.gate.rules.is_whole_file_rewrite(entry) is True, entry
+        plan = sbx.gate.plan_sweep(base="HEAD")
+        assert plan.planned_count > 0, plan.render()
+
+    def test_g13_ratio_branch_discriminates_from_keyword_branch(self):
+        """**判别性（🟡-B 对照）**：把阈值调高到 1.1 → 比例分支不可达；
+        且该条目**不**命中关键词分支 → 判定翻转为 False（证明原判定确由
+        **比例**驱动，而非恒真或关键词误命中）。"""
+        sbx = _sandbox_repo_for_rewrite()
+        entry = [c for c in sbx.gate.changed_files(base="HEAD")
+                 if c["path"].endswith("test_rw.py")][0]
+        assert sbx.gate.rules.is_whole_file_rewrite(entry) is True
+        strict = IncrementalGate(repo_root=sbx.root,
+                                 rules=SweepRules(dissolve_ratio=1.1))
+        assert strict.rules.is_whole_file_rewrite(entry) is False, (
+            "阈值 1.1 下比例分支不可达且无关键词 → 须 False（否则判定非比例驱动）")

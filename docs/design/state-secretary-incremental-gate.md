@@ -112,14 +112,23 @@ python3 state-secretary/poc/incremental_gate.py plan --base a455608
 python3 state-secretary/poc/incremental_gate.py run  --base a455608
 # 全量告警视图（标记已跑过项）
 python3 state-secretary/poc/incremental_gate.py full --base a455608
-# 校验留痕文字计数口径（合法写法；写法不合口径则 rc=1 并打印违规原因）
+# 合法写法（rc=0）：文本中的实跑数须与 --executed 一致
+python3 state-secretary/poc/incremental_gate.py counter \
+    --text "跑 51 个测试（全量 359 例中 308 例已跑过、默认不重复；本轮实跑 51 例）" \
+    --executed 51 --total 359 --deferred 308
+
+# 反例（会被拒绝，rc=1）：
+#   (a) 文本实跑数(69) ≠ --executed(51) → 无法核对"跑多少写多少"
 python3 state-secretary/poc/incremental_gate.py counter \
     --text "跑 69 个测试（全量 377 例中 308 例已跑过、默认不重复；本轮实跑 69 例）" \
     --executed 51 --total 359 --deferred 308
-# 反例（会被拒绝）：文本未含实跑数 51 → rc=1
+#   (b) 文本未含实跑数 51（只有规模/已跑过数）
 python3 state-secretary/poc/incremental_gate.py counter \
     --text "全量 308 项全部通过" --executed 51 --total 359 --deferred 308
 ```
+
+> 🟡-A（复评第 3 轮）：上例 (a) 原被误标为"合法写法"，与实测 rc=1 矛盾；
+> 现已改一致（合法例的文本实跑数 = `--executed`），并把原例降为反例 (a)。
 
 退出码：`0` 通过 / `1` 测试红或计数口径违规。
 
@@ -137,7 +146,7 @@ python3 state-secretary/poc/incremental_gate.py counter \
 
 | 场景 | 结果（复评第 2 轮实测） |
 |---|---|
-| 当前 head（门禁实现 + 用例） | **72 passed**（0 skipped；门禁文件） |
+| 当前 head（门禁实现 + 用例） | **84 passed**（0 skipped；门禁文件，复评第 3 轮） |
 | 移植到旧 head（未解决 Issue #14） | 收集期即失败（无 `secretary.gate` 模块） |
 | 变异体 **M1**：`plan_sweep` 退化为"总是全量" | **10 FAIL** |
 | 变异体 **M2**：计数守卫去掉"全量须标已跑过" | **11 FAIL** |
@@ -145,12 +154,15 @@ python3 state-secretary/poc/incremental_gate.py counter \
 | 变异体 **M5**：空计划裸跑全量 | **11 FAIL** |
 | 变异体 **M6**：`run()` selector 回退仓库相对口径 | **22 FAIL**（rc=4 / 假绿 / 路径口径） |
 | 变异体 **M7**：静默丢弃标的（both-empty 不 fail-fast） | **11 FAIL** |
-| 变异体 **M8**：`_appears` 退化为"含任意数字" | **16 FAIL**（复评第 1 轮仅 1 FAIL → 判别性已加厚） |
+| 变异体 **M8**：`_appears` 退化为"含任意数字" | **16 FAIL**（复评第 1 轮仅 1 FAIL → 判别性已加厚）<br>注：🟡-C 复评第 3 轮澄清——该变异体定义须为**同时**退化 `_appears` 与 `_appears_as_executed`（`_appears` 已不在守卫主路径，单独退化不触发 FAIL） |
 | 变异体 **M9**：回退分支用计划数冒充实跑数 | **11 FAIL** |
 | 变异体 **M10**：去掉不变量 1（计划 ≠ 实跑不拦） | **11 FAIL** |
 | 变异体 **M11**：`deferred` 不剔除 `excluded`（规模重复计数） | **10 FAIL** |
 | 变异体 **M12**：全量规模回退为 `planned+deferred+excluded` | **11 FAIL** |
 | 变异体 **M13**：未核实计数仍放行落账 | **10 FAIL** |
+| 变异体 **M14**：`pythonpath` 回退仓库根相对口径（🔴-A） | **5 FAIL**（多基线端到端 rc=4 + 口径单元） |
+| 变异体 **M15**：`counts[status]` 键名不符（🔴-B） | **2 FAIL**（`KeyError('error')` 崩栈） |
+| 变异体 **M16**：`_fill_results` 不收窄捕获 `JUnitParseError` | **1 FAIL**（解析异常逃逸） |
 
 ## 10.1 复评第 2 轮定点修复（🔴-1 / 🔴-2 / 🔴-3 清零）
 
@@ -163,6 +175,19 @@ python3 state-secretary/poc/incremental_gate.py counter \
 顺带处置：🟡1 冗余判定单一语义源（`REDUNDANT_LABELS`）、🟡2 整文件重写判定接线、
 🟡3 `src_pythonpath` 接线为 pytest `pythonpath` ini、🟡4 异常收窄 + 降级原因留痕、
 🟡5 留痕命令在拼接 `--junitxml=` **之后**生成、🟡6 docstring 修订同步、🟡7 跨句指代反例。
+
+## 10.2 复评第 3 轮定点修复（🔴-A / 🔴-B 清零）
+
+| 项 | 旧病灶 | 修复 |
+|---|---|---|
+| 🔴-A | `src_pythonpath` 默认值 `state-secretary/src` 是**仓库根相对**，而 pytest 的 `pythonpath` ini 相对 **rootdir**（=`state-secretary/`）解析 → 实际指向 `state-secretary/state-secretary/src`（不存在）→ 目标模块 import 失败 → **rc=2/4 collection error**。真实基线 `run --base e3195ea/d6abaab` 端到端失败（掩盖原因：端到端自测只跑 `--base a455608`，该文件自带 `sys.path.insert`） | 新增 `pythonpath_ini_value()`：注入前一律转**运行目录相对**（`state-secretary/src` → `src`；绝对路径原样）。口径与 `_pytest_rel()` 同源 |
+| 🔴-B | `_parse_junit` 的 `counts[status]` 键名不符（`counts` 键为复数 `errors`，`status` 取单数 `error`）→ **任何** junitxml 含 `<error>`（collection error / fixture / setup 错误）→ `KeyError('error')`（**非** `GateError`）→ 破坏公开 API 契约与 CLI 可诊断性（只打印 `[门禁拒绝] 'error'`） | ① 显式状态映射 `_JUNIT_STATUS_TO_COUNT`（`error → errors`）；② 未知状态抛 `JUnitParseError`（`GateError` 子类，已导出）；③ `_fill_results` 收窄捕获纳入 `JUnitParseError` → 明确降级（`counts_source="none"` + 降级原因留痕），**绝不**崩栈 |
+
+**回归防线**：新增 `TestG12Round3PointFixes`（🔴-A/🔴-B 定点 + **多基线端到端
+`run`** `e3195ea`/`d6abaab`）+ `TestG13WholeFileRewriteRatioBranch`（🟡-B 比例分支
+可复现判别）。多基线用例剔除本门禁文件防递归（其判别面
+`test_acceptance_matrix_issue4.py` / `test_secretary_session.py` **无**
+`sys.path.insert`，正是 🔴-A 的暴露面）。
 
 ## 11. 与既有门禁的关系
 

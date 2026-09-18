@@ -15,7 +15,7 @@ from .models import (
 )
 from .counter import assert_counter, CounterWordingError, render_count
 from .incremental import (
-    IncrementalGate, GateError, looks_like_test_path,
+    IncrementalGate, GateError, JUnitParseError, looks_like_test_path,
 )
 from .rules import (
     SweepRules, DEFAULT_RULES, DEFAULT_DISSOLVED_RATIO,
@@ -28,7 +28,7 @@ __all__ = [
     "SweepTarget", "SweepPlan", "SweepReport", "FullSweepReport",
     "CounterClaim",
     "assert_counter", "CounterWordingError", "render_count",
-    "IncrementalGate", "GateError", "looks_like_test_path",
+    "IncrementalGate", "GateError", "JUnitParseError", "looks_like_test_path",
     "SweepRules", "DEFAULT_RULES", "DEFAULT_DISSOLVED_RATIO",
     "classify_changed_path", "changed_test_files",
 ]
