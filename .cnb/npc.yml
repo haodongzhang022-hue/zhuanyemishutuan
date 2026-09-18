@@ -1,0 +1,183 @@
+# ============================================================
+# 专业秘书团 · NPC 任务配置（v0.3 · 适配新版 dsh 生态）
+# ------------------------------------------------------------
+# 新版生态：cnpc/dsh（基于 deepseek-harness 官方 CLI 的 CNB NPC 镜像）
+#   镜像：docker.cnb.cool/xqitw/docker/npc-dsh:latest
+#   入口：sh /app/start.sh（镜像内置，替代平台内置 npc:go 执行器）
+#   文档：https://cnb.cool/cnpc/dsh/-/blob/main/docs/integration.md
+# ------------------------------------------------------------
+# 与 v0.2（npc:go 内置执行器）的差异：
+#   1. 执行器：平台内置 npc:go → 自建镜像 npc-dsh
+#   2. 角色路由：评论内 [触发:<角色>] 文本命中 → 平台原生「顶层 key = 角色名」
+#      （评论 @dongdongxiaozu/zhuanyemishutuan(秘书·评审) 直接命中对应角色）
+#   3. 必配 stage timeout：镜像已删除进程级超时，靠 stage timeout 做时间兜底
+#   4. 角色提示词经 CNB_NPC_PROMPT 注入；空时镜像回落读 .cnb/settings.yml
+#   5. 模型经 DSH_MODEL 注入（dsh 不读该变量，由镜像 --patch 覆盖生效）
+# ============================================================
+
+# 共用任务环境：镜像、资源规格、服务
+.npc-job-base: &npc-job-base
+  docker:
+    image: docker.cnb.cool/xqitw/docker/npc-dsh:latest
+  runner:
+    cpus: 2
+  services:
+    - docker
+
+# 基础环境变量（各角色在 env 中 << 合并后追加 DSH_MODEL）
+.npc-env: &npc-env
+  # dsh 内置 web 工具（web_search + web_fetch 一体）默认禁用，避免误调白耗失败请求
+  DSH_WEB_TOOLS: "disable"
+  # 图片理解 vision 插件：秘书团角色为纯文本主模型，经 describe_image 副模型识图
+  DSH_VISION_ENABLED: "1"
+
+# 共用执行步骤：脚本、超时与基础环境变量
+.base-stage: &base-stage
+  script: sh /app/start.sh
+  # 必配：镜像已删除业务层进程级超时，时间兜底完全依赖该 stage timeout
+  # （CNB Job 未声明 timeout 默认仅 2h，漏配则 dsh 挂死无任何墙钟防线）
+  timeout: 10h
+  env: *npc-env
+
+# 通用 NPC 事件 job 锚点（不含 DSH_MODEL，由各角色在 stages 中覆盖）
+.npc: &npc
+  - <<: *npc-job-base
+    stages:
+      - name: npc go
+        <<: *base-stage
+
+# ── 秘书团角色（顶层 key = 角色名，与 .cnb/settings.yml 的 npc.roles[].name 精确一致） ──
+# 平台在评论中 @dongdongxiaozu/zhuanyemishutuan(<角色名>) 按同名顶层 key 路由到对应 pipeline。
+# 7 个角色共享同一镜像与资源规格，仅按角色语义覆盖 DSH_MODEL（当前统一 deepseek-v4-flash）。
+
+"秘书·接待":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·秘书长":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·状态管理":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·会话":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·开发":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·评审":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+"秘书·测试":
+  issue.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+  pull_request.comment@npc:
+    - <<: *npc
+      stages:
+        - name: npc go
+          <<: *base-stage
+          env:
+            <<: *npc-env
+            DSH_MODEL: deepseek-v4-flash
+
+# $ 节点兜底：未指定角色名（@ 路径不带括号角色）或非角色 key 事件时，
+# 走默认角色「秘书·接待」——与 .cnb/settings.yml 的 npc.defaultRole 对齐。
+$:
+  issue.comment@npc: *npc
+  pull_request.comment@npc: *npc

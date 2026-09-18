@@ -10,3 +10,12 @@
 - 仅 push 文件 ≠ 创建 Issue：须用 `cnb issues create-issue` 在平台创建正式 Issue
 - 纯文本评论中的 @CodeBuddy 不触发 NPC：须带结构化 mentions（--data JSON）或 UI 编辑器 @ 提及
 - npc:go 承接需要 .cnb/settings.yml 角色定义 + .cnb.yml `$` 事件绑定（二者缺一不触发）
+## 新版 dsh 生态适配（2026-09-18 · Issue #16）
+
+- 旧版：平台内置 `npc:go` 执行器 + 评论 `[触发:<角色>]` 文本命中路由
+- 新版：接入 `cnpc/dsh` 镜像（`docker.cnb.cool/xqitw/docker/npc-dsh:latest`），
+  角色路由升级为平台原生「顶层 key = 角色名」
+- 落点：`.cnb/npc.yml`（新增，7 角色 × issue/PR 事件）、`.cnb.yml`（精简为 include）、
+  `AGENTS.md`（新增，项目级指令）、`docs/dsh-ecosystem-adaptation.md`（适配说明）
+- 触发：`@dongdongxiaozu/zhuanyemishutuan(<角色名>)`，未带角色名走 `$` 段兜底（秘书·接待）
+- 关键约束：`stage timeout: 10h` 必配（镜像无进程级超时兜底）
