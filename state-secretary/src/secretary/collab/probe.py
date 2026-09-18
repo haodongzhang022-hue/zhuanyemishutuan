@@ -204,12 +204,56 @@ def _lock_key_known(known: Any, scope: str) -> bool:
     只有"出现过"才敢把"当前未持有"读成"**已释放**"；否则只能判"没查到"→
     `unknown`（🔴E）。台账不给全量键（旧视图 / 手搓视图）时，**取保守方向**：
     按"没查到"处理（宁可多等一次，不可误放行）。
+
+    🔴-1（复评第 5 轮 · 🔴E 未修全）：**判据必须与"命中"同口径**。
+    命中（`_collect_lock_facts`）用 ``row["key"]`` **或** ``row["scope"]``，
+    但这里旧实现只拿 ``scope`` 去比 ``keys`` —— 而 ``keys`` 里只有**锁键**。
+    生产形态里 ``scope`` 是自然语言描述、``key`` 才是锁键：
+
+    - `ReviewArbiter`：键 ``S:review``，``scope="评审读锁（评审已有基线，…）"``
+    - `OwnershipManager`：``scope="状态卡写入"``
+
+    于是"已释放"在生产形态下**恒判不出**（永远 `unknown`）→ 等他的锁**永不放行**
+    （原 🔴E 的同族，只是从"误放行"翻成"永不放行"）。
+
+    修法（两处都接，缺一不可）：
+
+    1. ``keys`` 命中锁键 → 出现过；
+    2. ``scopes``（台账给出的 scope 名清单，与 ``keys`` **同源**）命中 scope →
+       出现过；
+    3. 视图只给映射形态（``{scope: key}`` / ``{key: scope}``）时同样认。
     """
-    if not isinstance(known, (list, tuple, set, frozenset)):
-        return False
     if not scope:
         return False
-    return scope in {str(k) for k in known}
+    wanted = str(scope)
+    if isinstance(known, (list, tuple, set, frozenset)):
+        if wanted in {str(k) for k in known}:
+            return True
+    if isinstance(known, dict):
+        # 手写视图的两种映射形态都认（取并集：键侧与值侧都算"出现过"）。
+        seen = set()
+        for k, v in known.items():
+            seen.add(str(k))
+            if isinstance(v, str):
+                seen.add(v)
+        return wanted in seen
+    return False
+
+
+def _lock_scope_known(scopes: Any, scope: str) -> bool:
+    """台账是否**出现过**这个 ``scope`` 名（与 `_lock_key_known` 对称）。
+
+    ``overview()`` 的 ``scopes`` 是**全量 scope 名**（含已释放/已回收），与
+    ``keys`` 同源。判定必须与"命中"（``row["key"]`` **或** ``row["scope"]``）
+    对称：只比 ``keys`` 会让生产形态（scope 是自然语言、key 才是锁键）恒判不出。
+    """
+    if not scope or not isinstance(
+            scopes, (list, tuple, set, frozenset, dict)):
+        return False
+    wanted = str(scope)
+    if isinstance(scopes, dict):
+        return wanted in {str(k) for k in scopes}
+    return wanted in {str(k) for k in scopes}
 
 
 def _judge_lock(facts: Dict[str, Any]) -> Any:
@@ -721,6 +765,16 @@ class CheckpointProbe:
                 pass
             return best
         if isinstance(value, dict):
+            # 🔴-2（复评第 5 轮 · 🟡1 未修全）：**dict 载荷同样要按归属过滤**。
+            # 字符串留痕分支有 `attributed(...)` 过滤，dict 分支却漏了 —— 而
+            # `ProbeEvent.to_dict()` **正是 dict 且必带 `checkpoint_key`**：
+            # 别的检查点的载荷（如 `{"checkpoint_key": "cpA", "checks_used": 6}`）
+            # 会被本检查点整份吸收 → 本检查点一上来就判「预算用尽」→
+            # `resume_required`（**误判用尽**）。
+            # 同族对照：`loop_guard` 的 dict 分支**有**这层过滤（口径不对称才是缺陷）。
+            # 口径与字符串分支**同源**（同一个 `attributed`）：不带该字段不表态。
+            if not attributed(value, "checkpoint_key", cp_key):
+                return None
             best: Optional[int] = None
 
             def _take(candidate: Any) -> None:
@@ -1000,6 +1054,12 @@ class CheckpointProbe:
 
         "查到过"的判据是台账给出的**全量锁键**（``keys``，含已释放/已回收的记录）：
         只有"这把锁曾经/正在台账里出现"才敢把"当前未持有"读成"已释放"。
+
+        🔴-1（复评第 5 轮）：判据必须与"命中"**同口径** —— 命中看 ``key`` **或**
+        ``scope``，那么"查到过"也必须两处都看。旧实现只拿 ``scope`` 比 ``keys``
+        （``keys`` 只含锁键）→ 生产形态（``scope`` 是自然语言描述、``key`` 才是锁键）
+        下"已释放"**恒判不出**，等他的锁**永不放行**。故这里同时接受
+        ``scopes``（台账同源给出的全量 scope 名）。
         """
         view = None
         if self._lock_view is not None:
@@ -1012,6 +1072,17 @@ class CheckpointProbe:
         scope = cp.scope or cp.key
         held = view.get("held") if isinstance(view, dict) else None
         known = view.get("keys") if isinstance(view, dict) else None
+        known_scopes = view.get("scopes") if isinstance(view, dict) else None
+
+        def _appeared() -> bool:
+            """这把锁是否**在台账里出现过**（键侧或 scope 侧任一命中即可）。
+
+            🔴-1：命中看两处，判据就必须看两处；只比 ``keys`` 会让生产形态
+            （scope 是自然语言）恒判不出。
+            """
+            return (_lock_key_known(known, scope)
+                    or _lock_scope_known(known_scopes, scope))
+
         if isinstance(held, list):
             for row in held:
                 if not isinstance(row, dict):
@@ -1024,7 +1095,7 @@ class CheckpointProbe:
                         "ttl_left_sec": row.get("ttl_left_sec"),
                     }
             return ({"lock_held": False, "holder": ""}
-                    if _lock_key_known(known, scope) else {"lock_held": None})
+                    if _appeared() else {"lock_held": None})
         # 兼容 `{key: {...}}` 形态（只含**持有中**的锁 → 未命中一律判"没查到"）
         if isinstance(held, dict):
             row = held.get(scope)
@@ -1033,7 +1104,7 @@ class CheckpointProbe:
                         "holder": (row or {}).get("holder", "")
                         if isinstance(row, dict) else ""}
             return ({"lock_held": False, "holder": ""}
-                    if _lock_key_known(known, scope) else {"lock_held": None})
+                    if _appeared() else {"lock_held": None})
         return None
 
     def _collect_version_fact(self, cp: Checkpoint) -> Optional[Dict[str, Any]]:

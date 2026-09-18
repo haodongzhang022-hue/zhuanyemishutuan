@@ -72,7 +72,16 @@
 **"明确红"的判定必须排除计数词**（🟡2）：`"577 passed, 0 failed"` 是**绿**，
 不是红 —— 旧实现按**子串**匹配，含 `failed` 就判红 → "允许重跑一次"的例外被
 **恒真激活**（等于默认放行）。现口径先把 `0 failed` / `0 errors` 这类
-**零个失败**整段抹掉再匹配关键词（`_ZERO_ISSUE_RE`）。
+**零个失败**整段抹掉再匹配关键词（`_ZERO_ISSUE_RE`）。口径覆盖四类写法
+（🔴-4 复评第 5 轮：只认"数字 0 开头"时 `no errors` / `errors: 0` / `1 xfailed` /
+`no failures` 仍判红 → "允许重跑一次"的例外被**恒真激活**）：
+
+| 形态 | 例 |
+|---|---|
+| 前置零计数 | `0 failed` / `0.0 errors` / `0% failures` |
+| 后置零计数 | `errors: 0` / `failures = 0` / `failed 0` |
+| 显式否定 | `no errors` / `no failures` / `without failures` / `zero errors` |
+| 预期失败 | `xfailed` / `xfail`（pytest 的**预期失败**不是不绿） |
 
 #### 2.4.1 判重台账的**跨容器载体**（🔴F：与 🔴A 同一方案）
 
@@ -85,13 +94,23 @@
 |---|---|
 | 留痕 | `RunScopeGuard.trail()/trails()` = `<!-- run-scope: {…} -->`，可贴进**评论正文** / 交接卡 `context`（容器会被回收，评论不会） |
 | 合并 | `adopt_trails(payload)`：`max()` 只增不减；**按 `session_id` 归属过滤**（留痕不带该字段时不表态） |
-| 回写 | CI 跑完把 `guard.trails(...)` 追加写回同一条 PR/Issue 评论（保留旧留痕） |
-| 入口 | `CNB_RUN_SCOPE_TRAIL`（跑前恢复）/ 门面 `run_scope_trail()` / `inherit_run_scope(payload)` |
+| 回写 | CI 跑完把 `guard.trails(...)` **追加**写回同一条 PR/Issue 评论（保留旧留痕**与各自归属**） |
+| 入口 | 跑前 `carrier.run_fetch()`（`scripts/collab-carrier.sh fetch`）/ 跑后 `carrier.run_writeback()`（`... writeback`）；门面 `run_scope_trail()` / `inherit_run_scope(payload)` |
+| 归属 | 会话号 = `CNB_SESSION_ID` → `CNB_REPO_SLUG` + PR/Issue 号（同一 PR = 同一会话，跨容器稳定）；**推导不出 → 不写回** |
 | 结论 | CI 必须落**真实结论**（`record_repeat(..., verdict=<rc 回填>)`）：不落结论 → "上一轮不绿才允许复跑"的例外永不成立 |
+
+**载体必须有生产者**（🔴-3 复评第 5 轮）：`CNB_RUN_SCOPE_TRAIL` / `CNB_SESSION_ID`
+此前**全库只有读**（`.cnb.yml` 的 `main.push` 段也没有 `env`/`imports`）→ 载体停在
+"提示词要求"，且跑完写回会把评论里**所有会话**的归属整段重写成 `""`
+（别的会话台账被继承 = **漏跑**；"红→修→再跑"被堵死）。现由
+`scripts/collab-carrier.sh` 在 `main.push` 里接成**可执行的生产者**（fetch / writeback），
+`trails()` 也**不得**改写未指定归属的记录（保留原 `session_id`）。
 
 **红后可复跑**（🔴F）：内容键只由"受影响面 + 命令"构成，而**修 bug 常常改的就是
 同一批文件**（受影响面不变）→ 若一律跳过，"红 → 修 → 再跑"这条**唯一有信息量**
-的路径就被自己的判重堵死。故上一次该内容**明确不绿**时允许复跑一次
+的路径就被自己的判重堵死。故上一次该内容**明确不绿**时允许复跑——
+**但复跑有上界**（`scan.max_rerun_on_failure`，默认 1 = 本节口径"一次"）：
+无上界时连续"修了仍红"会全 `run`（实测 5 轮），例外把判重自己架空
 （与 §2.4 判定优先级第 4 条同源）。
 
 ### 2.5 全量门禁：**默认全量根本不跑**（v0.3 新增）

@@ -75,6 +75,10 @@ scan:
   default_mode: "scan"
   max_identical_repeats: 1          # 同一口径只跑一次；第 2 次起跳过
   repeat_rerun_on_failure: true     # 仅"上一轮不绿"才允许同口径重跑
+  # 「不绿 → 复跑」的**上界**（🔴F 结转项，复评第 5 轮落上界）。
+  # 文档/修法一直写"复跑**一次**"，但实测**无上界**：连续 5 轮"修了仍红"→
+  # 全 `run`（同版本红重复亦同）→ 例外把判重自己架空。默认 1 = 文档口径。
+  max_rerun_on_failure: 1
   repeat_keys: ["mode", "revision", "impact", "command"]
   allow_stability_repeats: false    # 禁止"连跑 N 次"当稳定性论证
   stability_via: ["targeted_probe", "mutation_probe", "independent_scenario"]

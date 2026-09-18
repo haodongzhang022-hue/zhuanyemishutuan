@@ -1730,11 +1730,16 @@ class SecretarySession:
 
     def record_repeat(self, mode: str = "", revision: str = "",
                       impact: Any = None, command: str = "",
-                      verdict: str = ""):
-        """登记一次实际执行（同时更新"受审内容 → 历史版本数"台账）。"""
+                      verdict: str = "",
+                      session_id: str = ""):
+        """登记一次实际执行（同时更新"受审内容 → 历史版本数"台账）。
+
+        ``session_id``：归属（缺省用**本会话**）。留痕写出时据此归属——
+        🔴-3：旧实现让 CI 侧写回时归属恒空 → 评论里**所有会话**的归属被抹平。
+        """
         return self.run_guard.record_repeat(
             mode=mode, revision=revision, impact=impact, command=command,
-            verdict=verdict)
+            verdict=verdict, session_id=session_id or self.session_id)
 
     def content_repeats_of(self, mode: str = "", impact: Any = None,
                            command: str = "") -> int:

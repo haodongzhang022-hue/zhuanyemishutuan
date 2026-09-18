@@ -78,8 +78,13 @@ npc:
           新工作区，`<tmp>/run-scope` 从空开始 → 判重永不触发。故用
           `run_scope_trail()` 把 `<!-- run-scope: … -->` **追加写回同一条评论**，
           下一棒 `inherit_run_scope(评论正文)` 恢复（按 `session_id` 归属过滤）。
+          **载体必须由流水线自动写回**（🔴-3）：`scripts/collab-carrier.sh
+          fetch|writeback` 已接进 `.cnb.yml` 的 `main.push`；会话号由
+          `carrier.session_id_for()` 推导（`CNB_SESSION_ID` → `CNB_REPO_SLUG` +
+          PR/Issue 号）；**归属推导不出 → 不写回**（不得把别人的归属抹平）。
           **红后修复（同一文件集）允许复跑**——否则"红→修→再跑"这条唯一有信息量的
-          路径会被判重自己堵死。
+          路径会被判重自己堵死；**但复跑有上界**（`scan.max_rerun_on_failure`，
+          默认 1 = 文档"复跑一次"口径）：无上界时"修了仍红"会无限复跑。
         三点已确认（v0.8）：① **落点分工固定**——≤5min 挂 `cnb:await`、>5min 交 `crontab`，
           **不存在"一律挂 await"**（长等待挂单个 await = 押注对端一定 resolve，不 resolve 即死等）；
           ② `crontab` 间隔**固定 `*/5` 一档扫**，不随阶梯档位放大（与阶梯时间表解耦）；

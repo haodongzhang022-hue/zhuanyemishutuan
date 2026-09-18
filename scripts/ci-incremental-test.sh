@@ -19,9 +19,13 @@
 #   - **跨容器判重（🔴F，本轮）**：平台每次 push = **新容器、新工作区**，
 #     `<tmp>/run-scope` 每次都从空开始 → 判重永不触发（实测 r1/r2/r3 全 run）。
 #     故台账随**可持久载体**走（PR/Issue 评论正文，与 🔴A 同一方案）：
-#       ① 跑之前 `adopt_trails()` 从 `CNB_RUN_SCOPE_TRAIL`（评论正文）恢复；
+#       ① 跑之前 `adopt_trails()` 从 `CNB_RUN_SCOPE_TRAIL`（评论正文）恢复——
+#          **生产者**是 `scripts/collab-carrier.sh fetch`（落
+#          `CNB_RUN_SCOPE_TRAIL_FILE`，🔴-3：此前该变量全库只有读、没有生产者）；
 #       ② 跑之后 `record_repeat(..., verdict=<真实结论>)` + 打印
-#          `<!-- run-scope: … -->`，由流水线**追加写回同一条评论**。
+#          `<!-- run-scope: … -->` 并落 `CNB_RUN_SCOPE_NEW_TRAIL_FILE`，
+#          由 `scripts/collab-carrier.sh writeback` **追加写回同一条评论**
+#          （保留旧留痕与各自 `session_id` 归属）。
 #     CI 必须落**真实结论**（verdict）：否则"红→修→再跑"这条唯一有信息量的
 #     路径会被判重自己堵死（内容没变=同一份受审内容，结论为空=不绿不红）。
 #
@@ -148,6 +152,7 @@ event = sys.argv[7] if len(sys.argv) > 7 else ""
 sys.path.insert(0, os.path.join(pkg, "src"))
 try:
     from secretary.collab import RunScopeGuard, load_rules
+    from secretary.collab import carrier
 except Exception as exc:            # 依赖缺失 → 不因守卫坏了挡住干活
     print("[guard] 无法装载守卫（%s）→ 直接执行" % exc)
     sys.exit(0)
@@ -160,10 +165,24 @@ cmd = "pytest -q %s" % targets
 
 # 🔴F ①：从**可持久载体**（评论正文）恢复判重台账。平台每次 push 都是新容器，
 # 本地台账从空开始 → 判重永不触发；容器会被回收，**评论不会**。
+#
+# 🔴-3：载体入口有**两个生产者**（`scripts/collab-carrier.sh fetch` 落文件；
+# 调用方也可直接给 `CNB_RUN_SCOPE_TRAIL`）。会话号**必须有生产者**——
+# 旧实现只读 `CNB_SESSION_ID`（全库无生产者）→ 归属恒空 → 写回时把评论里
+# 所有会话的归属抹平（漏跑方向）。现按 `carrier.session_id_for()` 推导：
+# 显式 `CNB_SESSION_ID` → `CNB_REPO_SLUG` + PR/Issue 号 → 空（**不冒充**）。
 trail = os.environ.get("CNB_RUN_SCOPE_TRAIL", "")
+if not trail:
+    trail = carrier._read(os.environ.get("CNB_RUN_SCOPE_TRAIL_FILE")
+                          or carrier.DEFAULT_TRAIL_FILE)
+sid = carrier.session_id_for(os.environ)
+if not sid:
+    print("[guard] **告警**：归属推导不出（无 CNB_SESSION_ID 且无 PR/Issue 号）"
+          "→ 本次不落载体归属，跑后**不写回**（不得抹平别人的归属）")
 if trail:
-    got = guard.adopt_trails(trail, session_id=os.environ.get("CNB_SESSION_ID", ""))
-    print("[guard] 从留痕恢复（跨容器继承）：merged=%s" % got.get("merged"))
+    got = guard.adopt_trails(trail, session_id=sid)
+    print("[guard] 从留痕恢复（跨容器继承）：merged=%s session_id=%r"
+          % (got.get("merged"), sid))
 
 try:
     wr = int(window)
@@ -225,18 +244,30 @@ try:
 except Exception as exc:                       # 依赖缺失 → 不挡住干活
     print("[guard] 无法装载守卫（%s）→ 跳过登记" % exc)
     raise SystemExit(0)
+sys.path.insert(0, os.path.join(pkg, "src"))
+from secretary.collab import carrier          # noqa: E402  （上面已装载过）
 guard = RunScopeGuard(load_rules(search_from=pkg), data_dir=os.path.join(
     os.environ.get("CNB_RUN_SCOPE_DIR", "/tmp"), "run-scope"))
 trail_in = os.environ.get("CNB_RUN_SCOPE_TRAIL", "")
-sid = os.environ.get("CNB_SESSION_ID", "")
+if not trail_in:
+    trail_in = carrier._read(os.environ.get("CNB_RUN_SCOPE_TRAIL_FILE")
+                             or carrier.DEFAULT_TRAIL_FILE)
+# 🔴-3：会话号**必须推导**（旧实现只读无生产者的 `CNB_SESSION_ID`）
+sid = carrier.session_id_for(os.environ)
 if trail_in:
     guard.adopt_trails(trail_in, session_id=sid)
 guard.record_repeat(mode=scope, revision=rev, impact=targets,
-                    command="pytest -q %s" % targets, verdict=verdict)
-print("[guard] 已登记本次执行：verdict=%s" % verdict)
-# 可持久留痕（写回评论用；保留旧留痕，解析侧取 max + 按归属过滤）
+                    command="pytest -q %s" % targets, verdict=verdict,
+                    session_id=sid)
+print("[guard] 已登记本次执行：verdict=%s session_id=%r" % (verdict, sid))
+# 可持久留痕（写回评论用；保留旧留痕与**各自归属**，解析侧取 max + 按归属过滤）
 out = guard.trails(session_id=sid)
 if out:
+    # 🔴-3：落文件供 `scripts/collab-carrier.sh writeback` 追加写回**同一条评论**。
+    # 归属为空时**不写回**（`run_writeback` 会拒绝）——宁可这次不落载体，
+    # 也不把评论里别的会话的归属抹成空串（那是漏跑方向）。
+    carrier._write(os.environ.get("CNB_RUN_SCOPE_NEW_TRAIL_FILE")
+                   or carrier.DEFAULT_OUT_FILE, out)
     print("[guard] 写回评论的留痕（追加，勿删旧的）：")
     print(out)
 PYEOF

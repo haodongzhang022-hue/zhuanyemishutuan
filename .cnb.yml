@@ -104,7 +104,23 @@ main:
         #      （保留旧留痕；解析侧 `max()` + 按 `session_id` 归属过滤）。
         # 结论必须落**真实退出码**：否则"红→修→再跑"这条唯一有信息量的路径
         # 会被判重自己堵死（受影响面不变 = 同一份受审内容）。
+        #
+        # 🔴-3（复评第 5 轮）：**载体必须有生产者**。此前
+        # `CNB_RUN_SCOPE_TRAIL` / `CNB_SESSION_ID` 全库**只有读**（本文件也没有
+        # `env`/`imports`）→ 两个变量在生产链路上都无来源，F 停在"提示词要求"：
+        #   ① 归属恒为空 → 跑完写回把评论里**所有会话**的归属整段抹成 `""`
+        #      → 别的会话台账被本会话继承（**漏跑**）/ 红后复跑被堵死；
+        #   ② 留痕取不回 → 判重永不触发。
+        # 故这里把两步接成**可执行的生产者**（`scripts/collab-carrier.sh`）：
+        #   `fetch`     跑前取回载体评论正文里的 `<!-- run-scope: … -->`；
+        #   `writeback` 跑后把本次新留痕**追加**回**同一条评论**（保留旧留痕
+        #               与各自 `session_id` 归属）。
+        # 会话号由 `carrier.session_id_for()` 推导：`CNB_SESSION_ID` →
+        # `CNB_REPO_SLUG` + PR/Issue 号（同一 PR/Issue = 同一会话，跨容器稳定）；
+        # **推导不出 → 不写回**（宁可这次不落载体，也不抹平别人的归属）。
+        - ./scripts/collab-carrier.sh fetch
         - ./scripts/ci-dispatch.sh
+        - ./scripts/collab-carrier.sh writeback
 
 # Issue / PR 评论触发（**只做秘书接待，不做测试**）
 # —— 防跨仓污染的直接堵口：评论类事件**没有基线、也没有变更集**，

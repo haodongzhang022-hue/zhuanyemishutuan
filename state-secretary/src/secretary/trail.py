@@ -38,12 +38,23 @@ def trail_re(marker: str) -> "re.Pattern[str]":
                       re.S)
 
 
-def collect_marked(text: Any, marker: str,
-                   max_depth: int = MAX_TRAIL_DEPTH) -> List[dict]:
+def collect_marked(text: Any, marker: str) -> List[dict]:
     """收集正文里**全部**留痕（顺序保留；坏 JSON 跳过，不炸）。
 
     只做"收集"这一件事 —— 合并语义（`max()` / 取或）留给各调用方，
     因为熔断轮次与探测次数合并的字段不同。
+
+    🟢-1（复评第 5 轮）：**删掉死形参 `max_depth`**。旧签名有
+    ``max_depth: int = MAX_TRAIL_DEPTH``，但函数体从不读它 ——
+    ``collect_marked(text, marker, 0)`` 与默认结果完全一致（形参存在却不生效，
+    正是本仓库反复治的形态："读了不生效 / 声明了不接线"）。
+
+    深度边界**不是**没有，而是**不在这里**：本函数只按标记正则取片段，
+    片段自身的嵌套深度由 `json.loads` 处理（超界抛 `RecursionError`，
+    已捕获 → 跳过该片段，不炸）；跨仓载荷的**语义**深度上界在消费侧
+    （`probe._coerce_checks_used` / `loop_guard._coerce_budget_payload`
+    的 `MAX_TRAIL_DEPTH`）。删形参而不是"补个假用"：后者会造出第二份
+    语义源，与本仓库"单一语义源"的口径冲突。
     """
     if not isinstance(text, str) or not text.strip():
         return []

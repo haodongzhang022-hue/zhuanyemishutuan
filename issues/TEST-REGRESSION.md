@@ -1385,3 +1385,42 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - §21（第 5 轮）未涉及本三项；本轮为**第 3 次打回后的定点修**（§19 `2be6a3d`、
   §20 `ed62088`、§21 `a7847f9`、本轮）——按协作纪律，若下轮仍有 🔴 残留，
   由评审按 `blocked` 上报总师裁定。
+
+## 23. PR #15 复评第 5 轮回转卡定点修复（🔴-1…🔴-4 · 基线 `11614ae`）
+
+> 触发：架构·评审 第 5 轮复评（对象 `a7847f9..d22f6d7`）→ `fix_bug`，
+> **🔴 未清零、达打回上界（标 blocked）**。回转卡列 4 项 🔴，均为**局部定点改动**。
+> 本轮为**同一被打回方第 3 次打回**后的返工；🟡4 / 🟢-1 / 红后复跑上界三项按卡要求
+> 给口径（见 §23.3）。
+
+### 23.1 🔴 四项（独立探针复现 → 修复后复测）
+
+| 项 | 缺陷（评审实测） | 修法 | 独立复测 |
+|---|---|---|---|
+| 🔴-1 | `_lock_key_known(known, scope)` 拿 **scope** 去比 **keys**（keys 只含锁键）→ 生产形态（`ReviewArbiter` 键 `S:review` / `scope="评审读锁（…）"`、`OwnershipManager` `scope="状态卡写入"`）"已释放"**恒判不出** → 等他的锁**永不放行**（原 🔴E 同族，从"误放行"翻成"永不放行"） | `_collect_lock_facts` 命中看 `key` **或** `scope`，判据就必须**同口径**：新增 `_lock_scope_known()`；`overview()` 补**全量 `scopes`**（与 `keys` 同源）；`_lock_key_known` 另认 `{scope: key}` 映射形态 | 持有 → `wait`；**已释放 → `proceed`**（基线 `a7847f9`/`11614ae` 同场景 `unknown`）；**未登记 scope 仍 `unknown`**（不得放宽成放行） |
+| 🔴-2 | `_coerce_checks_used` 的 **dict 分支无归属过滤**（字符串留痕分支有）→ 别人的 `ProbeEvent.to_dict()`（必带 `checkpoint_key`）被整份吸收 → 本检查点直接 `resume_required`（误判用尽） | dict 分支补 `attributed(value, "checkpoint_key", cp_key)`（与字符串分支**同一实现**）；不带归属的载荷仍保留（"不表态 ≠ 属于别人"） | 别人 cpA 事件载荷(6) → 本 cpB **`None`**（旧 `6`）；自己的 → `2`；不带归属 → `6`；**两分支结论一致** |
+| 🔴-3 | `CNB_SESSION_ID` / `CNB_RUN_SCOPE_TRAIL` **全库无生产者**（只有读），`main.push` 段无 `env`/`imports` → 载体停在提示词；`trails(session_id="")` 把评论里**所有会话**归属重写成 `""` → 别的会话台账被继承（**漏跑**）/ 红后复跑被堵死 | ① `trails()/trail()` **保留原归属**（`_owner_of`：显式 → 记录自带 → **不带该字段**，绝不用空串冒充）；② 新增 `collab/carrier.py`（`fetch`/`writeback` + `session_id_for` 推导）+ `scripts/collab-carrier.sh`，并**接进 `.cnb.yml` 的 `main.push`**；③ CI 侧归属为空**不写回**（告警） | CI 往返后 A/B 归属**原样保留**、`"session_id": ""` 不出现；第三会话 `merged=0` 且判定 `run`（旧 `skip_duplicate` = 漏跑）；A 红 + B 绿 → **`run`**（旧被堵死）；`.cnb.yml` 真有 fetch/writeback 生产者 |
+| 🔴-4 | `_ZERO_ISSUE_RE` 只匹配**数字 0 开头** → `"577 passed, no errors"` / `"errors: 0"` / `"1 xfailed"` / `"no failures"` 仍判红 → "允许重跑一次"的例外**恒真激活** | 零计数口径扩为四类：前置零计数 / 后置零计数 / 显式否定（`no`/`without`/`zero`）/ 预期失败（`xfail(ed/s)`） | 四类变体全 **`False`**（旧全 `True`）；**真失败仍红**（`2 failed` / `errors: 1` / `3 xfailed, 1 failed` / `0 errors, 3 failed`）；端到端 `"577 passed, no errors"` → 重跑仍 `skip_duplicate` |
+
+### 23.2 结转三项口径（回转卡要求"回一句口径"）
+
+| 项 | 口径 | 落地 |
+|---|---|---|
+| 🟡4 显式规则包路径不同源 | **结转**（本轮不修） | 已复现：`ReviewArbiter` **无 `rules_path` 形参**（只有 `retry_delay_sec`），故"显式规则包 → 独立构造"这条路径本轮不接；与会话路径同源只对"从数据根向上找得到规则包"成立。**登记待收口**（补形参属接口扩张，宜与总师口径一并定） |
+| 🟢-1 死形参 `max_depth` | **回退（删除）** | `collect_marked(text, marker)` 删除 `max_depth`——形参存在却不生效正是本仓库反复治的形态；"补个假用"会造出第二份语义源，与单一语义源冲突。深度边界仍在消费侧（`MAX_TRAIL_DEPTH`）+ `json.loads` 的 `RecursionError` 兜底 |
+| 🔴F 红后复跑无上界 | **落上界** | 新增规则 `scan.max_rerun_on_failure`（默认 **1** = 文档"复跑一次"口径），组织级 + 仓库级两份规则包同步；`decide()` 与 `decide_repeat()` **同一口径**。实测连续"修了仍红"：旧全 `run`（5 轮）→ 现 `run, run, skip×3`；上界设 0 → 不绿也不复跑（判别性对照） |
+
+### 23.3 自测
+
+- `pytest -q`：**994 passed**（基线 `11614ae` 944 + 本轮新增
+  `test_collab_round7_fixes_issue14.py` **50** 项）。
+- **判别力验证**（把本轮新测试放到**基线 `11614ae`** 上跑）：**25 failed / 25 passed**
+  —— 失败项正是本轮要修的 🔴-1/🔴-2/🔴-3/🔴-4 + 结转两项（不是恒真断言）。
+- `compileall src` OK；`pyflakes`（本轮改动文件 + 新文件）**0 告警**。
+- YAML：`.cnb.yml` / `shared/collab/collab-rules.yaml` / `shared/collab/organization.yaml` 语法 ✅。
+- **CI 端到端**（脚本实跑，非模拟）：容器1 `run` + 落留痕文件 → 容器2（新目录 = 新容器）
+  `skip_duplicate`（`merged=1` 从载体恢复）；会话号推导 `org/repo#15`。
+- **平台事实核对**（查证官方文档，非凭印象）：
+  `imports` / `env` 的优先级与用法（`/zh/build/env.md`）、`volumes: copy-on-write`
+  （`/zh/build/pipeline/grammar.md`）、PR 评论 API（`PATCH /{repo}/-/pulls/{n}/comments/{id}`，
+  `repo-notes:rw`）——载体写回按"**追加到同一条评论**"实现（PATCH，不新建评论）。

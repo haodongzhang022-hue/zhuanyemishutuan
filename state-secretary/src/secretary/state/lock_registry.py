@@ -682,6 +682,12 @@ class LockRegistry:
             # 跨仓不可见 → 判不出，继续等）。缺了它，两者会被读成同一件事，
             # 且都取放行方向（🔴E：等他的锁最怕的误放行）。
             "keys": sorted(all_locks),
+            # **全量 scope 名**（含已释放 / 已回收）：与 `keys` **同源**。
+            # 探测侧"查到过"的判据必须与"命中"同口径（命中看 key **或** scope），
+            # 而生产形态里 scope 是自然语言描述（如"评审读锁（评审已有基线，…）"）、
+            # key 才是锁键（如 `S:review`）。只给 `keys` → 探测侧拿 scope 去比锁键
+            # → "已释放"**恒判不出** → 等他的锁永不放行（🔴-1 复评第 5 轮）。
+            "scopes": sorted({r.scope for r in all_locks.values() if r.scope}),
             "held": [{
                 "key": r.key,
                 "kind": r.kind,

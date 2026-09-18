@@ -66,6 +66,11 @@ DEFAULT_PROBE_CHECKS = ["confirm", "lock", "version", "event", "resource"]
 # 审查范围默认档位 + 同口径重复执行上界（Issue #14：只跑增量、不连跑同一口径）
 DEFAULT_SCAN_MODE = "scan"                   # 日常默认=增量（除大版本外一律增量）
 DEFAULT_MAX_IDENTICAL_REPEATS = 1            # 同一口径只跑一次；第 2 次起跳过
+#: 「上一轮不绿 → 允许复跑」的**上界**（🔴F 结转项，复评第 5 轮落上界）。
+#: 文档/修法一直写"复跑**一次**"，实测却是**无上界**：连续 5 轮"修了仍红"→
+#: 全 `run`（同版本红重复亦同）。"红→修→再跑"要有信息量，前提是**修**了；
+#: 无上界等于把判重交给"永远还能再试一次"。故落成可配置上界（默认 1 = 文档口径）。
+DEFAULT_MAX_RERUN_ON_FAILURE = 1
 DEFAULT_REPEAT_KEYS = ["mode", "revision", "impact", "command"]
 DEFAULT_STABILITY_VIA = ["targeted_probe", "mutation_probe", "independent_scenario"]
 
@@ -231,6 +236,9 @@ class CollabRules:
     max_identical_repeats: int = DEFAULT_MAX_IDENTICAL_REPEATS
     # 仅当上一轮结论"不绿"时才允许同口径重跑（红→修→再跑是有信息的）
     repeat_rerun_on_failure: bool = True
+    # 「不绿 → 复跑」的**上界**（默认 1 = 文档口径"复跑一次"；🔴F 结转项）。
+    # 无上界 = "修了仍红"可以无限复跑 → 判重被自己的例外架空。
+    max_rerun_on_failure: int = DEFAULT_MAX_RERUN_ON_FAILURE
     # 判"同一口径"的比较键
     repeat_keys: List[str] = field(default_factory=lambda: list(DEFAULT_REPEAT_KEYS))
     # 是否允许"连跑 N 次同一命令"当稳定性论证（默认禁止：跑法固定 → 无判别力）
@@ -319,6 +327,7 @@ class CollabRules:
                 "default_mode": self.scan_default_mode,
                 "max_identical_repeats": self.max_identical_repeats,
                 "repeat_rerun_on_failure": self.repeat_rerun_on_failure,
+                "max_rerun_on_failure": self.max_rerun_on_failure,
                 "repeat_keys": list(self.repeat_keys),
                 "allow_stability_repeats": self.allow_stability_repeats,
                 "stability_via": list(self.stability_via),
@@ -427,6 +436,8 @@ class CollabRules:
                 scan.get("max_identical_repeats"), DEFAULT_MAX_IDENTICAL_REPEATS)),
             repeat_rerun_on_failure=_as_bool(
                 scan.get("repeat_rerun_on_failure"), True),
+            max_rerun_on_failure=max(0, _as_int(
+                scan.get("max_rerun_on_failure"), DEFAULT_MAX_RERUN_ON_FAILURE)),
             repeat_keys=_str_list(scan, "repeat_keys", DEFAULT_REPEAT_KEYS),
             allow_stability_repeats=_as_bool(
                 scan.get("allow_stability_repeats"), False),
@@ -814,6 +825,7 @@ _OVERRIDABLE_FIELDS = (
     "scan_keywords", "probe_checks",
     # 审查范围：日常只跑增量、同口径不重复（Issue #14 追问）
     "scan_default_mode", "max_identical_repeats", "repeat_rerun_on_failure",
+    "max_rerun_on_failure",
     "repeat_keys", "allow_stability_repeats", "stability_via",
     # 全量门禁（Issue #14 本轮）
     "repeat_scope", "blocked_events", "pipeline_allowlist",
