@@ -354,23 +354,64 @@ class TestFusedFlagConservative:
 # ==================================================================
 
 class TestCoercionDepthBound:
-    DEEP = "{" + '"a":{' * 3000 + "}" * 3000
+    """深度上界：深嵌套**不得**逃逸 ``RecursionError``。
+
+    🟡（复评第 4 轮）**旧用例无判别力，已换**：原先的
+    ``DEEP = "{" + '"a":{' * 3000 + "}" * 3000`` 是**非法 JSON**
+    （内层引号未转义）→ 走 ``json.loads`` 的 ``ValueError`` 分支，
+    **基线 `ed62088` 同样**返回"判不出"。合法 3000 层 JSON 在两边
+    ``json.loads`` 也会抛 ``RecursionError``（基线直接逃逸到门面）。
+    故判别性判据换成：**合法**深嵌套（内层 3000 层 dict）——基线
+    `RecursionError` 逃逸、本轮不抛；以及真正**递归**的形态
+    （内嵌 ``budget_trail`` 链）——解析结果与基线一致（逐层取内层）。
+    """
+    #: **合法**的极深 JSON（内层 3000 层 dict）→ `json.loads` 抛 `RecursionError`
+    DEEP_VALID = '{"a":' * 3000 + '1' + '}' * 3000
+    #: 旧用例形态（**非法 JSON**）：保留作"坏载荷不炸"的对照
+    DEEP_INVALID = "{" + '"a":{' * 3000 + "}" * 3000
+
+    def test_legal_deep_json_does_not_escape(self, tmp_dir):
+        """**合法**深嵌套：基线 `ed62088` 抛 `RecursionError` 逃逸，本轮按判不出。"""
+        import json as _json
+        with pytest.raises(RecursionError):      # 前提成立（真深，不是形状像）
+            _json.loads(self.DEEP_VALID)
+        g = LoopGuard(SESSION, data_dir=tmp_dir)
+        assert g.adopt_budget(self.DEEP_VALID)["merged"] is False
+        # 外层是合法 JSON（内嵌 budget_trail）：外层可解析 → 合并成立，
+        # 但**内层深载荷判不出** → 不采纳任何轮次（`round_no` 仍为 0）。
+        wrapped = g.adopt_budget(
+            _json.dumps({"budget_trail": self.DEEP_VALID}))
+        assert wrapped["adopted"]["round_no"] == 0
+        assert SecretarySession(SESSION, data_dir=tmp_dir).inherit_budget(
+            self.DEEP_VALID)["merged"] is False
+
+    def test_nested_trail_chain_parses_layer_by_layer(self, tmp_dir):
+        """**真正递归**的形态：内嵌 ``budget_trail`` 链逐层解析（深度 ≤ 上界）。"""
+        import json as _json
+        payload = _json.dumps({"rounds": {"total": 9}})
+        for _ in range(3):
+            payload = _json.dumps({
+                "budget_trail": "<!-- loop-budget: " + payload + " -->",
+                "rounds": {"total": 1}})
+        g = LoopGuard(SESSION, data_dir=tmp_dir)
+        assert g.adopt_budget(payload)["adopted"]["round_no"] == 9
 
     def test_adopt_budget_does_not_raise(self, tmp_dir):
         g = LoopGuard(SESSION, data_dir=tmp_dir)
-        assert g.adopt_budget(self.DEEP)["merged"] is False
-        assert g.adopt_budget('{"budget_trail": "' + self.DEEP + '"}')["merged"] is False
+        assert g.adopt_budget(self.DEEP_INVALID)["merged"] is False
+        assert g.adopt_budget(
+            '{"budget_trail": "' + self.DEEP_INVALID + '"}')["merged"] is False
 
     def test_facade_and_shared_do_not_raise(self, tmp_dir):
         sec = SecretarySession(SESSION, data_dir=tmp_dir)
-        assert sec.inherit_budget(self.DEEP)["merged"] is False
-        dis = dispatch_shared({"verdict": WAIT, "next_delay_sec": self.DEEP})
+        assert sec.inherit_budget(self.DEEP_INVALID)["merged"] is False
+        dis = dispatch_shared({"verdict": WAIT, "next_delay_sec": self.DEEP_INVALID})
         assert dis["action"] in ("platform_await", "platform_crontab")
         assert dis["wake_allowed"] is False
 
     def test_checks_used_deep_payload_is_none(self, tmp_dir):
         p = CheckpointProbe(SESSION, data_dir=tmp_dir, clock=FakeClock())
-        assert p._coerce_checks_used(self.DEEP) is None
+        assert p._coerce_checks_used(self.DEEP_INVALID) is None
         assert MAX_COERCE_DEPTH >= 1
 
     def test_reverse_shallow_payload_still_read(self, tmp_dir):

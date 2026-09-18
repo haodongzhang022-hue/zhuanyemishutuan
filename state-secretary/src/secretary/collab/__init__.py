@@ -26,6 +26,7 @@ from .backoff import (
 )
 from .probe import (
     ALL_CHECKS,
+    MAX_COERCE_DEPTH,
     ALL_DRIVERS,
     ALL_VERDICTS,
     CHECK_CONFIRM,
@@ -182,6 +183,10 @@ __all__ = [
     "CRON_FIXED_EXPR",
     "DRIVER_ROLE",
     "TWO_WAY_SPLIT_NOTE",
+    # 🟡（复评第 4 轮）：深度上界**单一语义源**的出口对齐——
+    # `loop` 包此前导出了 `MAX_COERCE_DEPTH`，`collab` 包没导出（同一份上界
+    # 两个包各暴露一半）。此处补齐，值 = `secretary.trail.MAX_TRAIL_DEPTH`。
+    "MAX_COERCE_DEPTH",
     "probe_verdict_of",
     "cron_expr_for",
     "dispatch_shared",

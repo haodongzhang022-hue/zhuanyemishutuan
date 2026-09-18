@@ -286,6 +286,7 @@ probe:
 | 合并 | `probe(key, external_checks=…)` / `adopt_checks_budget()`：`max()` 只增不减，且在"是否用尽"判定**之前**合并 |
 | 留痕 | `ProbeEvent.budget_trail` = `<!-- probe-budget: {…} -->`，可贴进**评论正文** / 交接卡 `context` / 事件载荷（容器会被回收，评论不会） |
 | **取全部** | 正文里留痕会**累积多条**（每棒写回）→ 解析取**全部留痕的 `max()`**，**不是第一条**；"留痕在前/在后"两种顺序结果一致（🔴1） |
+| **通道合并** | 留痕通道与载荷通道（`checks_used` / `external_checks` / `used` / `rounds` / 内嵌 `budget_trail`）**一起取 `max()`**——**任一通道都不得"命中即 return"**（🔴1 残留：`trail(2)+{"checks_used":5}` 曾读成 2，`budget_trail` 展开曾是死代码） |
 | 回写 | `dispatch()` 返回值统一带 `budget_trail`；接收方**追加写回同一条评论**（口径见下），下一棒据此恢复 |
 | 接线 | `.cnb.yml` 的 `probe_task` 明列三步：取上次留痕 → 合并 → 写回评论 |
 
@@ -303,8 +304,26 @@ probe:
 同族口径见 §2.1（熔断轮次）：`LoopGuard.budget_payload()` / `budget_trail()` /
 `adopt_budget()`，门面入口 `review_round(external_rounds=…)` /
 `inherit_budget(…)` / `loop_budget_trail()`。解析侧口径函数
-`loop_guard.extract_json_objects()` / `pick_wake_object()`：静默交接判定
-**优先取含 `wake` 的对象**（拼接顺序无关）。
+`loop_guard.extract_json_objects()` / `pick_wake_object()`：
+
+- **留痕与载荷必须合并**（🔴1 残留）：正文里"留痕段 + 不带内嵌留痕的卡"是
+  常见形态，故留痕解析**不得**在"读到 `rounds` 就 return"——两条通道
+  一律 `max()` 互补合并（`fused` / `budget` / `reason` 同）；
+- **静默判定保守且确定**（🔴2）：`pick_wake_object()` 不再"首个含 `wake` 者胜"
+  （那会让**卡+卡顺序决定结论**，一个方向是 fail-open）。现口径：
+  **任一对象的 `wake` 非严格 `True` → 判静默**；需要具体对象时取
+  **追加顺序里最后一张卡**（正文是追加写的 → 后者更晚）；
+- **正文扫描单次线性**（🔴5）：`extract_json_objects()` 走
+  `secretary.trail.scan_json_spans()`（一次扫描 + 有界修复）——
+  未闭合 `{` 不再"每个起点重扫文末"（`"{"×40000` 从 63 s → 毫秒级）；
+  未配平的起点不产片段，但**不影响它后面**能配平的起点
+  （"前面有未闭合花括号"不得把后面的静默卡整段丢掉）。
+
+**await 片的键名映射**（🟡2 收口）：≤5min 落点的 `trigger.env` 显式给出
+`CHECKPOINT_AWAIT_KEY`（= 本次轮次 key `probe:<key>:r<n>`，与 `.cnb.yml` 的
+`cnb:await.options.key: $CHECKPOINT_AWAIT_KEY` **同名同源**）与 `CHECKPOINT_KEY`；
+即"平台侧按 key 注入"这条不再只是事件名层面的口径——**键名映射写在落点里**，
+await 片读到的 key 与本次探测生成的 key 是同一个（`trigger.key_env` 标注变量名）。
 
 **接线**：长等待由 `.cnb.yml` 顶层的 `crontab` 配置真正接到平台
 （`cron: "*/5 * * * *"` + `event: api_trigger_probe_check`；平台约束：仅支持明确

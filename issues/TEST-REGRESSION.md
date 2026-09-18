@@ -1211,6 +1211,11 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 
 ## 二十、PR #15 复评第 4 轮定点修复（🔴1–🔴4 + 🟡1–🟡5）
 
+> ⚠️ **本节 🔴1 / 🔴2 两行结论已被实测推翻，请看 §22.5 的更正**（复评第 4 轮实测）：
+> 🔴1 的 ①「有 `rounds` 就提前 return」**仍在**（`trail(3)+card(6)` → `round_no=3`）；
+> 🔴2 当时是「首个含 `wake` 者胜」（**卡+卡顺序决定结论**，一个方向 fail-open）。
+> 两行原文的「已清零」只表示当轮做了修复动作，**不等于判据成立**。
+
 > 触发：架构·评审 复评第 3 轮（基线 `ed62088`）判 `fix_bug`——**🔴 未清零，不转测试**。
 > 本轮只动 `89d48bd..ed62088` 的**新增/改动行**，修复提交见本 PR 最新 commit。
 
@@ -1306,3 +1311,77 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   🟡5 用尽后磁盘 `checks_used=6`。
 - CI 脚本**端到端模拟**（同一受审内容连跑 3 个"新容器"）：容器 1 `run` +
   留痕 → 容器 2/3 `skip_duplicate`（旧实现三个容器全 `run`）。
+
+---
+
+## 22. PR #15 复评第 4 轮定点修复（🔴1 / 🔴2 / 🔴5 · 基线 `a7847f9`）
+
+> 触发：架构·评审 复评第 4 轮（对象 `a7847f9`）判 `fix_bug`——🔴3/🔴4 认可清零，
+> **🔴1 / 🔴2 有可达残留**，并新增 **🔴5 性能回归**。本轮只动这三项 + 5 项 🟡 收口。
+> 复评口径（评审指定）：`inherit_budget(trail+card)` → `6/True/False`、
+> `_coerce_checks_used(trail2+载荷5)` → `5`、卡+卡两序同结论、`"{"×20000` 耗时。
+
+### 22.1 🔴 三项
+
+| 项 | 缺陷（评审实测） | 修法 | 判别性回归（+ 反向对照） |
+|---|---|---|---|
+| **🔴1a** 留痕 ↔ 载荷**不合并**：`_coerce_budget_payload` ① 读到 `rounds` 就 `return merged` → ②③④ 全跳过；「留痕段 + 不带内嵌留痕的卡」形态下**卡的轮次读不到**（实测 `trail(3)+card(6)` → `round_no=3`，**比"只给卡"的 6 还差**） | `loop_guard.py`：① 的 early return 删除，`merged` 只作**初始值**参与合并；④ 不再以"`got` 有没有 `rounds`"为条件，两通道一律 `_merge_budget_dicts([got, merged])`（`fused`/`budget`/`reason` 同） | `TestBudgetTrailMergesWithPayload`（`inherit_budget` → `6/True/False`；`from_handoff` 同结论；**两序一致**）/ **反向**：只给留痕 → 3、只给卡 → 6（加留痕不得更差） |
+| **🔴1b** `_coerce_checks_used` dict 分支**首个键命中即 return** → `trail(2)+{"checks_used":5}` 读成 2；`{"checks_used":2,"budget_trail":trail(5)}` 读成 2（新增的 `budget_trail` 展开在真实路径上是**死代码**：`ProbeEvent.to_dict()` 必带 `checks_used`） | `probe.py`：三条键 + `rounds` + 内嵌 `budget_trail` **各自取值后统一 `max()`**；**正文串分支**同样合并（原先只扫留痕 → `trail(2)+{"checks_used":5}` 丢载荷），散落对象走 `trail.json_objects_in()`（与 `loop_guard` 同一份扫描） | `TestChecksUsedMergesAllChannels`（3 组 → 5；`ProbeEvent.to_dict()` 形态 → 4；`probe(external=trail2+载荷5)` → **6**）/ **反向**：只给留痕 → 2 |
+| **🔴2** `pick_wake_object` 取**第一个**含 `wake` 的对象 → **卡+卡顺序决定结论**：`[True,False]` → 放行（fail-open）、`[False,True]` → 熔断；基线 `ed62088` 同结论 → docstring/文档宣称的"顺序无关"被证伪 | `loop_guard.py`：口径改**保守 + 确定**——**任一对象的 `wake` 非严格 `True` → 判静默**（与 `parse_wake` 的"判不出 → 保守静默"同向）；需要具体对象时取**追加顺序里最后一张卡**（正文是追加写的 → 后者更晚，即显式定义的"最新"判据） | `TestPickWakeObjectIsConservative`（卡+卡两序**同结论**＝熔断；坏值 `"false"` + `True` 两序也同结论；多静默卡取最后一张）/ **反向**：单张 `wake=True` 不熔断、多张 `True` 不熔断、不带 `wake` → `None` |
+| **🔴5** `extract_json_objects` 在未闭合 `{` 上 **O(n²)**（`_balanced_object_end` 从每个 `{` 重扫文末）：`"{"×20000` → 15.8 s、`×40000` → 63.3 s、`"if (x) {"×3000` → 3.0 s；**基线 `ed62088` 同路径 3 ms**（本轮引入的回归，4 个数量级）；该函数在 `from_handoff` / `adopt_budget` / `_coerce_checks_used` **主路径**上，评论正文是不可信输入 | 扫描实现收敛到 `secretary/trail.py`（**单一实现**）：`scan_json_spans()` = **一次线性主扫描（栈配对 + 字符串状态）** + **有界修复**（对"字符串区间"重扫以补齐旧实现能捞到的起点；区间数与字符量各有上界，超界收摊）。未配平的起点**不产片段、也不重扫**（平方来源），但**不影响其后**能配平的起点 | `TestScanIsLinear`（`"{"×20000 / ×40000`、`"if (x) {"×3000` 均 **< 1 s**；×10 规模不平方）/ **反向**：未闭合前缀**不得**把其后的静默卡整段丢掉（fail-open 方向），正常正文（对象 + 留痕 + 括号字符串）逐字不变 |
+
+### 22.2 🟡 五项收口
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 🟡1 `DEEP` 用例**无判别力**（非法 JSON → 走 `ValueError` 分支，基线同样"判不出"；合法 3000 层 JSON 两边都 `RecursionError`） | 用例换成**合法**深嵌套（内层 3000 层 dict，基线 `RecursionError` **逃逸到门面** → 本轮按判不出）+ **真正递归**形态（内嵌 `budget_trail` 链逐层解析） | `TestCoercionDepthBound::test_legal_deep_json_does_not_escape`（先断言 `json.loads` 真抛 `RecursionError`，再断言门面/`adopt_budget` 不抛）/ `test_nested_trail_chain_parses_layer_by_layer`（深度 ≤ 上界时逐层合并到 `round_no=9`）/ **反向**：浅载荷仍被读到 |
+| 🟡2 `MAX_COERCE_DEPTH` **两处各写一份**（`loop_guard` / `probe`），`loop` 包导出了、`probe` 的没导出 | 上界**唯一定义处** = `secretary.trail.MAX_TRAIL_DEPTH`；两处只保留**指向它**的兼容别名（`MAX_COERCE_DEPTH = MAX_TRAIL_DEPTH`，不再 `as` 改名）；`collab` 包补齐导出 | `TestDepthBoundSingleSource`（`is` 同一对象；两个包都能取到同一个） |
+| 🟡3 `_merge_budget_dicts` 的 `reason` / `budget` 是"**首个非空胜**" → 顺序相关；`budget` 取首个会把 `max_rounds` **盖小**（`[3,9]` → 3）而 `rounds` 已 `max()`（两字段互相矛盾） | `reason` 取**已熔断载荷里最长**的一条（并列取字典序最小 → 完全顺序无关）；`budget` **逐字段 `max()`**（新增 `_merge_budget_values`） | `TestReasonAndBudgetMergeAreOrderIndependent`（两序 `reason` 同、`budget.max_rounds` → 9、`rounds.total` 仍 `max`） |
+| 🟡4 await 落点**只带 `key`、无 `env`**：`.cnb.yml` 的 await 片读 `$CHECKPOINT_AWAIT_KEY`，而落点产出的 key（`probe:<k>:r<n>`）**没人注入**那个变量 → "接线"停在事件名层面 | 落点 `trigger.env` 显式给出**键名映射**：`CHECKPOINT_AWAIT_KEY`（= 本次轮次 key，与 `.cnb.yml` **同名同源**）、`CHECKPOINT_KEY`、`PROBE_VERDICT`；另加 `trigger.key_env` 标注变量名 | `TestAwaitKeyIsWiredToPipeline`（`env.CHECKPOINT_AWAIT_KEY == trigger.key` 且以 `probe:c2:r` 开头；`.cnb.yml` 确实读该变量）/ **反向**：crontab 落点**不带** await 片的环境注入（落点互斥不混用） |
+| 🟢 `extract_json_object` 无调用方（仅 re-export） | **保留并写明原因**：对外稳定 API（`secretary.loop.__all__` 导出），语义 = "取第一个顶层对象"，与 `extract_json_objects()[0]` **同源实现**（不另写一份扫描）；内部判定一律走"取全部 + `pick_wake_object`" | `TestExtractJsonObjectRetention`（与 `extract_json_objects()[0]` 同值；空/非串 → `None`） |
+
+### 22.3 与旧实现的**差分对照**（防"修一个坏一个"）
+
+- `scan_json_spans` vs `a7847f9` 的 `extract_json_objects`：**4518 组**用例
+  （手写边界 + 4000 组随机花括号/引号/转义串 + 500 组"卡 + 留痕 + 未闭合 `{`"混合）
+  逐组比对对象清单 → **差异 0**。
+- `scan_json_spans` vs **基线 `ed62088`** 的 `extract_json_object`（按旧口径
+  "从左到右反复取第一个"复现）：差异仅出现在**未配平起点自身**（旧实现从
+  `start+1` 重扫，新实现不重扫）——正是平方复杂度来源；真实正文形态（对象 +
+  留痕 + 差量片段）**逐字节一致**。
+
+### 22.4 自测
+
+- `pytest -q`：**944 passed**（基线 `a7847f9` 909 + 本轮新增
+  `test_collab_round6_fixes_issue14.py` **33** 项 + 第 4 轮文件改判净 +2），连跑 3 次稳定。
+- **判别力验证**（把本轮新测试放到**上一轮 `d22f6d7`** 上跑）：**19 failed / 12 passed**
+  —— 19 项失败正是本轮要修的 🔴1a/🔴1b/🔴2/🔴5 + 🟡 各项（不是恒真断言）。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）：
+  PyYAML 语法 ✅ + 仓库兜底解析器（`_mini_yaml`）✅。
+- **性能对照**（评审表格口径，同一容器）：
+
+  | 输入 | `ed62088`（基线） | `a7847f9`（回归） | 本轮 |
+  |---|---|---|---|
+  | `"{" × 20000` | — | 15.8 s | **1.4 ms** |
+  | `"{" × 40000` | 3 ms | 63.3 s | **2.6 ms** |
+  | `"if (x) {" × 3000`（24 KB） | — | 3.0 s | **1.6 ms** |
+  | `"{" × 200000` | — | — | **14.9 ms** |
+  | 引号密集（`'"'×20000` / `'"{'×50000` / 2 MB 正文） | — | — | **29–81 ms** |
+
+- 复评口径四项（评审指定，独立探针）：
+  `inherit_budget(trail+card)` → `6 / True / False`；
+  `_coerce_checks_used(trail2+载荷5)` → `5`；
+  卡+卡两序 → `fused=True / should_wake_next=False`（两序同结论）；
+  `"{"×20000` → 1.4 ms（基线 3 ms 量级）。
+
+### 22.5 台账更正（按实测）
+
+- §20 的 🔴1 行：**"已清零"不成立**——本轮实测其 ① early return 仍在，
+  「留痕 + 不带内嵌留痕的卡」形态下轮次**回退**（`trail(3)+card(6)` → 3）。
+  已在 §22.1 🔴1a 记录并修复；🔴1 的"trail↔trail 通道"部分（第 3 轮）确实已修好。
+- §20 的 🔴2 行：**"已清零"不成立**——`pick_wake_object` 当时是"首个含 `wake` 者胜"，
+  卡+卡顺序决定结论（且一个方向 fail-open）。已在 §22.1 🔴2 记录并改为保守口径。
+- §21（第 5 轮）未涉及本三项；本轮为**第 3 次打回后的定点修**（§19 `2be6a3d`、
+  §20 `ed62088`、§21 `a7847f9`、本轮）——按协作纪律，若下轮仍有 🔴 残留，
+  由评审按 `blocked` 上报总师裁定。

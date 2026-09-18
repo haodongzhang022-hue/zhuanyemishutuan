@@ -87,11 +87,22 @@ _SAFE_ID = re.compile(r'^[A-Za-z0-9_-]+\Z')
 # 留痕收集 / 归属过滤的**公共实现**（🟢 复评第 5 轮）：与 `collab.probe` 共用
 # 同一份，避免两处再次分叉——🔴1「只取第一条」正是分叉里长出来的缺陷。
 from ..trail import (  # noqa: E402
-    MAX_TRAIL_DEPTH as MAX_COERCE_DEPTH,
+    DEFAULT_SCAN_BUDGET,
+    MAX_TRAIL_DEPTH,
     attributed,
     collect_marked,
+    json_objects_in,
     trail_re,
 )
+
+# 载荷解析的**深度上界**：跨仓/评论载荷不可信，深嵌套 JSON 会触发
+# ``RecursionError`` 并逃逸到门面；超界一律按"判不出"处理（不炸）。
+#
+# 🟡（复评第 4 轮）**单一语义源**：这里不再 `as MAX_COERCE_DEPTH` 另起一个名字
+# （旧写法在 `loop_guard` / `probe` 各留一个同值别名，看着像两套口径）。
+# 上界的**唯一定义处**是 `secretary.trail.MAX_TRAIL_DEPTH`；兼容别名只在
+# 包出口（`loop.__init__` / `collab.__init__`）保留，指向同一个对象。
+MAX_COERCE_DEPTH = MAX_TRAIL_DEPTH
 
 # 评论/正文里的预算留痕标记（跨容器传递轮次预算的**可持久载体**）：
 # 交接卡 context、PR/Issue 评论正文里带这一行即可被 `adopt_budget()` 识别。
@@ -112,88 +123,71 @@ WAKE_AWAKE = "awake"
 WAKE_UNKNOWN = "unknown"
 
 
-def _balanced_object_end(text: str, start: int) -> Optional[int]:
-    """从 ``text[start] == '{'`` 起按**括号配平**找出对象结束位置（跳过字符串内括号）。
-
-    取不到（未闭合 / 空）→ ``None``。纯迭代实现，**不做递归**（深嵌套不炸栈）。
-    """
-    depth = 0
-    in_str = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-    return None
-
-
-def extract_json_objects(text: str) -> List[dict]:
+def extract_json_objects(text: str, budget: Optional[int] = None) -> List[dict]:
     """从正文里取出**全部**顶层 JSON 对象（宽进：解析不出的片段跳过）。
 
     **为什么要"全部"**（复评第 3 轮 🔴2）：评论正文常见形态是
     「预算留痕 + 交接卡 context」拼接，而留痕在前/在后两种顺序都存在。
     只取**第一个**对象时，"留痕在前"就会把静默交接的 ``wake=False`` 读丢 →
     ``should_wake_next()=True``（熔断语义从新入口漏出去，且方向是**放行**）。
+
+    **复杂度**（🔴5 复评第 4 轮）：扫描实现收敛到 ``secretary.trail``
+    （``scan_json_spans``，**单次线性**）——未闭合 ``{`` 不再触发"每个起点
+    重扫文末"的 O(n²)（``"{" * 40000`` 从 63 s 降到毫秒级，见该函数 docstring）。
+    ``budget`` 缺省用 ``DEFAULT_SCAN_BUDGET``（超长正文只扫前一段，保守不表态）。
     """
-    out: List[dict] = []
-    if not isinstance(text, str):
-        return out
-    i = 0
-    while i < len(text):
-        start = text.find("{", i)
-        if start < 0:
-            break
-        end = _balanced_object_end(text, start)
-        if end is None:
-            i = start + 1
-            continue
-        try:
-            got = json.loads(text[start:end + 1])
-        except (ValueError, RecursionError):
-            got = None
-        if isinstance(got, dict):
-            out.append(got)
-        i = end + 1
-    return out
+    if not isinstance(text, str) or not text:
+        return []
+    return json_objects_in(text, DEFAULT_SCAN_BUDGET if budget is None else budget)
 
 
 def extract_json_object(text: str) -> Optional[dict]:
     """从正文里取出**第一个** JSON 对象（宽进：取不到 → ``None``）。
 
-    保留本入口供既有调用方使用；判定"是不是静默交接"请用
-    ``extract_json_objects()`` + ``pick_wake_object()``——只认第一个对象会把
-    "留痕在前"的静默交接读丢（见 🔴2）。
+    保留本入口的**原因**（🟢 复评第 4 轮点名"现已无调用方"）：
+    它是本模块**对外稳定 API**（``secretary.loop.__all__`` 里导出），语义 =
+    "取第一个顶层对象"，与 ``extract_json_objects()[0]`` **同源实现**
+    （不另写一份扫描）。**内部判定**（静默交接）一律用
+    ``extract_json_objects()`` + ``pick_wake_object()``：只认第一个对象会把
+    "留痕在前"的静默交接读丢（🔴2）。
     """
     objs = extract_json_objects(text)
     return objs[0] if objs else None
 
 
 def pick_wake_object(objects: List[dict]) -> Optional[dict]:
-    """在多个顶层对象里挑**含 ``wake`` 键**的那个（找不到 → ``None``）。
+    """在多个顶层对象里挑出**决定唤醒语义**的那个（找不到 → ``None``）。
 
-    ``wake`` 是静默交接的**判据字段**，故解析时**优先找它**，而不是盲取第一个：
-    "留痕在前"时第一个对象是预算留痕（不带 ``wake``），盲取 = 判不出静默交接。
-    全都找不到 ``wake`` → 返回 ``None``，调用方按"非静默交接"处理（普通 context
-    不误熔断）；而"带 ``wake`` 但值非严格 bool"仍走**保守静默**（见 ``parse_wake``）。
+    🔴2（复评第 4 轮）**确定性且保守**的口径——不再"首个含 ``wake`` 者胜"：
+
+    1. **保守优先**：只要有一个对象的 ``wake`` **不是严格 ``True``**
+       （严格 ``False`` 或坏值 ``"false"``/``0``/``"no"``…）→ 判定**静默**。
+       方向与 ``parse_wake`` 的"判不出 → 保守静默"一致：读入侧放宽等于把熔断
+       语义漏出去。交接卡同样会**累积多条**（同一条评论里引用多张卡），
+       "首个含 ``wake`` 者胜"会让**顺序决定结论**：
+       ``[wake=True, wake=False]`` → 放行、``[wake=False, wake=True]`` → 熔断
+       （**fail-open 且顺序相关**，与 docstring/文档宣称的"顺序无关"直接矛盾）。
+    2. **"最新卡"判据（显式定义）**：需要返回具体对象时，取**追加顺序里最后
+       出现**的那个（正文是"每棒追加写回同一条评论"的累积载体 → 最后出现的
+       即更晚的那张卡）。故多个静默卡时返回**最后一张**（决定仍恒为静默，
+       取哪张不影响结论；只是 ``reason`` 取最新那张的）。
+    3. 所有带 ``wake`` 的对象都是严格 ``True`` → 返回**最后一个**（常规接力）。
+    4. 全都**不带** ``wake`` → ``None``（普通 context，不误熔断）。
     """
+    if not isinstance(objects, (list, tuple)):
+        return None
+    silent: Optional[dict] = None
+    awake: Optional[dict] = None
     for obj in objects:
-        if isinstance(obj, dict) and "wake" in obj:
-            return obj
-    return None
+        if not isinstance(obj, dict) or "wake" not in obj:
+            continue
+        if obj.get("wake") is True:
+            awake = obj            # 严格 True：常规接力（取最新）
+        else:
+            silent = obj           # False / 坏值：保守静默（取最新）
+    if silent is not None:
+        return silent
+    return awake
 
 
 def parse_wake(value: Any) -> str:
@@ -574,7 +568,7 @@ class LoopGuard:
     @staticmethod
     def _merge_budget_dicts(dicts: Any, _depth: int = 0,
                             session_id: str = "") -> Optional[dict]:
-        """把**多份**预算 dict 合并成一份（逐字段 ``max()``，``fused`` 取或）。
+        """把**多份**预算 dict 合并成一份（**逐字段 ``max()`` / 顺序无关**）。
 
         🔴1：评论正文里留痕会**累积多条**（每棒把留痕写回评论 = 必做项）。
         只取第一条 = 拿最旧的轮次 → 上界被稀释。故全部取、按 ``max()`` 合并，
@@ -586,6 +580,15 @@ class LoopGuard:
         故 ``session_id`` 给出时只合并**属于该会话**的留痕；留痕不带
         ``session_id`` 字段时不表态（保留）——"没写归属"≠"属于别人"。
 
+        **``reason`` / ``budget`` 也按顺序无关口径合并**（🟡 复评第 4 轮）：
+
+        - ``reason``：旧实现"首个非空胜" → ``[d1, d2]`` 与 ``[d2, d1]`` 给出
+          **不同原因**（同一次判定、换顺序换结论）。现取**已熔断载荷里最长**的
+          那条（确定性；更长的通常信息更多），并列时取字典序较小者 → 完全顺序无关。
+        - ``budget``：旧实现"首个非空胜" → ``[{"max_rounds": 3}, {"max_rounds": 9}]``
+          读成 3（**上界被旧值盖小**，而 ``rounds`` 已 ``max()`` → 两个字段互相矛盾）。
+          现**逐字段取 ``max()``**（数字取大、其余按顺序无关的"最大"定义取）。
+
         内嵌的 ``budget_trail``（``<!-- loop-budget: … -->``）**递归展开后再合并**
         ——交接卡 context 里的预算留痕是内嵌字段，不是单独一段正文。
         深度超过 ``MAX_COERCE_DEPTH`` 一律不展开（跨仓载荷不可信）。
@@ -594,7 +597,9 @@ class LoopGuard:
             return None
         merged: Dict[str, Any] = {}
         rounds_out: Dict[str, Any] = {}
-        reason_out = ""
+        reasons: List[str] = []
+        budgets: List[Dict[str, Any]] = []
+        fused = False
         nested: List[Any] = []
         for d in dicts:
             if not isinstance(d, dict):
@@ -607,13 +612,13 @@ class LoopGuard:
                     if isinstance(v, int) and not isinstance(v, bool):
                         rounds_out[k] = max(rounds_out.get(k, 0), v)
             if LoopGuard._fused_of(d):
-                merged["fused"] = True
+                fused = True
                 reason = d.get("reason")
-                if isinstance(reason, str) and reason and not reason_out:
-                    reason_out = reason
+                if isinstance(reason, str) and reason:
+                    reasons.append(reason)
             budget = d.get("budget")
-            if isinstance(budget, dict) and "budget" not in merged:
-                merged["budget"] = dict(budget)
+            if isinstance(budget, dict):
+                budgets.append(budget)
             trail = d.get("budget_trail")
             if isinstance(trail, str) and trail:
                 nested.append(LoopGuard._coerce_budget_payload(
@@ -623,19 +628,53 @@ class LoopGuard:
                                                   session_id=session_id)
             if inner is not None:
                 for k, v in (inner.get("rounds") or {}).items():
-                    rounds_out[k] = max(rounds_out.get(k, 0), v)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        rounds_out[k] = max(rounds_out.get(k, 0), v)
                 if inner.get("fused") is True:
-                    merged["fused"] = True
-                    if not reason_out:
-                        reason_out = inner.get("reason") or ""
-                if isinstance(inner.get("budget"), dict) \
-                        and "budget" not in merged:
-                    merged["budget"] = dict(inner["budget"])
+                    fused = True
+                    r = inner.get("reason")
+                    if isinstance(r, str) and r:
+                        reasons.append(r)
+                if isinstance(inner.get("budget"), dict):
+                    budgets.append(inner["budget"])
         if rounds_out:
             merged["rounds"] = rounds_out
-        if reason_out:
-            merged["reason"] = reason_out
+        if fused:
+            merged["fused"] = True
+        if reasons:
+            # 顺序无关：最长优先，并列取字典序最小（同一次判定的原因唯一）
+            merged["reason"] = sorted(reasons, key=lambda x: (-len(x), x))[0]
+        if budgets:
+            merged["budget"] = LoopGuard._merge_budget_values(budgets)
         return merged or None
+
+    @staticmethod
+    def _merge_budget_values(budgets: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """把多份 ``budget`` 段**逐字段**合并（顺序无关）。
+
+        数字取 ``max()``（上界只增不减：``[3, 9]`` → 9，不能被旧值盖小）；
+        其余类型按"最大"的**确定性**定义取（字符串取字典序最大、``None`` 视为
+        缺席、其它类型取 ``repr`` 最大）——目的是**同一次判定的结果与顺序无关**，
+        而不是给"非数字上界"赋业务含义（``budget`` 段本来就只放数字上界）。
+        """
+        out: Dict[str, Any] = {}
+        for b in budgets:
+            if not isinstance(b, dict):
+                continue
+            for k, v in b.items():
+                if k not in out or out[k] is None:
+                    out[k] = v
+                    continue
+                cur = out[k]
+                if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                        and isinstance(cur, (int, float)) \
+                        and not isinstance(cur, bool):
+                    out[k] = max(cur, v)
+                elif isinstance(v, str) and isinstance(cur, str):
+                    out[k] = max(cur, v)
+                else:
+                    out[k] = max(cur, v, key=repr)
+        return out
 
     @staticmethod
     def _coerce_budget_payload(payload: Any, _depth: int = 0,
@@ -672,12 +711,16 @@ class LoopGuard:
 
         # ① 正文里的**全部** `<!-- loop-budget: … -->` 留痕 → 合并（🔴1）
         #    归属过滤（🟡1）：只合并属于本会话的留痕（同一条评论可能有多个会话）。
+        #    🔴1 残留（复评第 4 轮）：**这里不再"有 rounds 就提前 return"**。
+        #    旧实现「`merged` 带 rounds → 直接返回」把 ②③④ 全跳过：正文形态
+        #    「留痕段 + 不带内嵌留痕的卡」时，卡的轮次/`fused` 一律读不到——
+        #    正是本轮声称"预算来源取整段正文"要修的那个形态（实测 trail(3)+card(6)
+        #    → `round_no=3`，比"只给卡"的 6 还差）。现改为**参与合并**：
+        #    `merged` 只作初始值，继续解析正文里的对象再一起 `max()`。
         merged = LoopGuard._merge_budget_dicts(
             (rec for rec in collect_marked(payload, "loop-budget")
              if attributed(rec, "session_id", session_id)),
             _depth + 1, session_id=session_id)
-        if merged is not None and isinstance(merged.get("rounds"), dict):
-            return merged
 
         # ② 整段就是一份 JSON
         try:
@@ -691,8 +734,10 @@ class LoopGuard:
                 session_id=session_id)
         if not isinstance(got, dict):
             return merged
-        if not isinstance(got.get("rounds"), dict) and merged is not None:
-            # ④ 合并结果与 ③ 互补（如"留痕段 + 不带 rounds 的载荷"）
+        # ④ 留痕段与正文对象**互补合并**（顺序无关、逐字段 max）：
+        #    只要两处都有内容就合并——不再用"`got` 有没有 `rounds`"当条件
+        #    （`fused` / `budget` / `reason` 也必须在两条通道间合并）。
+        if merged is not None:
             got = LoopGuard._merge_budget_dicts([got, merged], _depth + 1,
                                                 session_id=session_id) or got
         # 载荷内嵌的 `budget_trail`（`<!-- loop-budget: … -->` 形态）：递归取内层，
