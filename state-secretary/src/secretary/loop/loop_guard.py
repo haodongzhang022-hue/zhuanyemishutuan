@@ -92,6 +92,7 @@ from ..trail import (  # noqa: E402
     attributed,
     collect_marked,
     json_objects_in,
+    json_objects_in_diag,
     json_objects_in_report,
     trail_re,
 )
@@ -155,6 +156,21 @@ def extract_json_objects_report(
     if not isinstance(text, str) or not text:
         return [], False
     return json_objects_in_report(
+        text, DEFAULT_SCAN_BUDGET if budget is None else budget)
+
+
+def extract_json_objects_diag(
+        text: str, budget: Optional[int] = None) -> "tuple[List[dict], bool, str]":
+    """``extract_json_objects`` 的**带降级原因**版本：``(对象清单, degraded, reason)``。
+
+    ``reason`` 三态（``truncated`` / ``work_cap`` / ``rescan_len``，见
+    ``secretary.trail.SCAN_REASON_*``）。判定侧据此把安全旗标取**保守方向**，
+    并把**原因**写进 ``fused_reason``——只标记"降级了"而不说明"哪一段没表态"
+    会让下一棒看不出该怎么复核（本仓库把"声明了不接线"当缺陷类）。
+    """
+    if not isinstance(text, str) or not text:
+        return [], False, ""
+    return json_objects_in_diag(
         text, DEFAULT_SCAN_BUDGET if budget is None else budget)
 
 
@@ -480,6 +496,7 @@ class LoopGuard:
         raw: Any = handoff_context
         payload: Any = raw
         degraded = False
+        scan_reason = ""
         if isinstance(raw, str) and raw.strip():
             try:
                 payload = json.loads(raw)
@@ -487,7 +504,7 @@ class LoopGuard:
                 # 常见形态：JSON 载荷 + `<!-- loop-budget: … -->` 留痕拼接。
                 # 🔴2：**优先取含 `wake` 键的对象**——正文里"留痕在前"时第一个
                 # 对象是预算留痕（不带 `wake`），盲取第一个 = 判不出静默交接。
-                objs, degraded = extract_json_objects_report(raw)
+                objs, degraded, scan_reason = extract_json_objects_diag(raw)
                 payload = pick_wake_object(objs)
         if not isinstance(payload, dict):
             payload = None
@@ -498,8 +515,8 @@ class LoopGuard:
             # （→ 保守静默），**不得**因为"没找到 `wake` 键"就判"常规接力"——
             # 后者正是 N1/N2 的 fail-open 方向（卡被丢掉 → `wake=True` 放行）。
             payload = {"wake": None,
-                       "reason": "扫描降级（正文超上界/工作量触顶）：该区间不表态，"
-                                 "按判不出处理（保守静默）"}
+                       "reason": "扫描降级（%s）：未表态区间按判不出处理"
+                                 "（保守静默）" % (scan_reason or "未标注")}
 
         guard = cls(session_id=session_id, data_dir=data_dir, **kwargs)
         # 轮次预算**无条件合并**（常规接力也要带，见上"跨容器/跨棒预算继承"）。
@@ -655,8 +672,8 @@ class LoopGuard:
                 budgets.append(budget)
             trail = d.get("budget_trail")
             if isinstance(trail, str) and trail:
-                nested.append(LoopGuard._coerce_budget_payload(
-                    trail, _depth + 1, session_id=session_id))
+                nested.append(LoopGuard._coerce_budget_diag_impl(
+                    trail, _depth + 1, session_id=session_id)[0])
         if nested:
             inner = LoopGuard._merge_budget_dicts(nested, _depth + 1,
                                                   session_id=session_id)
@@ -732,6 +749,31 @@ class LoopGuard:
     @staticmethod
     def _coerce_budget_payload(payload: Any, _depth: int = 0,
                                session_id: str = "") -> Optional[dict]:
+        """``_coerce_budget_diag`` 的**只取载荷**包装（既有调用方/回归按此签名）。
+
+        需要知道"扫描是否降级、为什么降级"时用 ``_coerce_budget_diag``——
+        降级 = 有区间**未表态**，消费侧据此取**保守方向**（见 ``adopt_budget``）。
+        """
+        return LoopGuard._coerce_budget_diag(payload, _depth, session_id)[0]
+
+    @staticmethod
+    def _coerce_budget_diag(payload: Any, _depth: int = 0,
+                            session_id: str = "") -> "tuple[Optional[dict], bool, str]":
+        """``(载荷, degraded, reason)``：解析预算载荷并**上报扫描降级**。
+
+        为什么必须把降级**传到消费侧**（复评第 5 轮裁定 · G5）：扫描降级意味着
+        "某一段没看"，而 `fused=true` 的卡 / 更大的 `rounds` **可能就在那一段里**。
+        若消费侧只拿到"没解析出东西"就按空操作返回，降级本身就成了**新的
+        fail-open 通道**（🔴-4：降级正文 → `merged=False`、`round_no=0`，卡静默丢）。
+
+        ``reason`` 三态见 ``secretary.trail.SCAN_REASON_*``；嵌套 `budget_trail`
+        递归展开时**逐层取或**（任一层降级 → 整体降级）。
+        """
+        return LoopGuard._coerce_budget_diag_impl(payload, _depth, session_id)
+
+    @staticmethod
+    def _coerce_budget_diag_impl(payload: Any, _depth: int = 0,
+                                 session_id: str = "") -> "tuple[Optional[dict], bool, str]":
         """把任意形态的载荷解析成预算 dict（宽进：解析不出 → None，不炸）。
 
         接受：dict / JSON 串 / 含 ``<!-- loop-budget: … -->`` 标记的正文
@@ -745,22 +787,23 @@ class LoopGuard:
         并逃逸到门面；超过 ``MAX_COERCE_DEPTH`` 一律按"判不出"（``None``）处理。
         """
         if _depth > MAX_COERCE_DEPTH:
-            return None
+            return None, False, ""
         if isinstance(payload, dict):
             if not attributed(payload, "session_id", session_id):
-                return None          # 别的会话的载荷：不合并（🟡1）
+                return None, False, ""   # 别的会话的载荷：不合并（🟡1）
             # 内嵌 `budget_trail`（交接卡 context 的形态）也要展开并合并
             trail = payload.get("budget_trail")
             if isinstance(trail, str) and trail:
-                inner = LoopGuard._coerce_budget_payload(
+                inner, degraded, reason = LoopGuard._coerce_budget_diag_impl(
                     trail, _depth + 1, session_id=session_id)
                 if inner is not None:
-                    return LoopGuard._merge_budget_dicts(
+                    return (LoopGuard._merge_budget_dicts(
                         [payload, inner], _depth + 1,
-                        session_id=session_id) or payload
-            return payload
+                        session_id=session_id) or payload), degraded, reason
+                return payload, degraded, reason
+            return payload, False, ""
         if not isinstance(payload, str) or not payload.strip():
-            return None
+            return None, False, ""
 
         # ① 正文里的**全部** `<!-- loop-budget: … -->` 留痕 → 合并（🔴1）
         #    归属过滤（🟡1）：只合并属于本会话的留痕（同一条评论可能有多个会话）。
@@ -776,17 +819,21 @@ class LoopGuard:
             _depth + 1, session_id=session_id)
 
         # ② 整段就是一份 JSON
+        degraded = False
+        reason = ""
         try:
             got: Any = json.loads(payload)
         except (ValueError, RecursionError):
             got = None
         if not isinstance(got, dict):
             # ③ 正文里散落的多个顶层对象 → 合并（顺序无关；内嵌留痕递归展开）
+            #    用 diag 版本：把"扫描降级"（截断 / 总量触顶 / 候选超长）
+            #    一并上报给消费侧，否则降级会被静默当成"没解析出东西"。
+            objs, degraded, reason = extract_json_objects_diag(payload)
             got = LoopGuard._merge_budget_dicts(
-                extract_json_objects(payload), _depth + 1,
-                session_id=session_id)
+                objs, _depth + 1, session_id=session_id)
         if not isinstance(got, dict):
-            return merged
+            return merged, degraded, reason
         # ④ 留痕段与正文对象**互补合并**（顺序无关、逐字段 max）：
         #    只要两处都有内容就合并——不再用"`got` 有没有 `rounds`"当条件
         #    （`fused` / `budget` / `reason` 也必须在两条通道间合并）。
@@ -797,12 +844,14 @@ class LoopGuard:
         # 与载荷自身的 rounds **合并**（取 max）——不是替换（否则内层较小值时回退）。
         nested = got.get("budget_trail")
         if isinstance(nested, str):
-            inner = LoopGuard._coerce_budget_payload(
+            inner, d2, r2 = LoopGuard._coerce_budget_diag_impl(
                 nested, _depth + 1, session_id=session_id)
             if inner is not None:
                 got = LoopGuard._merge_budget_dicts(
                     [got, inner], _depth + 1, session_id=session_id) or got
-        return got
+            degraded = degraded or d2
+            reason = reason or r2
+        return got, degraded, reason
 
     def adopt_budget(self, payload: Any, source: str = "",
                      save: bool = True) -> dict:
@@ -823,10 +872,14 @@ class LoopGuard:
         # 归属过滤（🟡1）：只合并**属于本会话**的留痕——同一条评论可能挂着
         # 多个会话/检查点的留痕，无脑 max() 会把别人的轮次吸收进来 → 本会话
         # 下一轮直接 fuse（误熔断）。
-        data = self._coerce_budget_payload(payload,
-                                           session_id=self.session_id)
+        data, degraded, scan_reason = self._coerce_budget_diag(
+            payload, session_id=self.session_id)
+        if data is None and not degraded:
+            return {"merged": False, "adopted": {},
+                    "reason": "载荷无法解析（无操作）"}
         if data is None:
-            return {"merged": False, "adopted": {}, "reason": "载荷无法解析（无操作）"}
+            # 降级且没解析出载荷：**不得**按空操作返回（🔴-4：卡静默丢）
+            data = {}
 
         st = self._state
         fields = ("round_no", "blocking_rounds", "repair_rounds",
@@ -855,10 +908,24 @@ class LoopGuard:
                                else "继承外部预算载荷（fused=True）")
             st.fused_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
+        if degraded:
+            # **扫描降级 → 安全旗标取保守方向**（复评第 5 轮裁定 · G5）：
+            # 降级 = "某一段没表态"，而 `fused=true` 的卡 / 更大的 `rounds`
+            # 可能就在那一段里。此时"没读到"**不得**当成"没有"——那正是
+            # 降级变成 fail-open 通道的形态（🔴-4）。故保守继承熔断，
+            # 并把**原因**写进 `fused_reason`（可观测，便于下一棒复核）。
+            if not st.fused:
+                st.fused = True
+                st.fused_reason = (
+                    f"扫描降级（{scan_reason or '未标注'}）：未表态区间按判不出"
+                    "处理（保守继承熔断）")
+                st.fused_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
         adopted = {k: getattr(st, k) for k in fields}
         changed = {k: v for k, v in adopted.items() if v != before[k]}
         note = (f"合并外部预算（source={source or '未标注'}）："
-                f"rounds={adopted}，fused={st.fused}")
+                f"rounds={adopted}，fused={st.fused}"
+                + (f"，扫描降级={scan_reason}" if degraded else ""))
         st.history.append({
             "round_no": st.round_no,
             "blocking": 0,

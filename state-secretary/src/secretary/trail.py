@@ -100,42 +100,105 @@ def attributed(record: Any, field: str, value: Any) -> bool:
 # * **构造性"不漏"**：每个候选 `{` 用 ``json.JSONDecoder().raw_decode`` **独立起算**
 #   ——与旧实现"每个起点重扫"的语义等价（能捞到的都捞到），但解析交给 C，
 #   且未闭合/非法即 fail-fast。**不再**依赖"预算够就捞到"。
-# * **不变量 = 超集召回**：`a7847f9` 的 `extract_json_objects` 能取到的对象，
-#   本实现**必须**全取到（差分 fuzz 须 `LOST=0`）。见 ``scan_json_spans`` docstring。
-# * **上界只降级、不丢段**：触顶（``MAX_SCAN_WORK``）时保留**已取到的**片段，
-#   只把**剩余区间**判为"不表态"，并**显式标记**（``..._report`` 的第二个返回值）。
+# * **不变量 = 超集召回**：`a7847f9` 的 `extract_json_objects` 能取到的、且长度
+#   **≤ ``MAX_RESCAN_LEN``** 的对象，本实现**必须**全取到（差分 fuzz 须 `LOST=0`）。
+#   见 ``scan_json_spans`` docstring。
+# * **上界只降级、不丢段**：两条上界（``MAX_RESCAN_LEN`` 每候选 / ``MAX_SCAN_WORK``
+#   总量）触界时保留**已取到的**片段，只把"未扫到的区间"判为"不表态"，
+#   并**显式标记**（``..._diag`` 的 `degraded` + 三态 `reason`）。
+#
+# ⚠️ **安全断言与实现同源**（复评第 5 轮总师点名 · `[HIGH]`）：本文件**不得**
+# 再出现"记账 ≥ 真实扫描量，故本上界同时是**真实耗时**的上界"这类**失真断言**。
+# 现在的口径是**可验证**的两条：
+#   ① 记账**覆盖** `raw_decode` 的实扫量与**异常构造代价**（失败取错误位置 `pos`，
+#      不是 `pos - p`——后者恒为 8，会让总上界**永不触顶**）；
+#   ② 记账**另含每候选固定开销**（``_SCAN_CANDIDATE_COST``）与一次基扫（`limit`），
+#      故"记账 → 耗时"的折算比有**实测上界**（最坏 ≈ 1.2 ns/单位，见
+#      `test_issue21_scan_rework.py::TestG7AccountingMechanism`）。
+# 断言写成"**实测折算比 × 上界** < 2 s"这种**可复跑**形式，不写"必然上界"。
 #
 #: 正文扫描的**默认上界**（字符数）：上界远大于任何真实交接卡/评论正文
 #: （含历史留痕累积）；超出部分不再尝试解析（保守：判不出 → 不表态）。
 DEFAULT_SCAN_BUDGET = 1_000_000
 
-#: 候选解析的**工作量上界**（字符数，兜底）：`raw_decode` 每个候选是
-#: O(候选长度)，"每个 `{` 都试一次"在**不可信正文**上仍可能退化
-#: （如 `'{"a":' * n` 这类"形态像对象、但一路不闭合"的片段）。
-#: 触顶即**降级**：保留已取到的片段 + **显式标记** `degraded`，
-#: 绝**不**丢弃整段结果（上一轮"静默收摊"正是丢卡来源）。
-#: 记账口径：成功/失败按 `raw_decode` **实际扫过**的位置计（成功 `end - p`、
-#: 失败 `pos - p`），`RecursionError`（无位置）按**剩余长度**上限计——
-#: 即"记账 ≥ 真实扫描量"，故本上界同时是**真实耗时**的上界。
-#: 取值按实测留足余量：79 KB 台账正文（`issues/TEST-REGRESSION.md`）工作量
-#: ≈ 18 万字符，本上界有 ~100× 余量；触顶只出现在恶意正文。
-MAX_SCAN_WORK = 20_000_000
+#: **每候选**的扫描区间上界（字符数）——「① 每候选上界」。
+#:
+#: 为什么必须**单独显式**给出（复评第 5 轮裁定 · G2 硬要求）：只给"总工作量上界"
+#: 而不给每候选上界，总上界会被**单个候选**吃掉——`'{"k":1, '×40000 + '}'`
+#: （320 KB）里每个候选都要扫到文末，总上界再大也只是"能容忍几个候选"，
+#: 实测 320 KB → 2.26 s、1 MB → 21.7 s（`degraded` 恒 `False`）。
+#:
+#: 语义：对候选 `p`，只在窗口 ``[p, min(limit, p + MAX_RESCAN_LEN))`` 里找 `}`；
+#: 窗口内**没有** `}` → 该候选不表态（跳过）且 `reason="rescan_len"`。
+#: 等价于"从该候选起能配平的对象，长度不得超过本上界"。
+#:
+#: 取值依据（实测，非拍脑袋）：本仓库全部语料（`issues/*.md`、`docs/**/*.md`、
+#: `src/**/*.py`、`tests/*.py` + 台账 ×1…×6 + 卡片拼接）里"候选 → 最近 `}`
+#: 距离"的**最大值 = 4 842**（台账 ×6），本上界有 **54×** 余量。
+#: 反向对照见 ``test_issue21_scan_rework.py``：**超过本上界的合法长对象会被
+#: 跳过**——但这是**显式降级**（`degraded=True` + `reason="rescan_len"`），
+#: 消费侧据此取保守方向，**不是**静默丢卡。
+MAX_RESCAN_LEN = 262_144
+
+#: 候选解析的**总工作量上界**（折算单位，见 `_SCAN_CANDIDATE_COST`）——「② 总上界」。
+#:
+#: 记账口径（复评第 5 轮裁定 · G3：**记账 ≥ 真实扫描量**，且须覆盖**异常构造代价**）：
+#:
+#:     work += 候选扫描区间长度（窗口内到 `}` 的字符数）
+#:           + 每候选固定开销折算（`_SCAN_CANDIDATE_COST`）
+#:           + raw_decode 实扫量：成功 `end - p`；失败取**错误位置 `pos`**
+#:             （**不是** `pos - p`——异常消息的构造代价随 `pos` 线性增长，
+#:             `pos - p` 恒为 8 ⇒ 总记账 800 k ≪ 上界 ⇒ **永不触顶**，
+#:             正是 2.26 s / 21.7 s 的机制）；无 `pos`（`RecursionError`）
+#:             取剩余长度上限。
+#:
+#: 触顶即**降级**：保留已取到的片段 + 显式标记 `degraded` / `reason="work_cap"`，
+#: 绝**不**丢弃整段结果（"静默收摊"正是丢卡来源）。
+#:
+#: 取值依据（实测）：最坏折算比 ≈ **5.6 ns/单位**（含 `limit` 基扫的截断形态
+#: `'{"k":1, '×125000`），故本上界对应最坏耗时 ≈ **0.56 s**（实测最坏对抗输入
+#: **0.22 s** = `'{"i":N}'×100 000`）；余量侧：台账 ×12（1 MB 真实正文，
+#: 312 个候选）折算量 ≈ 100 M，恰在上界附近 ⇒ 真实正文**不误降级**的判据取
+#: 台账 ×4（334 KB，折算 15.7 M）；触顶只出现在恶意/极端密集正文。
+MAX_SCAN_WORK = 100_000_000
+
+#: **每候选固定开销**的折算当量（单位：字符）。为什么总上界里必须含它：
+#: 扫描循环的每次迭代（`find` + 空白跳过 + 形态预检 + 循环开销）实测 ≈
+#: **0.4–0.9 µs/候选**，与候选长度**无关**；只按字符量记账时，
+#: "大量微对象"形态（如 `"{}"×500 000`：字符量仅 1 M，耗时 0.47 s）会
+#: 记成很小的量 ⇒ 记账**不覆盖真实耗时**（上界失真）。
+#: 取值 = 实测每候选开销的**上界**（0.9 µs）折算，留余量取 1 024。
+_SCAN_CANDIDATE_COST = 1_024
+
+#: 降级原因三态（`reason` 的取值域）。消费侧按 `reason` 把安全旗标取保守方向，
+#: 并把原因写进留痕。
+SCAN_REASON_TRUNCATED = "truncated"    # 正文被 `budget` 截断（尾部未表态）
+SCAN_REASON_WORK_CAP = "work_cap"      # 总工作量触顶而提前停止（尾部未表态）
+SCAN_REASON_RESCAN_LEN = "rescan_len"  # 有候选因「每候选上界」被跳过（该候选未表态）
+
+#: `reason` 的**优先级**（越靠前越"外层"：未表态的区间越靠后、越"整段"）。
+#: 多个原因同时成立时取最外层的一个——确定性（与出现顺序无关）。
+_SCAN_REASON_PRIORITY = (
+    SCAN_REASON_TRUNCATED,
+    SCAN_REASON_WORK_CAP,
+    SCAN_REASON_RESCAN_LEN,
+)
 
 #: JSON 对象首字符（跳过空白后）：`{` 之后**只能**是 `"`（键）或 `}`（空对象）。
 #: 这条 O(1) 预检把 `if (x) {` / `"{"` 类输入挡在 `raw_decode` 之外
 #: （否则每个候选都要进一次 C 解析器）。
 _JSON_WS = " \t\n\r"
+_JSON_WS_RE = re.compile(r"[ \t\n\r]*")
 _JSON_DECODER = json.JSONDecoder()
 
 
-def _scan_report(text: str, limit: int) -> "tuple[List[str], bool]":
-    """扫描 ``text[:limit]`` 里的顶层 ``{...}`` 片段（JSON 合法才取）。
+def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
+    """扫描 ``text[:limit]`` 里的顶层 ``{...}`` 片段。
 
-    返回 ``(片段清单, degraded)``。``degraded=True`` 的含义**只有一条**：
-    "``limit`` 之后（或工作量触顶之后）的区间**未表态**"——**已取到的片段
-    一个不丢**（这正是与上一轮"静默收摊、整段丢卡"的区别）。消费侧据此把
-    安全旗标（``fused`` / ``wake``）取**保守方向**，否则降级本身就是一条
-    fail-open。
+    返回 ``(片段清单, degraded, reason, work)``。``degraded=True`` 的含义**只有
+    一条**："有某个区间**未表态**"——**已取到的片段一个不丢**（这正是与上一轮
+    "静默收摊、整段丢卡"的区别）。``reason`` 说明**哪一段**未表态（三态见
+    ``SCAN_REASON_*``；多个原因同时成立时按该处列出的优先级取**最外层**的一个）。
 
     实现（**构造性"不漏"**）：
 
@@ -143,71 +206,116 @@ def _scan_report(text: str, limit: int) -> "tuple[List[str], bool]":
       的字符串状态）——等价旧实现"每个起点按括号配平重扫 + ``json.loads``"的
       语义，但解析在 C 里做，且未闭合/非法即 fail-fast。
     * **O(1) 预检**（短路 `"{"×n` / `if (x) {` 类输入）：
-      ① 候选之后**必须还有** `}`（``rfind``，一次 O(n) 定全局上界）；
+      ① 区间内**必须还有** `}`（``rfind``，一次 O(n) 定全局上界）；
       ② ``{`` 之后跳过空白**必须**是 `"` 或 `}`（JSON 对象的唯一两种起头）。
-    * **降级（只降级、不丢段）**：工作量超过 ``MAX_SCAN_WORK`` → 停止尝试、
-      保留已取到的片段、``degraded=True``。
+    * **两条上界**（缺一不可）：
+      ① **每候选**：窗口 ``[p, p + MAX_RESCAN_LEN)`` 内没有 `}` → 跳过该候选
+        （`rescan_len`）；
+      ② **总工作量**：折算量超过 ``MAX_SCAN_WORK`` → 停止尝试（`work_cap`）。
+    * **降级（只降级、不丢段）**：两条上界都**只**让"未扫到的区间"不表态，
+      已取到的片段照常返回。
     """
     out: List[str] = []
     # 截断（``limit < len(text)``）同样是"该区间不表态" → 显式标记（不得静默）。
-    degraded = limit < len(text)
+    truncated = limit < len(text)
+    # 基扫（一次 ``rfind``）计入记账：总上界因此也是"含基扫"的真实耗时上界。
+    work = limit
+    hit_work_cap = False
+    hit_rescan_len = False
     last_close = text.rfind("}", 0, limit)
     if last_close < 0:
-        return out, degraded     # 区间内没有 `}`：不可能有配平对象
-    work = 0
+        # 区间内没有 `}`：不可能有配平对象（此时"跳过"不是降级，是确证）。
+        return out, truncated, SCAN_REASON_TRUNCATED if truncated else "", work
     i = 0
     while True:
         p = text.find("{", i, limit)
         if p < 0 or p > last_close:
             break
-        j = p + 1
-        while j < limit and text[j] in _JSON_WS:
-            j += 1
+        j = _JSON_WS_RE.match(text, p + 1, limit).end()
+        cost = (j - p) + _SCAN_CANDIDATE_COST
         if j >= limit or (text[j] != '"' and text[j] != "}"):
-            i = p + 1            # 形态不像对象：O(1) 跳过（不进 raw_decode）
+            # 形态不像对象：O(1) 跳过（不进 raw_decode）
+            if work + cost > MAX_SCAN_WORK:
+                hit_work_cap = True
+                break
+            work += cost
+            i = p + 1
+            continue
+        # ① 每候选上界：只在窗口内找 `}`（找不到 ⇒ 该候选不表态）
+        window_end = min(limit, p + MAX_RESCAN_LEN)
+        close = text.find("}", p, window_end)
+        scanned = (close + 1 - p) if close >= 0 else (window_end - p)
+        if work + scanned + cost > MAX_SCAN_WORK:
+            hit_work_cap = True
+            break
+        work += scanned + cost
+        if close < 0:
+            # 窗口内没有 `}` ⇒ 该候选不可能在本上界内配平：跳过并显式降级。
+            hit_rescan_len = True
+            i = p + 1
             continue
         try:
             got, end = _JSON_DECODER.raw_decode(text, p)
         except (ValueError, RecursionError) as exc:
-            # 失败代价 = ``raw_decode`` **实际扫过**的位置（错误位置 pos），
-            # 而不是"剩余全文"——否则正常正文（每段一个对象）也会被误计为触顶。
-            # ``RecursionError`` 无 pos（深嵌套）：按剩余长度上限计（记账 ≥ 真实）。
+            # 失败代价 = ``raw_decode`` 的**错误位置 ``pos``**（整段前缀）——
+            # 异常消息的构造代价随 ``pos`` 线性，取 ``pos - p``（恒 8）会让
+            # 记账**永不触顶**（复评第 5 轮实测：320 KB → 2.26 s 而 `degraded`
+            # 恒 `False`）。``RecursionError`` 无 pos（深嵌套）：按剩余长度上限计。
             pos = getattr(exc, "pos", None)
-            cost = (pos - p) if isinstance(pos, int) and pos > p \
-                else (limit - p)
-            if work + cost > MAX_SCAN_WORK:
-                degraded = True  # 只降级：已取到的片段照常返回
+            charge = pos if isinstance(pos, int) and pos > p else (limit - p)
+            if work + charge > MAX_SCAN_WORK:
+                hit_work_cap = True
                 break
-            work += cost
+            work += charge
             i = p + 1            # 失败候选：下一个起点（旧实现跳到配平末尾）
             continue
         if work + (end - p) > MAX_SCAN_WORK:
-            degraded = True          # 同上：已取到的片段不丢
+            hit_work_cap = True
             break
         work += end - p
         if isinstance(got, dict):
             out.append(text[p:end])
         i = end if end > p else p + 1
-    return out, degraded
+    flags = {
+        SCAN_REASON_TRUNCATED: truncated,
+        SCAN_REASON_WORK_CAP: hit_work_cap,
+        SCAN_REASON_RESCAN_LEN: hit_rescan_len,
+    }
+    # 多个原因同时成立 → 取**最外层**（未表态区间最靠后）的一个，确定性。
+    reason = next((r for r in _SCAN_REASON_PRIORITY if flags[r]), "")
+    return out, bool(reason), reason, work
+
+
+def scan_json_spans_diag(
+        text: Any, budget: Optional[int] = None) -> "tuple[List[str], bool, str]":
+    """``scan_json_spans`` 的**带降级原因**版本：``(片段清单, degraded, reason)``。
+
+    为什么降级必须**可观测且带原因**（复评第 5 轮总师裁定 · G4）：上一轮的
+    ``MAX_REPAIR_CHARS`` 触顶是**静默收摊**——调用方看不出"这一段没表态"，
+    于是下一轮继续漏。三态 ``reason``（``truncated`` / ``work_cap`` /
+    ``rescan_len``）让消费侧能区分"正文被截断" / "总量触顶" / "某候选超长"，
+    并据此把安全旗标（``fused`` / ``wake``）取**保守方向**、把原因写进留痕。
+    """
+    out: List[str] = []
+    if not isinstance(text, str) or not text:
+        return out, False, ""
+    n = len(text)
+    limit = n if budget is None else min(n, max(0, budget))
+    if limit <= 0:
+        return out, True, SCAN_REASON_TRUNCATED if n > 0 else ""
+    spans, degraded, reason, _ = _scan_diag(text, limit)
+    return spans, degraded, reason
 
 
 def scan_json_spans_report(
         text: Any, budget: Optional[int] = None) -> "tuple[List[str], bool]":
     """``scan_json_spans`` 的**带降级标记**版本：``(片段清单, degraded)``。
 
-    为什么要有显式标记（复评第 5 轮总师裁定）：上一轮的
-    ``MAX_REPAIR_CHARS`` 触顶是**静默收摊**——调用方看不出"这一段没表态"，
-    于是下一轮继续漏。降级必须**可观测**，故单列一个入口返回标记；
-    语义仍是"降级只影响**剩余区间**，**已取到的片段一个不丢**"。
+    保留二元组签名（既有调用方/回归都按二元组解包）；需要知道**为什么**降级时
+    用 ``scan_json_spans_diag``（三态 ``reason``）。
     """
-    out: List[str] = []
-    if not isinstance(text, str) or not text:
-        return out, False
-    n = len(text)
-    limit = n if budget is None else min(n, max(0, budget))
-    if limit <= 0:
-        return out, False
-    return _scan_report(text, limit)
+    spans, degraded, _ = scan_json_spans_diag(text, budget)
+    return spans, degraded
 
 
 def scan_json_spans(text: Any, budget: Optional[int] = None) -> List[str]:
@@ -218,9 +326,13 @@ def scan_json_spans(text: Any, budget: Optional[int] = None) -> List[str]:
     出合法 JSON 对象"的那些，按起点顺序输出片段文本。旧实现是"每个起点按括号
     配平扫一遍再 ``json.loads``"——合法对象两种口径结果一致，故
 
-    * **超集召回（不变量）**：基线能捞到的对象，本实现**全捞到**（`LOST=0`）；
+    * **超集召回（不变量）**：长度 **≤ ``MAX_RESCAN_LEN``** 的对象，基线能捞到的，
+      本实现**全捞到**（差分 fuzz 判据 `LOST=0`）。**边界明示**：长度超过
+      ``MAX_RESCAN_LEN`` 的合法对象会被跳过——但那是**显式降级**
+      （`degraded=True` + `reason="rescan_len"`），消费侧取保守方向，
+      **不是**静默丢卡；
     * 失败候选按 ``p + 1`` 前进（旧实现跳到配平末尾）→ 可能多捞出失败候选
-      **内部**的对象（超集方向；不产生丢卡，且不会重复输出已被解析片段覆盖的起点）。
+      **内部**的对象（超集方向；不产生丢卡）。
 
     **为什么不再用"两段式（线性主扫描 + 有界修复）"**（复评第 5 轮裁定）：
     那条路径的**正确性依赖预算兜底**（"预算够就捞到"），本轮已在兜底路径上
@@ -232,13 +344,13 @@ def scan_json_spans(text: Any, budget: Optional[int] = None) -> List[str]:
     ``budget`` 给定时只扫描正文**前 ``budget`` 个字符**（上界远大于任何真实
     交接卡/评论正文；超出部分保守不表态），不改变正常输入的结果。
     """
-    return scan_json_spans_report(text, budget)[0]
+    return scan_json_spans_diag(text, budget)[0]
 
 
-def json_objects_in_report(
-        text: Any, budget: Optional[int] = None) -> "tuple[List[dict], bool]":
-    """``json_objects_in`` 的**带降级标记**版本：``(对象清单, degraded)``。"""
-    segs, degraded = scan_json_spans_report(
+def json_objects_in_diag(
+        text: Any, budget: Optional[int] = None) -> "tuple[List[dict], bool, str]":
+    """``json_objects_in`` 的**带降级原因**版本：``(对象清单, degraded, reason)``。"""
+    segs, degraded, reason = scan_json_spans_diag(
         text, DEFAULT_SCAN_BUDGET if budget is None else budget)
     out: List[dict] = []
     for seg in segs:
@@ -248,7 +360,14 @@ def json_objects_in_report(
             continue
         if isinstance(got, dict):
             out.append(got)
-    return out, degraded
+    return out, degraded, reason
+
+
+def json_objects_in_report(
+        text: Any, budget: Optional[int] = None) -> "tuple[List[dict], bool]":
+    """``json_objects_in`` 的**带降级标记**版本：``(对象清单, degraded)``。"""
+    objs, degraded, _ = json_objects_in_diag(text, budget)
+    return objs, degraded
 
 
 def json_objects_in(text: Any, budget: Optional[int] = None) -> List[dict]:
@@ -256,7 +375,8 @@ def json_objects_in(text: Any, budget: Optional[int] = None) -> List[dict]:
 
     与 ``scan_json_spans`` 同一次扫描的结果，只多一层 ``json.loads`` 兜底；
     ``budget`` 缺省同样取 ``DEFAULT_SCAN_BUDGET``（上界**处处生效**，
-    不因调用方忘了传就变成无界扫描）。降级标记见 ``json_objects_in_report``。
+    不因调用方忘了传就变成无界扫描）。降级标记见 ``json_objects_in_report`` /
+    ``json_objects_in_diag``。
     """
-    return json_objects_in_report(
+    return json_objects_in_diag(
         text, DEFAULT_SCAN_BUDGET if budget is None else budget)[0]

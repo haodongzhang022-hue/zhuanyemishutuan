@@ -101,9 +101,10 @@ from .platform import (  # noqa: E402  （同包内相对导入，放这里保�
 # 避免两处再次分叉——🔴1「只取第一条」正是分叉里长出来的）。
 from ..trail import (  # noqa: E402
     MAX_TRAIL_DEPTH,
+    SCAN_REASON_TRUNCATED,
     attributed,
     collect_marked,
-    json_objects_in,
+    json_objects_in_diag,
     trail_re,
 )
 
@@ -696,6 +697,19 @@ class CheckpointProbe:
     @staticmethod
     def _coerce_checks_used(value: Any, _depth: int = 0,
                             cp_key: Any = "") -> Optional[int]:
+        """``_coerce_checks_used_diag`` 的**只取轮次**包装（既有签名不变）。
+
+        需要知道"扫描是否降级、为什么降级"时用 ``_coerce_checks_used_diag``——
+        降级 = 有区间**未表态**，消费侧据此取**保守方向**（见
+        ``adopt_checks_budget`` / ``probe``），否则降级本身又是一条 fail-open
+        （🔴-4：降级正文 → 判不出 → 基线 5 次，上界被稀释）。
+        """
+        return CheckpointProbe._coerce_checks_used_diag(
+            value, _depth, cp_key)[0]
+
+    @staticmethod
+    def _coerce_checks_used_diag(value: Any, _depth: int = 0,
+                                 cp_key: Any = "") -> "tuple[Optional[int], bool, str]":
         """从任意形态的载荷里取外部探测轮次（宽进：取不到 → ``None``）。
 
         接受：int / 数字串 / 字典（``checks_used`` / ``external_checks`` /
@@ -728,15 +742,17 @@ class CheckpointProbe:
         并逃逸到门面；超过 ``MAX_COERCE_DEPTH`` 一律按"判不出"（``None``）处理。
         """
         if _depth > MAX_COERCE_DEPTH:
-            return None
+            return None, False, ""
         if isinstance(value, bool):
-            return None
+            return None, False, ""
         if isinstance(value, int):
-            return max(0, value)
+            return max(0, value), False, ""
         if isinstance(value, float):
-            return max(0, int(value))
+            return max(0, int(value)), False, ""
         if isinstance(value, str):
             best: Optional[int] = None
+            degraded = False
+            reason = ""
 
             def _keep(got: Optional[int]) -> None:
                 nonlocal best
@@ -747,24 +763,25 @@ class CheckpointProbe:
             for got in collect_marked(value, "probe-budget"):
                 if not attributed(got, "checkpoint_key", cp_key):
                     continue
-                _keep(CheckpointProbe._coerce_checks_used(
-                    got, _depth + 1, cp_key=cp_key))
+                _keep(CheckpointProbe._coerce_checks_used_diag(
+                    got, _depth + 1, cp_key=cp_key)[0])
             # ② 正文里散落的顶层 JSON 对象（如 `{"checks_used": 5}` / 事件载荷）
             #    ——**与留痕一起取 max**（🔴1 残留：旧实现只扫留痕，
             #    `trail(2) + {"checks_used": 5}` 读成 2，载荷的 5 直接丢）。
             #    扫描用 `secretary.trail.scan_json_spans`（候选 `{` 独立起算
             #    `raw_decode`，构造性"不漏"，复评第 5 轮改实现路径）。
-            for obj in json_objects_in(value):
+            objs, degraded, reason = json_objects_in_diag(value)
+            for obj in objs:
                 if not attributed(obj, "checkpoint_key", cp_key):
                     continue
-                _keep(CheckpointProbe._coerce_checks_used(
-                    obj, _depth + 1, cp_key=cp_key))
+                _keep(CheckpointProbe._coerce_checks_used_diag(
+                    obj, _depth + 1, cp_key=cp_key)[0])
             # ③ 整段就是数字串（`"5"` / `" 5 "`）
             try:
                 _keep(max(0, int(value.strip())))
             except ValueError:
                 pass
-            return best
+            return best, degraded, reason
         if isinstance(value, dict):
             # 🔴-2（复评第 5 轮 · 🟡1 未修全）：**dict 载荷同样要按归属过滤**。
             # 字符串留痕分支有 `attributed(...)` 过滤，dict 分支却漏了 —— 而
@@ -775,13 +792,17 @@ class CheckpointProbe:
             # 同族对照：`loop_guard` 的 dict 分支**有**这层过滤（口径不对称才是缺陷）。
             # 口径与字符串分支**同源**（同一个 `attributed`）：不带该字段不表态。
             if not attributed(value, "checkpoint_key", cp_key):
-                return None
+                return None, False, ""
             best: Optional[int] = None
+            degraded = False
+            reason = ""
 
             def _take(candidate: Any) -> None:
-                nonlocal best
-                got = CheckpointProbe._coerce_checks_used(
+                nonlocal best, degraded, reason
+                got, d2, r2 = CheckpointProbe._coerce_checks_used_diag(
                     candidate, _depth + 1, cp_key=cp_key)
+                degraded = degraded or d2
+                reason = reason or r2
                 if got is not None and (best is None or got > best):
                     best = got
 
@@ -796,8 +817,8 @@ class CheckpointProbe:
             trail = value.get("budget_trail")
             if isinstance(trail, str) and trail:
                 _take(trail)
-            return best
-        return None
+            return best, degraded, reason
+        return None, False, ""
 
     def adopt_checks_budget(self, cp: Checkpoint, payload: Any = None,
                             save: bool = True) -> dict:
@@ -811,25 +832,43 @@ class CheckpointProbe:
             save: 是否落盘。
 
         Returns:
-            ``{"merged": bool, "checks_used": int, "max_checks": int}``。
+            ``{"merged": bool, "checks_used": int, "max_checks": int,
+            "degraded": bool, "reason": str}``。
+
+        **扫描降级 → 取保守方向**（复评第 5 轮裁定 · G5）：载荷里的扫描若降级
+        （`truncated` / `work_cap` / `rescan_len`），说明"某一段没表态"——
+        而更大的 `checks_used` **可能就在那一段里**。此时"没读到"**不得**当成
+        "没消耗"（🔴-4：降级正文 → 判不出 → 基线 5 次，上界被稀释）。故降级时
+        把轮次**按上界（`max_checks`）继承**——保守方向 = 不再自动挂账，
+        交回人工，而不是继续自动探测。
         """
         # 归属过滤（🟡1）：只采纳**属于本检查点**的留痕——同一条评论里
         # 可能挂着多个检查点的留痕，无脑 max() 会把别人的轮次"继承"过来，
         # 直接判「预算用尽」（误判用尽）。
-        external = self._coerce_checks_used(payload, cp_key=cp.key)
+        external, degraded, reason = self._coerce_checks_used_diag(
+            payload, cp_key=cp.key)
+        if degraded and (external is None or external < cp.max_checks):
+            # 降级 = 有区间没表态：保守按"轮次可能已用尽"处理（不再自动挂账）。
+            external = cp.max_checks
+            reason = reason or SCAN_REASON_TRUNCATED
         if external is None or external <= cp.checks_used:
             return {"merged": False, "checks_used": cp.checks_used,
-                    "max_checks": cp.max_checks}
+                    "max_checks": cp.max_checks,
+                    "degraded": degraded, "reason": reason}
         cp.checks_used = external
+        note = "合并外部探测轮次（跨容器/跨棒继承，只增不减）"
+        if degraded:
+            note += f"；载荷扫描降级（{reason}）→ 保守按上界继承"
         cp.history.append({
             "at": self._clock(), "action": "adopt_budget",
             "checks_used": external,
-            "note": "合并外部探测轮次（跨容器/跨棒继承，只增不减）",
+            "note": note,
         })
         if save:
             self._save(cp)
         return {"merged": True, "checks_used": cp.checks_used,
-                "max_checks": cp.max_checks}
+                "max_checks": cp.max_checks,
+                "degraded": degraded, "reason": reason}
 
     def create(
         self,
