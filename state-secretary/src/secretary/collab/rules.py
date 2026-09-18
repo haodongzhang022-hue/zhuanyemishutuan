@@ -62,6 +62,12 @@ DEFAULT_CRONTAB_MIN_INTERVAL_SEC = 300.0     # 平台定时任务最小间隔（
 DEFAULT_CRONTAB_INTERVAL_MINUTES = 5         # 平台定时任务间隔：固定一档（已确认口径 #2）
 DEFAULT_PROBE_CHECKS = ["confirm", "lock", "version", "event", "resource"]
 
+# 审查范围默认档位 + 同口径重复执行上界（Issue #14：只跑增量、不连跑同一口径）
+DEFAULT_SCAN_MODE = "scan"                   # 日常默认=增量（除大版本外一律增量）
+DEFAULT_MAX_IDENTICAL_REPEATS = 1            # 同一口径只跑一次；第 2 次起跳过
+DEFAULT_REPEAT_KEYS = ["mode", "revision", "impact", "command"]
+DEFAULT_STABILITY_VIA = ["targeted_probe", "mutation_probe", "independent_scenario"]
+
 DEFAULT_LOCK_RETRY_DELAY_SEC = 60.0
 DEFAULT_LOCK_PERSISTENT_GRACE_SEC = 180.0
 DEFAULT_MAX_ROUNDS = 3
@@ -92,6 +98,11 @@ def _as_float(value: Any, default: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     return float(value)
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """宽进读布尔字段（非布尔 → 默认值，避免 "false" 字符串被当真值）。"""
+    return value if isinstance(value, bool) else default
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -192,6 +203,18 @@ class CollabRules:
         default_factory=lambda: ["大版本", "全量", "major version", "full scan"])
     scan_keywords: List[str] = field(
         default_factory=lambda: ["只审变化", "增量", "只跑增量", "scan only"])
+    # 默认档位：**日常=增量**（不需要有人"记得"选增量）
+    scan_default_mode: str = DEFAULT_SCAN_MODE
+    # 同一口径（范围+版本+受影响面+命令）最多跑几次；1 = 只跑一次
+    max_identical_repeats: int = DEFAULT_MAX_IDENTICAL_REPEATS
+    # 仅当上一轮结论"不绿"时才允许同口径重跑（红→修→再跑是有信息的）
+    repeat_rerun_on_failure: bool = True
+    # 判"同一口径"的比较键
+    repeat_keys: List[str] = field(default_factory=lambda: list(DEFAULT_REPEAT_KEYS))
+    # 是否允许"连跑 N 次同一命令"当稳定性论证（默认禁止：跑法固定 → 无判别力）
+    allow_stability_repeats: bool = False
+    # 稳定性论证的正规替代路径
+    stability_via: List[str] = field(default_factory=lambda: list(DEFAULT_STABILITY_VIA))
     platform: PlatformCostNote = field(default_factory=PlatformCostNote)
     source: str = "default"
     # 规则作用域（organization / repo / default）——一眼看出数值来自哪一级
@@ -261,6 +284,12 @@ class CollabRules:
                 "major_version_tags": list(self.major_version_tags),
                 "full_scan_keywords": list(self.full_scan_keywords),
                 "scan_keywords": list(self.scan_keywords),
+                "default_mode": self.scan_default_mode,
+                "max_identical_repeats": self.max_identical_repeats,
+                "repeat_rerun_on_failure": self.repeat_rerun_on_failure,
+                "repeat_keys": list(self.repeat_keys),
+                "allow_stability_repeats": self.allow_stability_repeats,
+                "stability_via": list(self.stability_via),
             },
             "platform": self.platform.to_dict(),
         }
@@ -354,6 +383,19 @@ class CollabRules:
             major_version_tags=_strs("major_version_tags", cls.major_version_tags_default()),
             full_scan_keywords=_strs("full_scan_keywords", cls.full_scan_keywords_default()),
             scan_keywords=_strs("scan_keywords", cls.scan_keywords_default()),
+            scan_default_mode=(
+                scan.get("default_mode")
+                if isinstance(scan.get("default_mode"), str)
+                and scan.get("default_mode") in ("scan", "full")
+                else DEFAULT_SCAN_MODE),
+            max_identical_repeats=max(1, _as_int(
+                scan.get("max_identical_repeats"), DEFAULT_MAX_IDENTICAL_REPEATS)),
+            repeat_rerun_on_failure=_as_bool(
+                scan.get("repeat_rerun_on_failure"), True),
+            repeat_keys=_str_list(scan, "repeat_keys", DEFAULT_REPEAT_KEYS),
+            allow_stability_repeats=_as_bool(
+                scan.get("allow_stability_repeats"), False),
+            stability_via=_str_list(scan, "stability_via", DEFAULT_STABILITY_VIA),
             probe_checks=probe_checks,
             platform=PlatformCostNote.from_dict(data.get("platform")),
             source=source,
@@ -580,11 +622,50 @@ def load_rules_chain(
 # 允许仓库级覆写的**数值域**（语义域不可改：判别式清单、落点清单的**成员资格**不可改）
 _OVERRIDABLE_FIELDS = (
     "probe_max_checks", "probe_await_max_sec", "crontab_min_interval_sec",
+    "crontab_interval_minutes",
     "lock_retry_delay_sec", "lock_persistent_grace_sec", "lock_registry_shared",
     "max_rounds", "max_advisory_fix_rounds", "max_total_rounds",
     "max_stall_repeats", "major_version_tags", "full_scan_keywords",
     "scan_keywords", "probe_checks",
+    # 审查范围：日常只跑增量、同口径不重复（Issue #14 追问）
+    "scan_default_mode", "max_identical_repeats", "repeat_rerun_on_failure",
+    "repeat_keys", "allow_stability_repeats", "stability_via",
 )
+
+# 白名单**自检**：新增数值字段若忘了登记进 `_OVERRIDABLE_FIELDS`，覆写会被
+# **静默丢弃**（"规则写了却不生效"——正是 Issue #14 里"为什么没事按那个规则"的根因形态）。
+# 故此处把"可覆写数值域"与"内置默认"做一次构造期对照：
+# 除下面明确列出的**语义域/派生域**外，任何数值字段漏登记都会在下述断言中暴露。
+_NON_OVERRIDABLE_FIELDS = (
+    "backoff",            # 语义域：阶梯合法性由 StepBackoff 校验
+    "probe_drivers",      # 语义域：落点成员资格不可改（只可重排）
+    "platform",           # 语义域：计费口径是"一句话"，不按仓改
+    "source", "scope", "chain", "extras",   # 留痕/元数据
+)
+
+
+def overridable_field_names() -> List[str]:
+    """可覆写的数值域清单（对外暴露，供自检与文档引用）。"""
+    return list(_OVERRIDABLE_FIELDS)
+
+
+def _audit_overridable_fields() -> List[str]:
+    """返回**漏登记**的数值字段名（应为空）。
+
+    判定：字段的"内置默认"与"显式传参"可区分（即它就是个可覆写数值），
+    却不在 `_OVERRIDABLE_FIELDS` 里 → 仓库级覆写会被静默丢弃。
+    """
+    import dataclasses
+    default = CollabRules()
+    names: List[str] = []
+    for f in dataclasses.fields(default):
+        if f.name in _NON_OVERRIDABLE_FIELDS or f.name in _OVERRIDABLE_FIELDS:
+            continue
+        val = getattr(default, f.name)
+        if isinstance(val, (int, float, str, list, tuple)) \
+                and not isinstance(val, bool):
+            names.append(f.name)
+    return names
 
 
 def _merge_rules(base: "CollabRules", overlay: "CollabRules") -> "CollabRules":

@@ -63,10 +63,17 @@ loop:
   max_stall_repeats: 2         # 同一整改项指纹连续重复 → 停滞熔断
 
 # ---- 审查范围：日常只审变化，全量只在大版本 ----
+# Ref: #14 本次追问「平时只跑增量，不跑全量；尤其不适合连跑三次（同一口径无判别力）」
 scan:
   major_version_tags: ["major-version", "大版本", "release-major"]
   full_scan_keywords: ["大版本", "全量", "major version", "full scan"]
   scan_keywords: ["只审变化", "增量", "只跑增量", "scan only"]
+  default_mode: "scan"
+  max_identical_repeats: 1          # 同一口径只跑一次；第 2 次起跳过
+  repeat_rerun_on_failure: true     # 仅"上一轮不绿"才允许同口径重跑
+  repeat_keys: ["mode", "revision", "impact", "command"]
+  allow_stability_repeats: false    # 禁止"连跑 N 次"当稳定性论证
+  stability_via: ["targeted_probe", "mutation_probe", "independent_scenario"]
 
 # ---- 平台计费口径（回答"等待会不会占用 CPU 计费"） ----
 # 依据 CNB 官方文档：/zh/pricing.md、/zh/build/timeout.md、

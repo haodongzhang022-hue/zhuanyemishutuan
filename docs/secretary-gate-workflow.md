@@ -233,6 +233,38 @@ sleep/轮询**——那是唯一真正烧核时的做法。
 - 落地：`review/scope.py`（`decide_scan` / `scan_commands`）；
   门面 `SecretarySession.review_scope()` / `review_scope_commands()`。
 
+## 2.4 增量执行与同口径去重（v0.9 新增 · Ref: #14 追问）
+
+> 平时不需要跑全量，而且**尤其**不适合连跑三次…**同一个口径几乎不会产生分歧**。
+> 所以像这种连续跑三次全量是无效的。…我们已经把这一套只跑增量、不跑全量的建立过了呀。
+
+**问题定位（用户问"是规则不健全吗？还是配置有问题？"）**：两者都有——
+
+| 缺口 | 表现 | 修法 |
+|---|---|---|
+| 规则只到"范围"，没到"重复" | 只说了"别全量"，**没说"同一口径别重复跑"** | 规则包补 `max_identical_repeats` / `allow_stability_repeats` / `stability_via` |
+| 规则是**口径**不是**机制** | 写给人/agent 看，靠"记得"执行；没人提就不会执行 | 新增 `RunScopeGuard`：判 `skip_duplicate` 即**不跑**（跳过不需要自觉） |
+| 配置**白名单漏登记** | 规则文件里写了新字段，**跑起来还是默认值**（静默丢弃） | 补齐 `_OVERRIDABLE_FIELDS` + 自检 `_audit_overridable_fields()` |
+| 流水线**没有测试阶段** | `.cnb.yml` 只有 echo/node -v，"只跑增量"无处落地 | 新增 `scripts/ci-incremental-test.sh` 并接入 `main.push` |
+
+**判定表**（`RunScopeGuard.decide`，口径指纹 = `mode + revision + impact + command`）：
+
+| 情形 | 判定 |
+|---|---|
+| `window_repeats > 1`（想连跑 N 次） | `blocked_stability` —— **红/绿都拒**，给替代口径 |
+| 缺版本 / 缺命令 | `run`（判不出就不拦） |
+| 同口径次数 < 上界 | `run` |
+| 达上界 + 上一轮**明确红** | `run`（红→修→再跑有新信息） |
+| 达上界 + 其余（含**没给结论**） | `skip_duplicate` |
+
+- **"没给结论 ≠ 跑红了"**：把未知当红 = 默认放行，判重形同虚设（本轮修掉的真缺陷）。
+- **稳定性论证换口径**：定点探针 / 变异探针 / 独立场景，而不是把同一命令再跑两遍
+  （跑法固定 → 重复跑**不产生判别力**）。
+- 受影响面按**集合**语义（换顺序 = 同一口径），且必须**由 revision 决定**
+  （读工作区会算出假新口径 → 判重失效）。
+- 落地：`collab/run_guard.py`；门面 `run_decision` / `record_run` / `run_repeats_of` /
+  `run_scope_overview` / `run_scope_note`；执行入口 `scripts/ci-incremental-test.sh`。
+
 ## 3. 角色职责与交接卡
 
 | 角色 | 职责 | 交接/回转条件 |

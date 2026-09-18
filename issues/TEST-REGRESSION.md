@@ -1107,3 +1107,62 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - `pyflakes`（新增/改动文件）0 告警；`compileall src tests` OK。
 - `.cnb.yml`：YAML 语法 ✅ / 语义 ✅（Schema 告警为 HEAD 既有，未新增）。
 
+
+---
+
+## 十八、Issue #14 追问 · 只跑增量 / 同口径不重复（PR #15 分支）
+
+> 触发：用户「平时不需要跑全量，而且尤其是不适合连跑三次…同一个口径几乎不会产生分歧…
+> 我们已经把这一套只跑增量、不跑全量的建立过了呀，但可能在其他仓库没有形成，组织下通用的…
+> 现在为什么没事按那个规则呀，是规则不健全吗？还是配置有问题？检查一下这个吧。」
+
+### 18.1 问题定位：**四个缺口叠加**（规则不全 + 机制缺失 + 配置漏登记 + 流水线没接）
+
+| # | 缺口 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | 规则**只到"范围"没到"重复"** | `scan` 段只有 `major_version_tags` / `*_keywords`，无任何"同一口径别重复跑"的参数 | 规则包补 `default_mode` / `max_identical_repeats` / `repeat_keys` / `allow_stability_repeats` / `stability_via`（组织级 + 仓库级都补） |
+| 2 | 规则是**口径不是机制** | `decide_scan` 只返回 `scan`/`full` 字符串；没有任何代码**拦**重复执行 | 新增 `collab/run_guard.py`（`RunScopeGuard`）：`skip_duplicate` / `blocked_stability` |
+| 3 | 配置**白名单漏登记** | `_OVERRIDABLE_FIELDS` 是硬编码元组；实测仓库级写 `max_identical_repeats: 3` → 合并结果**仍是 1**（静默丢弃） | 补齐白名单（含漏掉的 `crontab_interval_minutes`）+ 自检 `_audit_overridable_fields()` |
+| 4 | 流水线**没有测试阶段** | `.cnb.yml` 只有 `echo` + `node -v`；"只跑增量"**无处落地** | 新增 `scripts/ci-incremental-test.sh`，接入 `main.push` |
+
+> 第 3 条正是用户问的"规则不健全还是配置有问题"：**两者都有**——
+> 规则缺"重复"这一维，且新增字段被**静默丢弃**（写了不生效），
+> 再叠加"没人真正执行它"。三层都不拦住，才会"没事就不按那个规则"。
+
+### 18.2 本轮修掉的真缺陷（都配反向对照护栏）
+
+| # | 缺陷 | 后果 | 护栏 |
+|---|---|---|---|
+| 1 | "上一轮不绿"用 `not _is_green(...)` 判 | **未知/空也算红** → 台账里只要没结论，同口径**无限重跑**，判重形同虚设 | `test_no_verdict_does_not_license_rerun` / `test_unknown_verdict_does_not_license_rerun`（反向）+ `test_explicit_red_verdict_licenses_one_rerun`（正向） |
+| 2 | `window_repeats>1` 原按"上轮绿"才拒 | 上轮红时可"连跑三次" → 例外被当默认路径 | `test_window_repeats_three_blocked_even_when_red` |
+| 3 | 仓库级覆写漏登记（见 18.1 #3） | "规则写了不生效" | `test_audit_is_discriminative`（故意移除字段 → 自检必须报出） |
+| 4 | CI 受影响面读**工作区**而非 revision | 同一 revision 算出不同 impact → 每次当"新口径" → 判重失效（实测：同命令连跑 3 次全部放行） | 改 `git diff <base>...<REVISION>`；`test_impact_order_irrelevant` / `test_impact_duplicates_collapse` |
+
+### 18.3 判定表（`RunScopeGuard.decide`）
+
+口径指纹 = `mode + revision + impact + command`（**只有口径字段**进指纹）。
+
+| 情形 | 判定 |
+|---|---|
+| `window_repeats > 1`（想连跑 N 次） | `blocked_stability`（**红/绿都拒**）+ 替代口径 |
+| 缺版本 / 缺命令 | `run`（判不出就不拦） |
+| 同口径次数 < 上界（1） | `run` |
+| 达上界 + 上一轮**明确红** | `run` |
+| 达上界 + 其余（含**没给结论**） | `skip_duplicate` |
+
+### 18.4 端到端实测（`scripts/ci-incremental-test.sh`）
+
+| 调用 | 结果 |
+|---|---|
+| 第 1 次（同口径） | `run` → 533 passed（增量目标，非全量） |
+| 第 2 次（同口径） | `skip_duplicate` → `[ci] 本次跳过（不消耗构建/测试）` |
+| 第 3 次（同口径） | `skip_duplicate` → 跳过 |
+| `CNB_WINDOW_REPEATS=3` | `blocked_stability` + `targeted_probe/mutation_probe/independent_scenario` → 跳过 |
+| 换基线（受影响面变） | `run` → 420 passed（新口径，正常放行） |
+
+### 18.5 自测
+
+- `pytest -q`：**616 passed**（基线 577 + 新增 `test_run_scope_issue14.py` **39** 项）。
+- `pyflakes`（改动文件）0 告警；`compileall src tests` OK。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- **本轮不连跑三次**：按新口径，同一口径第 2 次即跳过（自证口径生效）。

@@ -44,6 +44,8 @@ from ..collab import (
     ProbeOutcome,
     StepBackoff,
     WaitPolicy,
+    RunScopeGuard,
+    RunDecision,
     load_rules,
 )
 from ..review import (
@@ -139,6 +141,7 @@ class SecretarySession:
         locks_dir: Optional[str] = None,
         persistent_grace_sec: Optional[float] = None,
         collab_rules: Optional[CollabRules] = None,
+        run_guard_dir: Optional[str] = None,
         rules_path: Optional[str] = None,
         probe_dir: Optional[str] = None,
         max_checks: Optional[int] = None,
@@ -289,6 +292,14 @@ class SecretarySession:
             # ≤ 此值挂 cnb:await，> 此值交平台 crontab（固定 */5 一档扫）。
             await_max_sec=self.collab_rules.probe_await_max_sec,
             rules=self.collab_rules,
+        )
+        # 同口径重复执行守卫（Issue #14 本次追问）：**让"只跑增量、不连跑"成为机制**。
+        # 日常默认 `scan`（增量）；同一口径（范围/版本/受影响面/命令）只跑一次，
+        # 第 2 次起 `skip_duplicate`——跑法固定，重复跑不产生判别力（只重复烧构建/测试）。
+        # 「连跑 N 次同一命令」当稳定性论证 → `blocked_stability` + 替代口径。
+        self.run_guard = RunScopeGuard(
+            rules=self.collab_rules,
+            data_dir=run_guard_dir or os.path.join(self._session_root, "run-scope"),
         )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
@@ -1560,6 +1571,61 @@ class SecretarySession:
     def review_scope_commands(self, **kwargs) -> Dict[str, str]:
         """按范围档位给出构建/测试执行口径（``scan`` 档明确不跑全量）。"""
         return scan_commands(self.review_scope(**kwargs))
+
+    # ------------------------------------------------------------------
+    # 同口径重复执行守卫（Issue #14 本次追问：只跑增量、不连跑同一口径）
+    # ------------------------------------------------------------------
+
+    def run_decision(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        last_verdict: str = "",
+        window_repeats: int = 1,
+    ) -> RunDecision:
+        """**跑不跑**：日常默认增量；同一口径（范围/版本/受影响面/命令）只跑一次。
+
+        - 同一口径第 2 次起 → ``skip_duplicate``（跑法固定，重复跑不产生判别力）；
+        - 想"连跑 N 次"当稳定性论证 → ``blocked_stability`` + 替代口径
+          （定点/变异探针、独立场景）；
+        - 例外：同口径已达上界但上一轮**不绿** → 允许重跑（红→修→再跑有新信息）。
+        """
+        return self.run_guard.decide(
+            mode=mode, revision=revision, impact=impact, command=command,
+            last_verdict=last_verdict, window_repeats=window_repeats)
+
+    def record_run(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        verdict: str = "",
+    ):
+        """登记一次**实际执行**（只记真的跑了的；被跳过的重复不计数）。"""
+        return self.run_guard.record(mode=mode, revision=revision, impact=impact,
+                                     command=command, verdict=verdict)
+
+    def run_repeats_of(self, mode: str = "", revision: str = "",
+                       impact: Any = None, command: str = "") -> int:
+        """某口径已执行几次（"连跑三次"这类行为会被一眼看见）。"""
+        return self.run_guard.repeats_of(mode=mode, revision=revision,
+                                         impact=impact, command=command)
+
+    def run_scope_overview(self) -> Dict[str, Any]:
+        """口径台账总览：跑了几次、有没有**超出同口径上界**的重复执行。"""
+        return self.run_guard.overview()
+
+    def run_scope_note(self) -> str:
+        """一行口径（评论/文档/角色提示词共用）：**只跑增量、同口径只跑一次**。"""
+        r = self.collab_rules
+        return (f"日常只跑增量（默认 {r.scan_default_mode}）；同一口径"
+                f"（范围/版本/受影响面/命令）最多跑 {r.max_identical_repeats} 次，"
+                f"第 2 次起跳过；稳定性论证请换口径"
+                f"（{'/'.join(r.stability_via)}），不连跑同一命令；"
+                f"全量（full）只在大版本")
 
     # ------------------------------------------------------------------
     # 检查点探测器（Issue #14 追问：非轮询 → 检查点 → 状态变化再触发）

@@ -61,6 +61,23 @@ scan:
   major_version_tags: ["major-version", "大版本", "release-major"]
   full_scan_keywords: ["大版本", "全量", "major version", "full scan"]
   scan_keywords: ["只审变化", "增量", "只跑增量", "scan only"]
+  # 默认档位：**日常=增量**。除大版本外一律增量，不需要有人"记得"去选。
+  default_mode: "scan"
+  # 同口径重复执行上界（Issue #14 本次追问的核心）：
+  # 「同一个口径几乎不会产生分歧」——**同一范围 + 同一版本 + 同一命令**再跑没有新信息。
+  # 1 = 同一口径只跑一次；第 2 次起判为重复，直接跳过（不消耗构建/测试）。
+  # 允许因"上一轮结论为红"而重跑（见 repeat_rerun_on_failure）。
+  max_identical_repeats: 1
+  # 仅当上一轮结论是"不绿"时才允许同口径重跑（红→修→再跑是有信息的）
+  repeat_rerun_on_failure: true
+  # 判"同一口径"的比较键（缺一不可）：范围档位 + 版本 + 受影响面 + 命令行
+  repeat_keys: ["mode", "revision", "impact", "command"]
+  # 是否允许"连跑 N 次同一命令"作为稳定性论证（**默认禁止**）
+  # 跑法固定时，重复跑不会产生分歧，只是重复烧构建/测试 —— 无判别力
+  allow_stability_repeats: false
+  # 稳定性论证的正规替代：先跑一次增量，再对**可疑项**做定点/变异探针，或换用
+  # 变更集不同的独立口径（见 stability_via）
+  stability_via: ["targeted_probe", "mutation_probe", "independent_scenario"]
 
 # ---- 平台计费口径（跨仓同一句话：等待不计 CPU） ----
 platform:

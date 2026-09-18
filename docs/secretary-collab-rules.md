@@ -26,6 +26,7 @@
 | 锁 | `locks.retry_delay_sec` / `persistent_grace_sec` / `registry_shared` | 延迟首档 10s；重触发转持续锁；所有锁进一本台账 |
 | 循环熔断 | `loop.max_rounds`=3 / `max_advisory_fix_rounds`=1 / `max_total_rounds`=5 / `max_stall_repeats`=2 | §2.1 |
 | 审查范围 | `scan.major_version_tags` / `full_scan_keywords` / `scan_keywords` | 日常只审变化，全量只在大版本 |
+| 增量执行 | `scan.default_mode` / `max_identical_repeats` / `repeat_keys` / `allow_stability_repeats` / `stability_via` | §2.4（**同一口径只跑一次**；禁连跑当稳定性论证） |
 | 探测 | `probe.*` | §4.1（非轮询检查点、固定 `*/5`、落点分工） |
 | 计费口径 | `platform.*` | §4（等待不计 CPU） |
 
@@ -42,6 +43,38 @@
 
 > 显式传参（如 `SecretarySession(retry_delay_sec=…)`）**优先于**规则包——
 > 调用方有明确口径时以调用方为准；不传才取规则包。
+
+### 2.4 增量执行：只跑变化，同一口径不重复
+
+> 平时不需要跑全量，而且**尤其是**不适合连跑三次…连续跑三次，有问题也可能查不出来，
+> 因为跑的方式是固定的。**同一个口径几乎不会产生分歧**。所以像这种连续跑三次全量是无效的。
+
+两条**机制**（不是提醒；由 `RunScopeGuard` 判定，跳过不需要"自觉"）：
+
+| 口径 | 数值 | 说明 |
+|---|---|---|
+| 日常档位 | `default_mode: scan` | **默认就是增量**（不需要有人记得选） |
+| 同一口径上界 | `max_identical_repeats: 1` | 第 2 次起 `skip_duplicate` |
+| 口径指纹字段 | `repeat_keys: [mode, revision, impact, command]` | **只有口径字段**进指纹（时间戳/执行人不得进） |
+| 连跑当稳定性论证 | `allow_stability_repeats: false` | 显式想连跑 → `blocked_stability` |
+| 稳定性替代路径 | `stability_via: [targeted_probe, mutation_probe, independent_scenario]` | 换口径，而不是重跑同一命令 |
+
+判定优先级（`RunScopeGuard.decide`）：
+
+1. **连跑**（`window_repeats > 1`）→ `blocked_stability`（**红/绿都拒**：
+   "上轮红"只允许"重跑一次"，不等于"允许连跑三次"）；
+2. 口径信息不全（缺版本/缺命令）→ `run`（**判不出就不拦**，不挡住干活）；
+3. 同口径次数 < 上界 → `run`；
+4. 达上界 + 上一轮**明确红** → `run`（红→修→再跑有新信息）；
+5. 达上界 + 其余（含**没给结论**）→ `skip_duplicate`。
+
+**"没给结论 ≠ 跑红了"**：这是实现中抓到的真缺陷——原用 `not _is_green(...)`
+把"未知/空"也当成红，等于**默认放行**（台账里只要没结论，同口径就能无限重跑）。
+现改为只认**明确的红**（`_is_red`）才走例外。
+
+**配置侧同类缺陷（本轮根因之一）**：`_OVERRIDABLE_FIELDS` 是**白名单**，
+新增数值字段若忘登记，仓库级覆写会被**静默丢弃** —— 表现为"规则文件里明明写了，
+跑起来还是默认值"。现已加自检 `_audit_overridable_fields()`（漏登记即断言失败）。
 
 ## 3. 等待阶梯：从少到多，到顶即停
 

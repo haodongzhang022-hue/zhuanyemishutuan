@@ -7,6 +7,10 @@
 - `rules`（`CollabRules`）：整包协同参数 + YAML 装载（仓库可覆写）
 - `wait_policy`（`WaitPolicy`）：把"等多久"翻译成"怎么等"——**等待交平台挂起，
   本地不做 CPU 轮询**（回答"等待会不会占用构建 CPU 计费"）
+- `run_guard`（`RunScopeGuard`）：**同口径重复执行守卫**——日常默认增量、
+  同一口径（范围/版本/受影响面/命令）只跑一次，第 2 次起跳过；
+  "连跑 N 次同一命令"当稳定性论证 → 显式拒绝并给替代口径
+  （跑法固定 → 重复跑不产生判别力，只重复烧构建/测试）
 - `probe`（`CheckpointProbe`）：**检查点探测器**——非轮询，"形成检查点 → 判断检查点 →
   状态变化/到点再触发"，最多 6 次（= 等待阶梯档位数），平台落点仅 `cnb:await` /
   `crontab` / `api_trigger`（webhook）/ 交回人工
@@ -62,6 +66,14 @@ from .rules import (
     find_rules_file,
     load_rules,
     load_rules_chain,
+)
+from .run_guard import (
+    BLOCKED_STABILITY,
+    RUN,
+    SKIP_DUPLICATE,
+    RunDecision,
+    RunRecord,
+    RunScopeGuard,
 )
 from .wait_policy import (
     ALL_WAIT_MODES,
@@ -124,4 +136,10 @@ __all__ = [
     "ORGANIZATION_RULES_RELPATH",
     "load_rules_chain",
     "find_rules_file",
+    "RunScopeGuard",
+    "RunDecision",
+    "RunRecord",
+    "RUN",
+    "SKIP_DUPLICATE",
+    "BLOCKED_STABILITY",
 ]

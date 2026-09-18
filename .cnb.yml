@@ -28,6 +28,13 @@
 #   ③ 这套 probe 口径在**组织级共享**（shared/collab/organization.yaml，全组织一份），
 #      仓库级 shared/collab/collab-rules.yaml **只覆写数值**；跨仓接力**只传判定**，
 #      接收方按同一份规则出同一套动作（dispatch_probe_event_shared），不按本地会话号重算
+# 增量执行（v0.9 · Issue #14 追问）：**日常只跑增量、同一口径只跑一次**
+#   —— 用户口径：「平时不需要跑全量，尤其不适合连跑三次（跑法固定，同一口径不产生分歧）」。
+#   机制（非提醒）：`RunScopeGuard` 判 `skip_duplicate` 即**不跑**；
+#   想"连跑 N 次"当稳定性论证 → `blocked_stability` + 替代口径
+#   （定点/变异探针、独立场景）。规则：shared/collab/*.yaml 的 `scan` 段；
+#   执行入口：scripts/ci-incremental-test.sh（接入 main.push，日常唯一跑法）。
+#   全量（full）只在**大版本**，日常绝不走。
 # 角色定义见 .cnb/settings.yml（秘书· 命名空间）
 # ============================================================
 
@@ -40,6 +47,14 @@ main:
       stages:
         - echo "秘书团流水线已启动"
         - node -v
+        # **增量测试（日常唯一跑法）**：只跑本 PR/本次推送**变更相关**的用例，
+        # 不跑全量、更不连跑同一命令（跑法固定 → 重复跑不产生判别力）。
+        # 全量只在**大版本**（major-version 标签 / 显式触发）。
+        # 口径（机制，非提醒）：`RunScopeGuard.decide()` 同口径第 2 次起 skip_duplicate；
+        # "连跑 N 次"当稳定性论证 → blocked_stability + 替代口径
+        # （定点/变异探针、独立场景）。规则见 shared/collab/*.yaml。
+        - python3 --version || true
+        - ./scripts/ci-incremental-test.sh
 
 # NPC 任务兜底（Issue/PR 评论 @NPC 触发）
 .npc_task: &npc_task
