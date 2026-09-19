@@ -1052,7 +1052,6 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 4. 浅克隆下跨版采集回退文件级消解（保守）。
 5. 有效覆盖面兜底只在 **diff 触及范围**内生效（口径收敛，见契约 §5）。
 
-
 ---
 
 ## 十六、Issue #14 收口轮 · 全量复跑暴露的 🔴-C 修复（「查不到」≠「没有」）
@@ -1065,7 +1064,14 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 
 | 现象 | 根因 |
 |---|---|
-| `TestG13WholeFileRewriteRatioBranch` 2 项 IndexError / AssertionError，**5 次连跑稳定失败**（非 flake） | ① 沙箱未对消宿主全局 `commit.gpgsign` → 镜像内 `git commit` **静默失败 rc=128**（*gpg failed to sign the data*）→ 沙箱**无 HEAD**；② 门禁 `changed_files` 用 `_run`（**不校验 rc**），base 解析失败返回 **128 + 空 stdout**，被当作"**无变更**" |
+| `TestG13WholeFileRewriteRatioBranch` 2 项失败，**5 次连跑稳定**（非 flake） | 见下两条根因 |
+
+根因（串联）：
+
+1. 沙箱未对消宿主全局 `commit.gpgsign` → 镜像内 `git commit` **静默失败 rc=128**
+   （*gpg failed to sign the data*）→ 沙箱**无 HEAD**；
+2. 门禁 `changed_files` 用 `_run`（**不校验 rc**）→ base 解析失败返回
+   **128 + 空 stdout**，被当作「**无变更**」。
 
 **关键**：② 不只是"测试环境问题"——它意味着**生产路径**上，
 "基线查不到"会被读成"没有增量"，产出**空计划**。空计划 = 本轮实跑 0 例，
