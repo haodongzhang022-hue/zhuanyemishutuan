@@ -1051,3 +1051,67 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 3. 仅识别 `*.py` 测试面（其他语言测试面需扩展 `looks_like_test_path`）；
 4. 浅克隆下跨版采集回退文件级消解（保守）。
 5. 有效覆盖面兜底只在 **diff 触及范围**内生效（口径收敛，见契约 §5）。
+
+---
+
+## 十六、Issue #14 收口轮 · 全量复跑暴露的 🔴-C 修复（「查不到」≠「没有」）
+
+> 触发：用户指示"PR #19 已合并，尝试收尾"后**全量复跑**，实测 **2 项失败**。
+> 初判像"环境噪声"，追查确认是**两个真缺陷叠加**，且其中一个是本门禁
+> **最危险的失败模式（静默假绿）**。
+
+### 16.1 现象 → 根因
+
+| 现象 | 根因 |
+|---|---|
+| `TestG13WholeFileRewriteRatioBranch` 2 项失败，**5 次连跑稳定**（非 flake） | 见下两条根因 |
+
+根因（串联）：
+
+1. 沙箱未对消宿主全局 `commit.gpgsign` → 镜像内 `git commit` **静默失败 rc=128**
+   （*gpg failed to sign the data*）→ 沙箱**无 HEAD**；
+2. 门禁 `changed_files` 用 `_run`（**不校验 rc**）→ base 解析失败返回
+   **128 + 空 stdout**，被当作「**无变更**」。
+
+**关键**：② 不只是"测试环境问题"——它意味着**生产路径**上，
+"基线查不到"会被读成"没有增量"，产出**空计划**。空计划 = 本轮实跑 0 例，
+在留痕里与"本轮无需跑测"无从区分 → **假绿**。这正是用户反复强调要避免的
+"用低质量重复冒充安全"的镜像面（这里是用**空跑**冒充"已审"）。
+
+### 16.2 修复（🔴-C1 / 🔴-C2）
+
+- **🔴-C1 沙箱封闭**：新增 `_hermetic_git_init()` —— `commit.gpgsign=false` +
+  `tag.gpgsign=false` + `core.hooksPath=/dev/null`，**断言 commit 成功 + HEAD 存在**。
+  断言的意义：把"沙箱坏了"**显式**暴露，不再伪装成业务失败（原失败形态是
+  IndexError，归因成本很高）。
+- **🔴-C2 查不到 ≠ 没有**：
+  - 新增 `_run_checked()`：git 非零 rc → 抛 `GateError`；
+  - 新增 `_assert_base_usable()` 基线预检；
+  - `plan_sweep` 对不可解析基线走 `_degraded_plan()`：**保守降级**
+    （文件级消解 = 全树重跑，宁多跑不漏跑），`plan.degraded` /
+    `degraded_reason` **留痕可见**（`render()` 输出 `⚠ 降级`），
+    **绝不返回空计划**。
+  - 与不变量 6（指纹缺失 → 保守回退文件级消解）**同源**：保守是本门禁的既定方向。
+
+### 16.3 判别性回归（`TestG14BaseUnresolvable`，5 项）
+
+| 用例 | 断言 | 变异判别力（实测） |
+|---|---|---|
+| `test_unresolvable_base_raises_instead_of_empty` | 基线不可解析 → `GateError` | M17（放行）→ **FAIL** |
+| `test_empty_result_is_still_empty_for_a_valid_base` | **反向对照**：合法基线 + 确无改动 → 仍返回 `[]` | 防恒真（不得把"没有"也判成错） |
+| `test_plan_degrades_conservatively_not_silently` | 降级**非空** + 原因可见 + 全 `dissolved` | M18（空计划）→ **FAIL** |
+| `test_valid_base_with_real_change_is_not_degraded` | **反向对照**：真增量 → 不降级、只落变更文件 | 防降级分支误触发 |
+| `test_sandbox_is_hermetic_against_host_gpgsign` | 沙箱须有 HEAD 且提交**无签名** | M19（去对消）→ **5 FAIL** |
+
+- **变异矩阵**：M17 / M18 / M19 分别触发 **2 / 1 / 5 FAIL**；本实现 **5/5 PASS** → 非恒真。
+- **跨版判别力**：本组用例移植到修复前 head → 确定性失败（无 `degraded` 能力）。
+
+### 16.4 自测（收口轮）
+
+- 本 PR 增量 = 门禁文件新增 5 例（72 → 77 项）+ 门禁文件自身在收口轮扩至 **89 项**。
+- **全量 pytest：397 passed**（连跑 3 次稳定）。
+- 增量口径：`plan --base HEAD` → 计划 **8 例**（新增 5 / 消解 3），已跑过不重复 **389 例**；
+  全量规模 **397**。
+- `compileall src tests poc` OK；`pyflakes` / `flake8 --max-line-length=100`（改动文件）**0 告警**。
+- CLI 端到端：`plan --base HEAD` rc=0；`plan --base deadbeef`（模拟浅克隆）rc=0 且
+  **输出 `⚠ 降级` 全树计划**（旧实现为静默空计划）。

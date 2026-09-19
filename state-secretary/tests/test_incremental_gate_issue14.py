@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from secretary.gate import (  # noqa: E402
     INCREMENT_ADDED, INCREMENT_DISSOLVED, INCREMENT_LEGACY,
-    CounterWordingError, FullSweepReport, IncrementalGate,
+    CounterWordingError, FullSweepReport, GateError, IncrementalGate,
     SweepPlan, SweepReport, SweepTarget, SweepRules,
     assert_counter, render_count,
 )
@@ -582,6 +582,36 @@ class TestG9DiscriminativePower:
 #   (d) 守卫拒绝未含实跑数的文本。
 
 
+def _hermetic_git_init(git, root: str) -> None:
+    """**封闭式** git 沙箱初始化：不受宿主全局/用户 git 配置影响。
+
+    🔴 根因（Issue #14 收口，实测复现）：沙箱只配了 ``user.email/user.name``，
+    **没关签名**。宿主若存在全局 ``commit.gpgsign=true`` 且签名程序不可用
+    （CI 镜像里就是如此），``git commit`` 会**静默失败**（rc=128
+    "gpg failed to sign the data"）——于是仓库**根本没有 HEAD**，
+    随之 ``git diff --numstat HEAD`` 以 128 + 空输出"假装没有变更"，
+    用例拿到空条目后表现为 IndexError / AssertionError。
+
+    此类失败看起来像"环境噪声"，实为**两个真缺陷**叠加（见本文件
+    ``TestG14BaseUnresolvable``）：沙箱不封闭 + 门禁把"查不到"当"没有"。
+
+    修法：``-c commit.gpgsign=false`` + ``-c gpg.format=openpgp`` 显式对消，
+    **并断言 commit 真的成功**（否则后续失败会伪装成"业务失败"，无从归因）。
+    """
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    git("config", "commit.gpgsign", "false")
+    git("config", "tag.gpgsign", "false")
+    git("config", "core.hooksPath", os.devnull)
+    git("add", "-A")
+    commit = git("-c", "commit.gpgsign=false", "commit", "-qm", "base")
+    assert commit.returncode == 0, (
+        f"沙箱基线提交失败（{commit.returncode}）: {commit.stderr}")
+    head = git("rev-parse", "--verify", "HEAD")
+    assert head.returncode == 0, f"沙箱无 HEAD（提交未落）: {head.stderr}"
+
+
 class _Sandbox:
     """沙箱仓库：临时 git repo + 真实可跑的 pytest 用例（隔离真实仓库）。"""
 
@@ -618,11 +648,7 @@ def _sandbox_repo(with_new_file: bool = False, failing: bool = False,
         return subprocess.run(["git", *args], cwd=root, capture_output=True,
                               text=True)
 
-    git("init", "-q")
-    git("config", "user.email", "gate@example.com")
-    git("config", "user.name", "gate")
-    git("add", "-A")
-    git("commit", "-qm", "base")
+    _hermetic_git_init(git, root)
 
     if with_new_file:
         with open(os.path.join(tests, "test_new.py"), "w",
@@ -1514,9 +1540,7 @@ def _sandbox_repo_for_rewrite() -> _Sandbox:
         return subprocess.run(["git", *args], cwd=root, capture_output=True,
                               text=True)
 
-    git("init", "-q")
-    git("config", "user.email", "gate@example.com")
-    git("config", "user.name", "gate")
+    _hermetic_git_init(git, root)
     # 基线：4 行、3 例
     with open(path, "w", encoding="utf-8") as f:
         f.write("def test_a():\n    assert True\n\n"
@@ -1566,3 +1590,101 @@ class TestG13WholeFileRewriteRatioBranch:
                                  rules=SweepRules(dissolve_ratio=1.1))
         assert strict.rules.is_whole_file_rewrite(entry) is False, (
             "阈值 1.1 下比例分支不可达且无关键词 → 须 False（否则判定非比例驱动）")
+
+
+def _sandbox_repo_broken_base() -> _Sandbox:
+    """沙箱：**基线不可解析**（模拟浅克隆 / HEAD 未建立 / 提交静默失败）。
+
+    复现路径与实测一致：初始化并 add 后，commit **未落**（宿主
+    ``commit.gpgsign=true`` 且签名器不可用时即为如此），于是仓库无 HEAD。
+    """
+    root = tempfile.mkdtemp(prefix="gate-sbx-nobase-")
+    pkg = os.path.join(root, "state-secretary")
+    tests = os.path.join(pkg, "tests")
+    os.makedirs(tests, exist_ok=True)
+    with open(os.path.join(pkg, "pytest.ini"), "w", encoding="utf-8") as f:
+        f.write("[pytest]\n")
+    with open(os.path.join(tests, "test_base.py"), "w", encoding="utf-8") as f:
+        f.write("def test_ok():\n    assert True\n")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "gate@example.com")
+    git("config", "user.name", "gate")
+    git("add", "-A")
+    # 刻意**不提交** → 无 HEAD（等价于 commit 静默失败）
+    assert git("rev-parse", "--verify", "HEAD").returncode != 0
+    return _Sandbox(root, IncrementalGate(repo_root=root))
+
+
+class TestG14BaseUnresolvable:
+    """🔴 收口：基线不可解析 — 「查不到变更」**不得**等于「没有变更」。
+
+    缺陷（Issue #14 收口轮实测，非环境噪声）：原 ``changed_files`` 用
+    ``_run``（不校验 rc），``git diff --numstat <base>`` 在 base 解析失败时
+    返回 **128 + 空 stdout**，被当作"无变更" → 空条目 / 空计划。
+    表现是 2 项用例 IndexError / AssertionError，根因是**静默假绿**：
+    "只跑增量"最危险的失败模式就是**空计划被读成"本轮无需跑测"**。
+    """
+
+    def test_unresolvable_base_raises_instead_of_empty(self):
+        """**判别性**：基线不可解析 → ``changed_files`` 抛 ``GateError``。
+
+        反向对照（本条为"旧行为"的对照）：旧实现返回 ``[]``——
+        那正是"查不到 = 没有"的错。"""
+        sbx = _sandbox_repo_broken_base()
+        with pytest.raises(GateError) as ei:
+            sbx.gate.changed_files(base="HEAD")
+        assert "基线不可解析" in str(ei.value)
+
+    def test_empty_result_is_still_empty_for_a_valid_base(self):
+        """**反向对照（防恒真）**：基线合法且**确实无改动**时，
+        仍须返回空列表——不得把"真·无变更"也判成错误。
+        （即：本修复只把**查不到**与**没有**分开，不改变"真的没有"。）"""
+        sbx = _sandbox_repo()
+        assert sbx.gate.changed_files(base="HEAD") == []
+
+    def test_plan_degrades_conservatively_not_silently(self):
+        """**判别性**：基线不可解析 → 计划**保守降级**（全树消解），
+        **不**返回空计划，且降级原因**可见**。
+
+        - 旧行为：空计划（0 例）→ 读成"无需跑测"（假绿）；
+        - 新行为：文件级消解 = 全树需重跑（宁多跑不漏跑）+ ``degraded`` 留痕。"""
+        sbx = _sandbox_repo_broken_base()
+        plan = sbx.gate.plan_sweep(base="HEAD")
+        assert plan.degraded is True
+        assert plan.degraded_reason, "降级必须留痕（否则与真实增量无法区分）"
+        assert plan.planned_count > 0, (
+            "降级不得退化为空计划——空计划会被读成『本轮无需跑测』")
+        assert all(t.kind == INCREMENT_DISSOLVED for t in plan.targets)
+        assert "⚠ 降级" in plan.render()
+
+    def test_valid_base_with_real_change_is_not_degraded(self):
+        """**反向对照（防恒真）**：基线合法且有真实增量 → **不得**降级，
+        且计划只落在变更文件上（证明降级分支不被误触发）。"""
+        sbx = _sandbox_repo_for_rewrite()
+        plan = sbx.gate.plan_sweep(base="HEAD")
+        assert plan.degraded is False
+        assert not plan.degraded_reason
+        assert plan.planned_files == ["state-secretary/tests/test_rw.py"], (
+            plan.planned_files)
+
+    def test_sandbox_is_hermetic_against_host_gpgsign(self):
+        """**回归**：沙箱提交**不受宿主全局 git 配置影响**。
+
+        判别力：把 helper 的 ``-c commit.gpgsign=false`` + 断言去掉后，
+        在 ``commit.gpgsign=true`` 且签名器不可用的环境上，本文件
+        ``TestG13WholeFileRewriteRatioBranch`` 会**确定性**失败
+        （IndexError）——即历史上"看起来像环境噪声"的那两项。"""
+        sbx = _sandbox_repo_for_rewrite()
+        head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
+                              cwd=sbx.root, capture_output=True, text=True)
+        assert head.returncode == 0, "沙箱必须有 HEAD（提交须真的落盘）"
+        unsigned = subprocess.run(
+            ["git", "log", "-1", "--format=%G?"], cwd=sbx.root,
+            capture_output=True, text=True)
+        # "N" = 无签名（正是我们要的：沙箱不该依赖签名器）
+        assert unsigned.stdout.strip() in ("N", ""), unsigned.stdout

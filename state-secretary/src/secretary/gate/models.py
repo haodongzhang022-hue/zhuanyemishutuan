@@ -120,6 +120,10 @@ class SweepPlan:
         # ``deferred`` 可能含**已重命名/删除**的陈旧 nodeid，并集口径会把它
         # 也算进当前全量（实测 e3195ea → 378 vs 真实 377）。
         self.measured_suite_total: int = 0
+        # 🔴 收口：基线不可解析 → 保守降级标记 + 原因（降级必须**可见**，
+        # 否则"全树重跑"会被误读成"本轮真实增量"）。
+        self.degraded: bool = False
+        self.degraded_reason: str = ""
 
     # ---- 统计（权责一致口径） ----
 
@@ -215,6 +219,8 @@ class SweepPlan:
                 lines.append(f"    - {p}（{n} 例）")
         for n in self.note:
             lines.append(f"  备注: {n}")
+        if self.degraded:
+            lines.append(f"  ⚠ 降级: {self.degraded_reason}")
         return "\n".join(lines)
 
 
