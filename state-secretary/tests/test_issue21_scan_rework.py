@@ -9,21 +9,35 @@
 
 | # | 门禁 | 本文件判据 |
 |---|---|---|
-| G1 | 语义 = 超集召回 | 差分 fuzz ≥40 000 × ≥12 seed：`LOST=0` **且** `REV=0` |
-| G2 | ① `MAX_RESCAN_LEN` **显式** | 触界 → `reason="rescan_len"`；**不可**用总上界顶替 |
-| G3 | ② `MAX_SCAN_WORK` **显式**且记账 ≥ 真实扫描量 | 触界 → `reason="work_cap"`；须覆盖**异常构造代价** |
+| G1 | 语义 = 超集召回（**前提 `degraded=False`**） | 差分 fuzz **42 000**（12 seed × 3 500）：`LOST=0` **且** `REV=0` |
+| G2 | ① `MAX_RESCAN_LEN` **显式** | 触界 → `reason="rescan_len"`；**归因 = 冗余兜底**（非"缺一不可"，见 R2） |
+| G3 | ② `MAX_SCAN_WORK` **显式**且记账 ≥ 真实扫描量 | 触界 → `reason="work_cap"`；须覆盖**异常构造代价**；**归因 = 承载上界**（见 R2） |
 | G4 | 降级契约 `degraded=True` + `reason` | 三态各一条；已配平起点**不得静默丢** |
 | G5 | 消费侧接线 **3 处** | `from_handoff` / `adopt_budget` / `probe._coerce_checks_used` |
 | **G6** | **含 `}`** 的对抗输入 **< 1 s** | `'{"k":1, '×40000 + '}'`；**禁止**只测无 `}` 输入 |
-| **G7** | 记账覆盖异常构造代价 / 每候选限长 | 见 G3/G2 的**机制**断言（非仅结论） |
+| **G7** | 记账覆盖异常构造代价 / 每候选限长 | 见 G3/G2 的**机制**断言（非仅结论）；**R5 起改为消融敏感** |
+| **R1** | 断言与实现**同源** | 删两条失真断言（超上界必跳过 / ≤ 上界必全捞到），改可复跑判据 + 反例 |
+| **R2** | 归因 = ①冗余兜底 / ②承载上界 | 删「缺一不可」，附**消融**（cap→1e9 仍被 ② 拦住 / work→1e18 失控） |
+| **R3** | 数字可复跑 | 5 289 / 42 000 / 12 000 / 1.6 MB 标注口径 / 折算比统一 2.0 ns/单位 |
+| **R4** | **降级区间 fuzz** | 三态各 ≥ 3 000 组；判据 = **方向保守**（非"不丢卡"） |
+| **R5** | 判别力 | `test_g7_...` 改造为**消融敏感**（记账量差 > 10×） |
 
-**不变量（硬判据）**：超集召回 —— `a7847f9` 的 `extract_json_objects` 能取到的
-**长度 ≤ `MAX_RESCAN_LEN`** 的对象，本实现**必须全取到**（`_baseline_objects()`
+**不变量（硬判据 · 前提 `degraded=False`）**：超集召回 —— `a7847f9` 的
+`extract_json_objects` 能取到的**长度 ≤ `MAX_RESCAN_LEN`** 的对象，
+**在本次扫描未降级时**本实现**必须全取到**（`_baseline_objects()`
 内联复刻基线实现，故回归**不依赖**旧提交可检出）。
+**降级（`degraded=True`）下允许丢段** —— 这是**已批准语义**，不是缺陷
+（反例：14 B 的 `{"wake":false}` 接在 400 000 个 `{}` 之后 → `work_cap` 丢卡，
+基线能捞到；见 `TestR1AssertionsMatchImplementation`）。
 
-**边界明示**：长度超过 `MAX_RESCAN_LEN` 的合法对象会被**跳过**——但那是
-**显式降级**（`degraded=True` + `reason="rescan_len"`），消费侧取保守方向，
-**不是**静默丢卡。
+**边界明示（与实现同源 · 总师裁定 R1）**：判据是**「候选 `p` 到窗口内首个
+`}` 的距离 > `MAX_RESCAN_LEN`」**——**不是**"长度超过 `MAX_RESCAN_LEN` 的
+合法对象会被跳过"（后者有反例：含内层 `}` 的 **5.2 MB** 合法对象**未被跳过**，
+见 `TestR1AssertionsMatchImplementation`）。
+
+**R4 降级 fuzz**：本文件的 G1 fuzz 覆盖不到降级区间（实测 42 000 组里 body
+最大 962 B、`degraded` 计数 **0**）——降级区间的判据见
+`TestR4DegradedFuzz`（三态各 ≥ 数千组，判据 = **方向保守**，不是"不丢卡"）。
 """
 from __future__ import annotations
 
@@ -281,11 +295,20 @@ class TestG2PerCandidateBoundIsExplicit:
         assert cap >= worst * 8, (worst, cap)
 
     def test_g2_long_legal_object_is_skipped_but_flagged(self):
-        """**边界明示**：超上界的合法对象被跳过 —— 但**显式降级**（不是静默丢）。"""
+        """**边界明示（同源判据 · 总师裁定 R1）**：判据是
+        **「候选 `p` 到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`」**。
+
+        ⚠️ 旧写法（"长度超上界的合法对象会被跳过"）**与实现不同源**，已被
+        反例推翻 —— 见 `TestR1AssertionsMatchImplementation::
+        test_r1a_long_object_with_inner_close_brace_is_not_skipped`。
+        本用例的输入**恰好**满足同源判据（单个候选、`}` 在 cap+10 处）。
+        """
         cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
         obj = json.dumps({"pad": "z" * (cap + 10)})
+        # 前提断言：该输入确实满足**同源**判据（距离 > cap）
+        assert obj.index("}", 1) + 1 > cap
         objs, degraded, reason = _objects_diag(obj)
-        assert objs == []                  # 被跳过
+        assert objs == []                  # 该候选不表态（跳过）
         assert degraded is True            # 但**显式**（可观测、可复核）
         assert reason == SCAN_REASON_RESCAN_LEN
 
@@ -639,11 +662,14 @@ class TestG7AccountingMechanism:
                     SCAN_REASON_RESCAN_LEN}) == 3
 
     def test_g7_accounting_covers_measured_worst_case(self):
-        """记账折算比（实测最坏 ≈ 1.2 ns/单位）→ 上界对应耗时 < 2 s。
+        """**R5 改造**：原判据（"最坏耗时 < 2 s"）**恒真、无判别力**（实测：
+        原样 0.41 s / cap→1e9 0.40 s / candcost→0 1.07 s，三者均 < 2.0）。
 
-        判据取**宽松**上界（只为抓"记账口径失真"这类回归）：若把每候选固定
-        开销从记账里去掉，"微对象密集"形态会记成极小量 → 实际耗时远超
-        `MAX_SCAN_WORK × 折算比`。
+        现改为**消融敏感**：绑 `_SCAN_CANDIDATE_COST` 计入/不计入的**记账量差**
+        （确定性、不受机器速度影响），见
+        `TestR5DiscriminatingPower::test_r5_candidate_cost_is_bound_into_accounting`。
+        本用例保留"耗时 < 2 s"作为**辅助**上界，并同时给出可复跑**折算比**
+        （测量形态：`"{}"×500 000`，`dt / work`，实测最坏 **2.0 ns/单位**）。
         """
         worst_dt = 0.0
         for body in ("{}" * 500000, '{"k":1, ' * 40000 + '}',
@@ -857,3 +883,385 @@ class TestReverseControlRealBodyBeyond417K:
         _, degraded, reason = _objects_diag(body)
         assert degraded is True
         assert reason in (SCAN_REASON_WORK_CAP, SCAN_REASON_RESCAN_LEN)
+
+
+# ==================================================================
+# R1–R5（总师裁定 A⊕B · 2026-09-19T00:26:34Z）
+#   范围冻结：只改文档/断言/数字与实现同源 + 补降级区间 fuzz；
+#   **不改** `_scan_diag` 逻辑 / 常量取值 / 消费侧接线。
+# ==================================================================
+
+class TestR1AssertionsMatchImplementation:
+    """**R1 断言同源**：把两条失真断言换成**可复跑**判据 + 反例用例。
+
+    失真断言（总师独立复现 · 均成立）：
+    ① "长度超 `MAX_RESCAN_LEN` 的合法对象会被跳过" —— **反例**：含内层 `}`
+       的 5.2 MB 对象 → `n=1`（未跳过）。
+    ② "长度 ≤ `MAX_RESCAN_LEN` 必全捞到" —— **反例**：14 B 卡在微对象密集
+       正文后 → `work_cap` 丢卡（基线捞得到）。
+    """
+
+    def test_r1a_source_guard_does_not_claim_length_over_cap_is_skipped(self):
+        """**源码护栏**：`trail.py` 不得再出现"长度超上界的合法对象会被跳过"。"""
+        path = os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
+                            "trail.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        # 失真断言①的**断言式**写法（"会被跳过——但那是显式降级"）不得再现；
+        # 出现在**否定语境**里的引用（"不是……会被跳过"）不算断言。
+        for bad in ("的合法对象会被跳过——但那是",
+                    "的合法对象会被**跳过**——但那是"):
+            assert bad not in src, f"失真断言①仍在：{bad}"
+        # 同源写法必须出现
+        assert "到窗口内首个" in src
+
+    def test_r1a_long_object_with_inner_close_brace_is_not_skipped(self):
+        """**反例①（可复跑）**：长度 > `MAX_RESCAN_LEN` 的合法对象**未被跳过**。
+
+        关键在"候选 `p` 到窗口内**首个** `}` 的距离"：本对象内层就有 `}`，
+        故该候选的窗口内首个 `}` 很近 → 正常配平 → 不触发 `rescan_len`。
+        ⇒ "长度超上界就会被跳过"这条断言**不成立**。
+        """
+        cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
+        inner_close = '{"a":"}"' + ',"b":"' + "x" * (5 * 1024 * 1024) + '"}'
+        assert len(inner_close) > cap, "前提：对象长度 > 上界"
+        # 同源判据：候选 0 到窗口内首个 `}` 的距离（远小于 cap）
+        assert inner_close.index("}", 1) + 1 <= cap, "前提：窗口内首个 `}` 很近"
+        assert isinstance(json.loads(inner_close), dict), "前提：合法 JSON 对象"
+        objs, degraded, reason = _objects_diag(inner_close)
+        assert len(objs) == 1 and objs[0] == json.loads(inner_close), (
+            "长度超上界的合法对象**未被跳过** ⇒ 失真断言①被反例推翻")
+        # 该输入仍降级，但原因是 `DEFAULT_SCAN_BUDGET` 截断，**不是** rescan_len
+        assert degraded is True and reason == SCAN_REASON_TRUNCATED, (degraded,
+                                                                      reason)
+
+    def test_r1b_source_guard_invariant_has_degraded_false_premise(self):
+        """**源码护栏**：超集召回不变量必须带前提 `degraded=False`。"""
+        for rel in ("state-secretary/src/secretary/trail.py",
+                    "docs/secretary-collab-rules.md",
+                    "issues/TEST-REGRESSION.md"):
+            with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
+                src = f.read()
+            assert "degraded=False" in src, f"{rel} 缺 `degraded=False` 前提"
+            assert "降级" in src and "允许丢段" in src, f"{rel} 未明示降级允许丢段"
+
+    def test_r1b_short_card_lost_under_degradation(self):
+        """**反例②（可复跑）**：长度 **≤** `MAX_RESCAN_LEN` 的卡在降级下**被丢**。
+
+        `{"wake":false}` 仅 14 B（远小于上界），接在 400 000 个 `{}` 之后
+        → `work_cap` 丢卡，而基线 `_baseline_objects()` **捞得到**。
+        ⇒ 无前提的"长度 ≤ 上界必全捞到"**不成立**；判据必须写成
+        "`degraded=False` 时 `LOST=0`"。
+        """
+        cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
+        small_card = '{"wake":false}'
+        assert len(small_card) <= cap, "前提：卡长度 ≤ 上界"
+        body = "{}" * 400000 + small_card
+        base = set(_canon(_baseline_objects(body)))
+        objs, degraded, reason = _objects_diag(body)
+        new = set(_canon(objs))
+        assert json.dumps({"wake": False}) in base, "前提：基线能捞到该卡"
+        assert degraded is True and reason == SCAN_REASON_WORK_CAP, (degraded,
+                                                                    reason)
+        assert base - new, "长度 ≤ 上界的卡在降级下**被丢** ⇒ 无前提断言被推翻"
+
+    def test_r1b_invariant_holds_when_not_degraded(self):
+        """**同源判据的正向一半**：`degraded=False` 时 `LOST=0` 确实成立。"""
+        rnd = random.Random(20260919)
+        for _ in range(300):
+            body = "".join(rnd.choice(['{"a":1}', '{"k":', '{', '}', '"', 'x'])
+                           for _ in range(rnd.randint(0, 30))) + CARD
+            base = set(_canon(_baseline_objects(body)))
+            objs, degraded, _ = _objects_diag(body)
+            if degraded:
+                continue
+            assert not (base - set(_canon(objs))), "未降级却丢对象"
+
+
+class TestR2AttributionIsRedundantFallback:
+    """**R2 归因（B 落地）**：① = 冗余兜底 / ② = 承载上界；删除"缺一不可"。
+
+    判据 = **消融敏感**：去掉 ① 不改变量级（仍被 ② 拦住），去掉 ② 才失控。
+    """
+
+    def test_r2_source_guard_no_mutual_necessity_claim(self):
+        """**源码护栏**：三处不得再写"缺一不可"（scan 上界语境）。"""
+        # 判据 = **断言式**写法不得再现（"两条上界（缺一不可）"）；出现在
+        # **否定语境**里的引用（"不是「缺一不可」"）是允许的——那正是本轮改写。
+        targets = {
+            "state-secretary/src/secretary/trail.py":
+                "两条上界**（缺一不可）",
+            "docs/secretary-collab-rules.md": "两条上界（缺一不可",
+            "issues/TEST-REGRESSION.md": "两条上界（**缺一不可**）",
+        }
+        for rel, needle in targets.items():
+            with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as f:
+                src = f.read()
+            assert needle not in src, f"{rel} 仍有「{needle}」"
+        # 归因结论必须写明
+        with open(os.path.join(REPO_ROOT, "state-secretary", "src",
+                               "secretary", "trail.py"), encoding="utf-8") as f:
+            src = f.read()
+        assert "冗余兜底" in src and "承载上界" in src
+
+    def test_r2_ablation_rescan_len_is_redundant(self):
+        """**消融 ①**：`MAX_RESCAN_LEN→1e9` 后对抗输入**仍被 ② 拦住**（同量级）。"""
+        adv = '{"k":1, ' * 40000 + '}'
+        t0 = time.perf_counter()
+        _objects_diag(adv)
+        both = time.perf_counter() - t0
+        orig = trail_mod.MAX_RESCAN_LEN
+        try:
+            trail_mod.MAX_RESCAN_LEN = 10 ** 9
+            t0 = time.perf_counter()
+            _, degraded, reason = _objects_diag(adv)
+            cap_off = time.perf_counter() - t0
+        finally:
+            trail_mod.MAX_RESCAN_LEN = orig
+        assert degraded is True, "去掉 ① 后仍须被 ② 拦住（否则 ① 才是承载上界）"
+        assert reason == SCAN_REASON_WORK_CAP, reason
+        assert cap_off < 0.1, (both, cap_off)
+        assert cap_off < max(both, 1e-6) * 20, (
+            f"去掉 ① 后耗时应同量级：both={both:.4f}s cap_off={cap_off:.4f}s")
+
+    def test_r2_ablation_work_cap_is_the_bearing_bound(self):
+        """**消融 ②**：`MAX_SCAN_WORK→1e18` 后对抗输入**失控**（远慢于 both）。"""
+        adv = '{"k":1, ' * 40000 + '}'
+        t0 = time.perf_counter()
+        _objects_diag(adv)
+        both = time.perf_counter() - t0
+        orig = trail_mod.MAX_SCAN_WORK
+        try:
+            trail_mod.MAX_SCAN_WORK = 10 ** 18
+            t0 = time.perf_counter()
+            _objects_diag(adv)
+            work_off = time.perf_counter() - t0
+        finally:
+            trail_mod.MAX_SCAN_WORK = orig
+        assert work_off > 0.5, f"去掉 ② 应失控：{work_off:.4f}s"
+        assert work_off > max(both, 1e-6) * 100, (
+            f"② 才是承载上界：both={both:.4f}s work_off={work_off:.4f}s")
+
+
+class TestR4DegradedFuzz:
+    """**R4 降级 fuzz（本轮核心缺口）**：强制触发三态，判据 = **方向保守**。
+
+    为什么必须补：G1 fuzz（42 000 组）实测 body 最大 962 B、`degraded` 计数
+    **0** ⇒ **降级路径零覆盖**。降级下**允许丢段**（已批准语义），故判据
+    **不是**"不丢卡"，而是**「消费侧方向保守」**（`fused=True` / `wake=False`）。
+
+    ⚠️ 三态覆盖规模（**实测计数**）：
+    `truncated` **7 200 组** / `work_cap` **3 000 组** / `rescan_len` **3 000 组**
+    （合计 **13 200 组**；每组都走 `from_handoff` 端到端）。
+    `work_cap` 组用**测试内缩小的** `MAX_SCAN_WORK` 以把墙钟压到可跑范围
+    （**代码路径不变**，只是更快触顶；另有 `test_r4_work_cap_at_production_cap`
+    用**生产取值**单独钉住）。
+    """
+
+    _SEEDS_CHEAP = [20260919, 7, 42, 1, 2, 3]
+    _SEEDS_CAP = [20260919, 7, 42]
+
+    # ---- 三态构造器：**强制**触发降级（不依赖随机撞上） ----
+    @staticmethod
+    def _body_truncated(rnd):
+        """`truncated`：正文 > `DEFAULT_SCAN_BUDGET`（`limit < len(text)`）。"""
+        pad = "".join(rnd.choice('{}"x') for _ in range(rnd.randint(0, 200)))
+        return '{"a":1}\n' + "x" * (DEFAULT_SCAN_BUDGET + rnd.randint(1, 5000)) \
+            + pad + CARD
+
+    @staticmethod
+    def _body_work_cap(rnd, n=None):
+        """`work_cap`：微对象密集串把折算量顶过 `MAX_SCAN_WORK`。"""
+        return '{"keep":1}' + "{}" * (n or rnd.randint(2000, 2600)) + CARD
+
+    @staticmethod
+    def _body_rescan_len(rnd):
+        """`rescan_len`：候选到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`。"""
+        cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
+        pad = "x" * (cap + rnd.randint(1, 5000))
+        return '{"a": ' + pad + "}" + CARD
+
+    @pytest.mark.parametrize("seed", _SEEDS_CHEAP)
+    def test_r4_truncated_fuzz_is_conservative(self, seed):
+        """>= 数千组 `truncated`：消费侧方向**保守**（`fused=True`/`wake=False`）。"""
+        rnd = random.Random(seed)
+        n = 0
+        for _ in range(1200):
+            body = self._body_truncated(rnd)
+            objs, degraded, reason = _objects_diag(body)
+            assert degraded is True, "构造的输入未降级"
+            assert reason == SCAN_REASON_TRUNCATED, reason
+            n += 1
+            g = _guard(body)
+            assert g.is_fused() is True, "降级方向不保守（fused）"
+            assert g.should_wake_next() is False, "降级方向不保守（wake）"
+        assert n >= 1200, f"truncated 覆盖不足：{n}"
+
+    @pytest.mark.parametrize("seed", _SEEDS_CAP)
+    def test_r4_work_cap_fuzz_is_conservative(self, seed):
+        """>= 数千组 `work_cap`：**允许丢段**，但方向必须保守。"""
+        rnd = random.Random(seed)
+        orig = trail_mod.MAX_SCAN_WORK
+        n = 0
+        lost_any = 0
+        try:
+            trail_mod.MAX_SCAN_WORK = 1_500_000     # 更快触顶（路径不变）
+            for _ in range(1000):
+                body = self._body_work_cap(rnd)
+                objs, degraded, reason = _objects_diag(body)
+                assert degraded is True, "构造的输入未降级"
+                assert reason == SCAN_REASON_WORK_CAP, reason
+                n += 1
+                if CARD_OBJ not in objs:
+                    lost_any += 1          # **允许**（已批准语义）
+                g = _guard(body)
+                assert g.is_fused() is True, "降级方向不保守（fused）"
+                assert g.should_wake_next() is False, "降级方向不保守（wake）"
+        finally:
+            trail_mod.MAX_SCAN_WORK = orig
+        assert n >= 1000, f"work_cap 覆盖不足：{n}"
+        assert lost_any > 0, "work_cap 下应当**允许**丢段（本用例覆盖该语义）"
+
+    def test_r4_work_cap_at_production_cap(self):
+        """**生产取值钉住**：不缩小上界时 `work_cap` 仍可达且方向保守。"""
+        cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
+        body = '{"keep":1}' + "{}" * 240000 + CARD
+        _, _, _, work = _scan_diag_probe(body)
+        assert work <= cap, (work, cap)
+        objs, degraded, reason = _objects_diag(body)
+        assert degraded is True and reason == SCAN_REASON_WORK_CAP, (degraded,
+                                                                    reason)
+        g = _guard(body)
+        assert g.is_fused() is True and g.should_wake_next() is False
+
+    @pytest.mark.parametrize("seed", _SEEDS_CAP)
+    def test_r4_rescan_len_fuzz_is_conservative(self, seed):
+        """>= 数千组 `rescan_len`：方向保守 + 已取片段不丢。"""
+        rnd = random.Random(seed)
+        n = 0
+        for _ in range(1000):
+            body = self._body_rescan_len(rnd)
+            objs, degraded, reason = _objects_diag(body)
+            assert degraded is True, "强制构造的输入未降级"
+            assert reason == SCAN_REASON_RESCAN_LEN, reason
+            n += 1
+            g = _guard(body)
+            assert g.is_fused() is True, "降级方向不保守（fused）"
+            assert g.should_wake_next() is False, "降级方向不保守（wake）"
+        assert n >= 1000, f"rescan_len 覆盖不足：{n}"
+
+    def test_r4_three_states_all_covered_by_thousands(self):
+        """**覆盖度自证**：三态在 fuzz 里各 ≥ 数千组（防"零覆盖"复发）。"""
+        rnd = random.Random(20260919)
+        counts = {SCAN_REASON_TRUNCATED: 0, SCAN_REASON_WORK_CAP: 0,
+                  SCAN_REASON_RESCAN_LEN: 0}
+        orig = trail_mod.MAX_SCAN_WORK
+        try:
+            trail_mod.MAX_SCAN_WORK = 1_500_000
+            for _ in range(1200):
+                for body in (self._body_truncated(rnd),
+                             self._body_work_cap(rnd),
+                             self._body_rescan_len(rnd)):
+                    _, degraded, reason = _objects_diag(body)
+                    assert degraded is True, "构造的输入未降级"
+                    counts[reason] += 1
+        finally:
+            trail_mod.MAX_SCAN_WORK = orig
+        for state, c in counts.items():
+            assert c >= 1200, f"{state} 覆盖不足：{c}"
+
+    def test_r4_g1_fuzz_covers_no_degradation_reproduced(self):
+        """**缺口复现（把 R4 的必要性钉住）**：G1 fuzz 形态确实**零降级**。"""
+        rnd = random.Random(20260919)
+        frags = TestG1SupersetRecallInvariant._FRAGS
+        alpha = TestG1SupersetRecallInvariant._ALPHA
+        deg = 0
+        maxlen = 0
+        for _ in range(2000):
+            kind = rnd.choice(["random", "frag", "quoteish"])
+            if kind == "random":
+                body = "".join(rnd.choice(alpha)
+                               for _ in range(rnd.randint(0, 40)))
+            elif kind == "frag":
+                body = "".join(rnd.choice(frags)
+                               for _ in range(rnd.randint(0, 40)))
+            else:
+                body = "".join(rnd.choice(['"', '\\', '{', '}', 'x'])
+                               for _ in range(rnd.randint(0, 40)))
+            body = body + CARD
+            maxlen = max(maxlen, len(body))
+            if _objects_diag(body)[1]:
+                deg += 1
+        assert deg == 0, f"G1 形态意外覆盖了降级：{deg}"
+        assert maxlen < 5000, f"G1 形态规模很小（{maxlen} B）⇒ 覆盖不到降级"
+
+
+class TestR5DiscriminatingPower:
+    """**R5 判别力**：`test_g7_accounting_covers_measured_worst_case` 改造为
+    **消融敏感**（绑 `_SCAN_CANDIDATE_COST` 计入/不计入的记账量差）。
+
+    旧用例（实测）：原 0.406 s / cap→1e9 0.397 s / candcost→0 1.021 s，
+    三者均 < 2.0 ⇒ **恒真**（无判别力）。现在改为**记账量**判据（确定性、
+    不受机器速度影响）。
+    """
+
+    def test_r5_candidate_cost_is_bound_into_accounting(self):
+        """**消融敏感**：`_SCAN_CANDIDATE_COST` 计入/不计入 → 记账量差 **≫ 1×**。
+
+        微对象密集形态下，每候选固定开销主导记账；去掉后记账量掉一个数量级
+        ⇒ 判据能把"记账口径被改坏"抓出来（旧用例抓不出）。
+        """
+        body = "{}" * 500000
+        _, _, _, work_full = _scan_diag_probe(body)
+        orig = trail_mod._SCAN_CANDIDATE_COST
+        try:
+            trail_mod._SCAN_CANDIDATE_COST = 0
+            _, _, _, work_zero = _scan_diag_probe(body)
+        finally:
+            trail_mod._SCAN_CANDIDATE_COST = orig
+        assert work_zero > 0
+        ratio = work_full / work_zero
+        assert ratio > 10, (
+            f"记账量对 `_SCAN_CANDIDATE_COST` 不敏感（ratio={ratio:.2f}）"
+            "⇒ 用例无判别力")
+        # 源码护栏：常量存在且被计入
+        with open(os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
+                               "trail.py"), encoding="utf-8") as f:
+            src = f.read()
+        assert "_SCAN_CANDIDATE_COST" in src
+        assert "cost = (j - p) + _SCAN_CANDIDATE_COST" in src
+
+    def test_r5_worst_case_is_measured_and_bounded(self):
+        """最坏耗时判据保留，但**同时**给出可复跑的**折算比**（口径标注）。"""
+        body = "{}" * 500000
+        _, _, _, work = _scan_diag_probe(body)
+        t0 = time.perf_counter()
+        _objects_diag(body)
+        dt = time.perf_counter() - t0
+        ratio_ns = dt / work * 1e9 if work else float("inf")
+        assert dt < 2.0, f"最坏耗时 {dt:.4f}s"
+        # 折算比 × 上界 < 2 s（**可复跑**形式，非"必然上界"）
+        assert MAX_SCAN_WORK * ratio_ns / 1e9 < 2.0, (ratio_ns, dt, work)
+
+    def test_r5_ablation_cap_off_does_not_change_worst_case(self):
+        """**判别力对照**：cap→1e9 不改变最坏耗时（⇒ 旧用例据此恒真）。"""
+        bodies = ("{}" * 500000, '{"k":1, ' * 40000 + '}', "{" * 999000 + "}",
+                  "if (x) {" * 50000 + "}")
+        def worst():
+            w = 0.0
+            for b in bodies:
+                t0 = time.perf_counter()
+                _objects_diag(b)
+                w = max(w, time.perf_counter() - t0)
+            return w
+        base = worst()
+        orig = trail_mod.MAX_RESCAN_LEN
+        try:
+            trail_mod.MAX_RESCAN_LEN = 10 ** 9
+            off = worst()
+        finally:
+            trail_mod.MAX_RESCAN_LEN = orig
+        assert off < 2.0 and base < 2.0, (base, off)
+        assert off < max(base, 1e-6) * 10, (
+            f"cap→1e9 不应改变量级：base={base:.4f}s off={off:.4f}s"
+            "（⇒ 旧用例的『< 2 s』判据在此消融下恒真）")
