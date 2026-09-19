@@ -31,6 +31,23 @@
 | 锁聚合台账 | `LockRegistry` — 所有锁统一登记 + 延迟后检测 + 先做其他并挂锁 + 绝不遗留 | [lock-registry.md](../docs/design/state-secretary-lock-registry.md) |
 | 跨仓库协同规则 | `collab/` — 阶梯退避（10s→30s→60s→3min→6min→10min 到顶即停）+ 等待走平台挂起（不占 CPU） | [collab-rules.md](../docs/secretary-collab-rules.md) |
 | 审查范围分级 | `decide_scan` / `ScanContext` — 日常只审变化，全量只在大版本 | review-arbiter.md §6 |
+| 增量跑测门禁 | `secretary.gate.IncrementalGate` — 只跑有效增量 / 反全量冗余 / 计数权责一致 | incremental-gate.md |
+
+## 增量跑测门禁（Issue #14）
+
+原则：**只跑增量**（允许漏，后续用时会重新提需求去改），不得大量重复冗余；
+**跑多少写多少**，不得用"全量"造成歧义。
+
+```bash
+# 本轮要跑什么（过程可视化；只列 diff 触及的用例）
+python3 poc/incremental_gate.py plan --base <上次已跑 head>
+# 按计划实跑（精确到 nodeid）
+python3 poc/incremental_gate.py run  --base <上次已跑 head>
+# 全量告警视图：把「已跑过、默认不重复」逐项标出来
+python3 poc/incremental_gate.py full --base <上次已跑 head>
+```
+
+契约见 `docs/design/state-secretary-incremental-gate.md`。
 
 ## 快速开始
 
@@ -147,15 +164,24 @@ state-secretary/
 │       ├── session/             # 会话门面层（L3 秘书统一入口）
 │       │   ├── __init__.py
 │       │   └── session.py       # SecretarySession（推荐使用）
-│       └── loop/                # 循环熔断守卫（Issue #14）
-│           ├── __init__.py
-│           └── loop_guard.py    # LoopGuard
-│       └── review/             # 评审版本仲裁 + 审查范围分级（Issue #14 补全机制）
-│           ├── review_arbiter.py  # ReviewArbiter
-│           ├── scope.py           # decide_scan / scan_commands
-│           └── rules.py           # 同侧/过渡态判定规则
-├── tests/                       # 445 项测试（门面 148 + 独立探针 65 + 验收矩阵 13 + 循环熔断 62 + 评审仲裁 75，含评审回归）
+│       ├── loop/                # 循环熔断守卫（Issue #14）
+│       │   ├── __init__.py
+│       │   └── loop_guard.py    # LoopGuard
+│       ├── review/              # 评审版本仲裁 + 审查范围分级（Issue #14 补全机制）
+│       │   ├── review_arbiter.py  # ReviewArbiter
+│       │   ├── scope.py           # decide_scan / scan_commands
+│       │   └── rules.py           # 同侧/过渡态判定规则
+│       ├── collab/              # 跨仓库协同规则（等待阶梯 / 探测 / 增量门禁）
+│       │   └── ...
+│       ├── gate/                # 增量跑测门禁（Issue #14）
+│       │   ├── models.py        # 三态模型 SweepTarget/Plan/Report + 全量告警视图
+│       │   ├── rules.py         # 增量分类 + 冗余剔除 + 有效覆盖面兜底
+│       │   ├── counter.py       # 计数口径守卫（跑多少写多少）
+│       │   └── incremental.py   # IncrementalGate（git 增量识别 + 采集 + 实跑）
+│       └── trail.py             # 留痕公共工具（单一实现，防两处再分叉）
+├── tests/                       # 全量回归（门面 + 独立探针 + 验收矩阵 + 循环熔断 + 评审仲裁 + 增量门禁，含评审回归）
 ├── poc/                         # POC 脚本 + benchmark
+│   ├── incremental_gate.py      # 增量跑测门禁 CLI（plan/run/full/counter）
 │   ├── m1_router.sh             # 单单元路由 POC
 │   ├── m2_router_composite.sh   # 复合路由 POC
 │   ├── m3_multiunit_router.sh   # 多单元路由 POC

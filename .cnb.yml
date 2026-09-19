@@ -1,68 +1,16 @@
 # ============================================================
-# 专业秘书团 · 流水线配置（v0.2）
-# 核心机制：Issue/PR 评论 @NPC 触发（issue.comment@npc）→ npc:go 兜底承接
-# 循环熔断（v0.3）：评审/修复往返有轮次上界（门禁 3 / 非必要 1 / 总 5 / 停滞 2）
-#   熔断后交接 wake=False（静默、不唤醒），恢复仅人工 resume；落地见
-#   state-secretary/src/secretary/loop/loop_guard.py
-# 评审写回 + 审查范围（v0.4 · Issue #14 补全）：只在开启评审时记版本、冲突只额外处理一个；
-#   **日常只审变化，全量只在大版本**（防无效构建/测试）——
-#   state-secretary/src/secretary/review/（ReviewArbiter + decide_scan）
-# 协同规则（v0.5 · Issue #14 追问，全局跨仓库）：等待阶梯从少到多、10 分钟到顶即停
-#   （10s→30s→60s→3min→6min→10min，见 shared/collab/collab-rules.yaml）；
-#   **等待不计构建 CPU**——平台计费项只有 CPU 核时与 AI Credits，没有"等待"这一项；
-#   等待一律走**平台等待/挂起**语义（如内置任务 cnb:await），本地严禁 sleep / 空转轮询
-#   （8 核空转 10 分钟 ≈ 1.33 核时）。落地：state-secretary/src/secretary/collab/
-#   （StepBackoff 阶梯 + WaitPolicy 等待策略）、shared/collab/collab-rules.yaml
-# 检查点探测（v0.6 · Issue #14 追问）：**非轮询**——
-#   形成检查点 → 判断检查点 → 锁/状态变化（cnb:resolve）或到点（平台 crontab）再触发；
-#   最多 6 次（= 等待阶梯档位数），用尽即停止自动挂账、交回人工。**永不本地 sleep**。
-#   落地：state-secretary/src/secretary/collab/probe.py（CheckpointProbe）
-#   平台落点：cnb:await（**≤5min**，零占用）/ crontab（**>5min**，平台代跑）/
-#             api_trigger（外部 webhook 再跑）/ 交回人工（resume_required）
-# 三点已确认（v0.8 · Issue #14：用户「好的，做吧，都做」）：
-#   ① 落点分工**固定不可混用**：≤5min 挂 cnb:await、>5min 交 crontab；
-#      **不存在"一律挂 await"**——长等待挂在单个 await 上等于押注对端一定会 resolve，
-#      对端不 resolve（人没编辑完/外部系统不回调）就是死等；
-#   ② crontab 间隔**固定 */5 一档扫**，**不随阶梯档位放大**（旧 */6、*/10 作废）：
-#      与阶梯时间表解耦——阶梯回答"我们何时再看"，cron 只回答"平台多久代跑一次"；
-#   ③ 这套 probe 口径在**组织级共享**（shared/collab/organization.yaml，全组织一份），
-#      仓库级 shared/collab/collab-rules.yaml **只覆写数值**；跨仓接力**只传判定**，
-#      接收方按同一份规则出同一套动作（dispatch_probe_event_shared），不按本地会话号重算
-# 增量执行（v0.9 · Issue #14 追问）：**日常只跑增量、同一口径只跑一次**
-#   —— 用户口径：「平时不需要跑全量，尤其不适合连跑三次（跑法固定，同一口径不产生分歧）」。
-#   机制（非提醒）：`RunScopeGuard` 判 `skip_duplicate` 即**不跑**；
-#   想"连跑 N 次"当稳定性论证 → `blocked_stability` + 替代口径
-#   （定点/变异探针、独立场景）。规则：shared/collab/*.yaml 的 `scan` 段；
-#   执行入口：scripts/ci-incremental-test.sh（接入 main.push，日常唯一跑法）。
-#   全量（full）只在**大版本**，日常绝不走。
-# 平台语义对齐（v0.10 · Issue #14 本轮）：查证官方文档后发现 `cnb:await` 有两条
-#   会让落点失效的硬约束 —— ① 「只能对**同一个事件**触发的 pipeline 做 await/resolve」；
-#   ② 「一个 `key` **仅能 resolve 一次**」。故落点判定**先过平台约束**（`resolve_driver()`）：
-#   配不上对 → **降级 crontab**（平台代跑 + 平台死锁检测兜底），await key **按轮次唯一**
-#   （`probe:<checkpoint>:r<attempt>`）；`cnb:await` 还必须位于 `stages`（endStages/failStages 不生效）。
-#   出处：/zh/build/internal-steps/cnb/await-resolve.md
-#   同时对齐官方**增量**最佳实践（SCA 插件：「同一组件同一 CVE 不重复阻断」、
-#   「内容未变化的文件重命名不重复产生」）→ 评审侧**同一问题不报第二遍**（评审项指纹），
-#   执行侧**能力降级保守放行**（判不出受影响面就不做增量判重；漏跑比多跑危险）。
-# 组织级分发（v0.10）：`scripts/distribute-collab-rules.sh`（默认 dry-run，`--apply` 才写；
-#   只铺组织级基线，**不覆盖**各仓已有的数值覆写）——各仓库通用。
-# 全量门禁（v0.11 · Issue #14 本轮追问）：**默认全量根本不跑**，不是"默认不跑"。
-#   上一轮只做了 `default_mode: scan`（= **默认值**，不是门禁：调用方显式给
-#   `CNB_SCOPE=full` 就绕过）与 `RunScopeGuard` 判重（判重键含 `revision`，
-#   **每改一行代码 revision 就变 → 每次都算新口径 → 每次都放行**）。
-#   本轮补两道硬闸：
-#   ① `decide_full()` 门禁：`full` 必须同时满足「大版本事实 + 可采信来源
-#      （action / tag / operator，**agent 自述不算**）+ 代码推进类事件」，
-#      否则 `blocked_full` 并给出**可直接跑**的增量命令（拦了但给路）。
-#      ⚠️ 方向与判重相反：判重判不出 → **保守放行**；全量判不出 → **保守拦截**。
-#   ② 去升级口径 `scan.repeat_scope: content`：同一份**受审内容**跨版本只跑一次
-#      （修掉"每开发一步就跑一次 600 多项验证"）。
-#   对外只暴露一条命令 `scripts/ci-dispatch.sh`：不接收"全量"参数，
-#   没有 `run:` 输入 → 恶意/误用输入改不了执行路径。
-#   规则：`shared/collab/*.yaml` 的 `scan.repeat_scope / blocked_events /
-#   pipeline_allowlist`；落地：`collab/full_gate.py` + `collab/platform.py`。
-# 角色定义见 .cnb/settings.yml（秘书· 命名空间）
+# 专业秘书团 · 流水线配置（v0.3 · 适配新版 dsh 生态 / 合并 v0.2 协同段）
+# ------------------------------------------------------------
+# NPC 接入：新版 dsh 生态（cnpc/dsh 镜像）——见 .cnb/npc.yml
+#   角色定义：.cnb/settings.yml（秘书· 命名空间，defaultRole = 秘书·接待）
+#   触发：Issue/PR 评论 @dongdongxiaozu/zhuanyemishutuan(<角色名>)
+#   兜底：$ 段 issue.comment@npc / pull_request.comment@npc → 默认角色
+# 迁移说明：v0.2 使用平台内置 npc:go 执行器；v0.3 改用 npc-dsh 自建镜像，
+#   角色路由由「评论文本 [触发:<角色>]」升级为平台原生「顶层 key = 角色名」。
 # ============================================================
+
+include:
+  - .cnb/npc.yml
 
 main:
   push:

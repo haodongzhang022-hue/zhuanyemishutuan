@@ -21,6 +21,7 @@
 | `state-secretary-checkpoint-probe.md` | 检查点探测器（非轮询探测点：形成检查点 + 判断检查点 + 状态变化/到点再触发；最多 6 次；平台语义 cnb:await/crontab/api_trigger；**已确认**：落点分工 ≤5min await / >5min crontab、crontab 固定 `*/5`、规则组织级共享）· Issue #14 追问 |
 | `state-secretary-platform-alignment.md` | **平台语义对齐 + 官方最佳实践对照**（Issue #14 本轮）：`cnb:await` 硬约束（同一事件配对 / key 仅能 resolve 一次 / 仅 `stages`）+ 配不上对**降级 crontab** + await key 按轮次唯一；能力降级**保守放行**；评审项**确定性去重**（同一问题不报第二遍）；分发到组织（可执行 + 可校验） |
 | `../secretary-collab-rules.md`（docs 根） | **agent 协同规则（全局 · 跨仓库）**：等待阶梯 10s→30s→60s→3min→6min→10min 到顶即停 + 等待不占 CPU（平台挂起）＋ **三点确认**（落点分工 / 固定 `*/5` / 组织级共享）＋ v0.3 平台语义对齐 · Issue #14 |
+| `state-secretary-incremental-gate.md` | 增量跑测门禁（Issue #14）：只跑增量 / 反全量冗余 / 计数权责一致 / 全量须标记 |
 
 ## 2. 对 SKILL.state 论文的三层改进对照
 
