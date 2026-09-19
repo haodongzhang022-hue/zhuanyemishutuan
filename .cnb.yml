@@ -1,5 +1,5 @@
 # ============================================================
-# 专业秘书团 · 流水线配置（v0.3 · 适配新版 dsh 生态）
+# 专业秘书团 · 流水线配置（v0.3 · 适配新版 dsh 生态 / 合并 v0.2 协同段）
 # ------------------------------------------------------------
 # NPC 接入：新版 dsh 生态（cnpc/dsh 镜像）——见 .cnb/npc.yml
 #   角色定义：.cnb/settings.yml（秘书· 命名空间，defaultRole = 秘书·接待）
@@ -15,16 +15,181 @@ include:
 main:
   push:
     - docker:
-        image: node:20
+        # 🔴H（复评第 5 轮）：本阶段会跑 `python3 -m pytest`，**必须声明运行时**。
+        # 旧配置只声明了 Node 运行时（`node:20`）且零安装步骤 —— 该镜像**不含 python3**
+        # （逐层核对：apt 清单里只有 ca-certificates/curl/gnupg/netbase/sq/wget
+        # 与 scm、buildpack-deps 的 -dev 库，Env 无 python 路径），
+        # 于是 `python3 -m pytest` 在干净 node 镜像里**必失败**（`set -euo pipefail`），
+        # 而 main 分支此前无测试阶段 → 属"新引入的必失败阶段"。
+        # 现改为 `python:3.11`（自带 python3 + pip，与 setup.py 的
+        # `python_requires=">=3.9"` 一致），并在 stages 里装测试依赖（pytest）。
+        image: python:3.11
       volumes:
-        - /root/.npm:copy-on-write
+        - /root/.cache/pip:copy-on-write
       stages:
         - echo "秘书团流水线已启动"
-        - node -v
+        - python3 --version
+        # 运行时自检（🔴H）：**装不上 pytest 就直接失败**，不再靠 `|| true`
+        # 把"没有运行时/没有测试框架"静默吞掉（那正是"阶段看似跑了、实际没跑"）。
+        - python3 -m pip install --disable-pip-version-check -q pytest
+        - python3 -c "import pytest, sys; print('pytest', pytest.__version__, sys.version)"
+        # **增量测试（日常唯一跑法）**：只跑本 PR/本次推送**变更相关**的用例，
+        # 不跑全量、更不连跑同一命令（跑法固定 → 重复跑不产生判别力）。
+        # 全量只在**大版本**（major-version 标签 / 显式触发）。
+        # 口径（机制，非提醒）：`RunScopeGuard.decide()` 同口径第 2 次起 skip_duplicate；
+        # "连跑 N 次"当稳定性论证 → blocked_stability + 替代口径
+        # （定点/变异探针、独立场景）。规则见 shared/collab/*.yaml。
+        # **唯一的执行入口**：不接收"全量"参数（全量只能由大版本流程显式触发），
+        # 因此不存在"通过传参绕过全量门禁"的路径。
+        # `utils:params` 只用于**观测**（打印本次拿到的参数），不参与执行。
+        #
+        # 🔴F（跨容器判重载体）：平台每次 push = **新容器、新工作区**，
+        # `<tmp>/run-scope` 每次都从空开始 → 判重永不触发。故台账随**可持久载体**
+        # （评论正文）走，与 🔴A 同一方案：
+        #   ① 跑前把评论正文里的 `<!-- run-scope: … -->` 放进
+        #      `CNB_RUN_SCOPE_TRAIL`（未注入则本次按"无历史"处理，不误拦）；
+        #   ② 跑后脚本打印新的 `<!-- run-scope: … -->` → **追加写回同一条评论**
+        #      （保留旧留痕；解析侧 `max()` + 按 `session_id` 归属过滤）。
+        # 结论必须落**真实退出码**：否则"红→修→再跑"这条唯一有信息量的路径
+        # 会被判重自己堵死（受影响面不变 = 同一份受审内容）。
+        #
+        # 🔴-3（复评第 5 轮）：**载体必须有生产者**。此前
+        # `CNB_RUN_SCOPE_TRAIL` / `CNB_SESSION_ID` 全库**只有读**（本文件也没有
+        # `env`/`imports`）→ 两个变量在生产链路上都无来源，F 停在"提示词要求"：
+        #   ① 归属恒为空 → 跑完写回把评论里**所有会话**的归属整段抹成 `""`
+        #      → 别的会话台账被本会话继承（**漏跑**）/ 红后复跑被堵死；
+        #   ② 留痕取不回 → 判重永不触发。
+        # 故这里把两步接成**可执行的生产者**（`scripts/collab-carrier.sh`）：
+        #   `fetch`     跑前取回载体评论正文里的 `<!-- run-scope: … -->`；
+        #   `writeback` 跑后把本次新留痕**追加**回**同一条评论**（保留旧留痕
+        #               与各自 `session_id` 归属）。
+        # 会话号由 `carrier.session_id_for()` 推导：`CNB_SESSION_ID` →
+        # `CNB_REPO_SLUG` + PR/Issue 号（同一 PR/Issue = 同一会话，跨容器稳定）；
+        # **推导不出 → 不写回**（宁可这次不落载体，也不抹平别人的归属）。
+        - ./scripts/collab-carrier.sh fetch
+        - ./scripts/ci-dispatch.sh
+        - ./scripts/collab-carrier.sh writeback
+
+# Issue / PR 评论触发（**只做秘书接待，不做测试**）
+# —— 防跨仓污染的直接堵口：评论类事件**没有基线、也没有变更集**，
+#    在这里跑任何测试（尤其全量回归）都是纯空烧，且会污染所有接了这套配置的仓库。
+.npc_comment_task: &npc_comment_task
+  name: secretary npc comment
+  stages:
+    - name: npc go
+      type: npc:go
+      options:
+        role: "秘书·接待"
+        userPrompt: |
+          这是一次**评论触发的秘书接待**（不是一次验证/回归）。
+          - 日常一律**只跑增量**（变更相关用例 + 受影响面），**不得跑全量**；
+          - 需要判断"能不能跑全量"时用 `full_decision(major_version=…, source=…, event=…)`：
+            只有【大版本事实 + 可采信来源（action/tag/operator）+ 代码推进类事件】
+            三者同时成立才放行，否则会被判 `blocked_full` 并给出可直接跑的增量命令；
+            **不得把"我觉得这是大版本"当事实**（agent 自述不构成凭据）。
+          - 评论/目录/定时/触发类事件**不得**跑全量；
+          - 同一份**受审内容**跨版本只跑一次（去升级口径 `content`）。
+
+# NPC 任务兜底（Issue/PR 评论 @NPC 触发）
+.npc_task: &npc_task
+  name: secretary npc
+  stages:
+    - name: npc go
+      type: npc:go
+      options:
+        role: "秘书·接待"   # 默认入口；按评论内 [触发:<角色>] 命中对应角色
+
+# 检查点探测的空跑占位（平台 **crontab** 触发时无需 Docker 化工作负载：
+# 探测判定由 npc:go 的秘书角色执行——读取检查点、采集轻量事实、给出下一步）。
+.probe_task: &probe_task
+  name: checkpoint probe
+  stages:
+    - name: probe checkpoint
+      type: npc:go
+      options:
+        role: "秘书·会话"
+        userPrompt: |
+          这是一次**检查点探测**（非轮询、非新需求）：
+          - 检查点 KEY：$CHECKPOINT_KEY（载荷：$PROBE_PAYLOAD）
+          - 只做三件事：① 读 `checkpoints_overview()`；② 用 `probe_checkpoint()`
+            采集轻量事实并判定；③ 按 `dispatch_probe_event()` 的落点执行下一步。
+          - 判定只看**可判定事实**（锁在不在 / 版本变没变 / 我方还等不等），
+            **不看自述、不做推测**；判不出就保持等待，不误判为"已完成"。
+          - 仍未满足 → **按固定分工**挂 `cnb:await`（≤5min，走 `api_trigger_probe_wait`
+            的 await 片）或交 `crontab`（>5min，**固定 `*/5` 一档扫**）；
+            条件满足 → 触发一次真正干活的流水线；
+            预算用尽（最多 6 次）→ 停止自动挂账、交回人工。
+          - **探测预算跨容器继承（必做）**：本任务是**新容器**，本地
+            `data/probe/*.json` 是空的 → `checks_used` 会从 0 开始，"最多 6 次"永不触发。
+            故必须：① 从评论/交接卡里取上一次的 `<!-- probe-budget: … -->` 留痕
+            （**取全部留痕的 max()**，正文里会累积多条，不是只取第一条）；
+            ② 调 `probe_checkpoint(key, external_checks=<上次 checks_used>)` 合并预算；
+            ③ 把本次 `dispatch_probe_event(...)["budget_trail"]` **追加写回同一条评论**
+            （= ①取留痕的那条；保留旧留痕，解析侧按 max() 合并，评论数不膨胀）。
+            没有第 ③ 步，下一棒又会归零（等于把软约束换了个位置）。
+          - **判重台账同样跨容器继承（🔴F）**：跑增量测试前 `inherit_run_scope(评论正文)`
+            恢复"这份受审内容跑过几遍、上轮结论是什么"（留痕 `<!-- run-scope: … -->`，
+            按 `session_id` 归属过滤）；跑完用 `run_scope_trail()` 把新留痕
+            **追加写回同一条评论**（保留旧留痕）。结论必须落**真实退出码**——
+            否则"红→修→再跑"（受影响面不变）会被自己的判重堵死。
+          - **跨仓接力只传判定**（wait/proceed/release/unknown），接收方按组织级同一份规则
+            算落点（`dispatch_probe_event_shared()`），**不按自己的本地会话号重算**；
+            判不出/非法判定一律 `unknown` → 继续等，**不得当成放行**。
+          - **严禁本地 sleep / 空转轮询**（等待一律走平台挂起语义，否则按 CPU 核时计费）。
+
+# 「等锁」的零占用等待：`cnb:await` 挂起，由对端 `cnb:resolve` 在锁释放时唤醒。
+# 说明（官方硬约束，本轮对齐）：`cnb:await`/`cnb:resolve` **只能配合同一事件**触发的
+#   pipeline；跨事件（如 push 放锁）**配不上对、会永远等不到** ——
+#   请用 `cnb:apply` / `cnb:trigger` 触发 `api_trigger_probe_*`，
+#   或按 `await_plan()` 的判定**降级 `crontab`**（平台代跑 + 平台死锁检测兜底）。
+.await_lock_task: &await_lock_task
+  name: await lock release
+  stages:
+    - name: await lock
+      type: cnb:await
+      options:
+        key: $CHECKPOINT_AWAIT_KEY
+      exports:
+        verdict: PROBE_VERDICT
+    - name: resume work
+      type: npc:go
+      options:
+        role: "秘书·会话"
+        userPrompt: |
+          检查点 $CHECKPOINT_KEY 的等待已由 `cnb:resolve` 唤醒（对端状态已变化）。
+          只做一件事：`probe_checkpoint("$CHECKPOINT_KEY")` 复核一次；
+          判定 `proceed` 才继续干活，否则回到等待（不空转）。
 
 # $ 节点：仓库级事件绑定 + 云原生开发环境声明
-# （NPC 事件已在 .cnb/npc.yml 中按角色定义，此处不重复声明）
 $:
+  # **≤5min 的等待落点**：挂 `cnb:await` 零占用（由对端 `cnb:resolve` 唤醒）。
+  # 🟡3 修复：`.await_lock_task` 此前**定义后无人引用**（`*await_lock_task` 出现 0 次）
+  # → 「≤5min 挂 await」这条口径只写在文档里、**未接线**，与 §2.2.2 的
+  # 「落点分工固定不可混用」不闭合。这里补上引用：await 片由本事件承载，
+  # 与 `crontab`（>5min）**互斥不混用**（await 行不带 cron，crontab 行必带）。
+  api_trigger_probe_wait:
+    - *await_lock_task
+  # **平台定时任务（crontab）一档扫**：固定 `*/5`（= 平台 5 分钟下限），
+  # 承载"长等待(>5min)交平台代跑一次探测"——平台才是那个"不睡觉的进程"。
+  # 口径固定：不随等待阶梯档位放大（否则换阶梯就改了平台的代跑节奏）。
+  crontab:
+    - cron: "*/5 * * * *"
+      # 仅支持**明确单一分支**（平台约束）
+      branch: main
+      event: api_trigger_probe_check
+  # 外部 webhook / 平台定时任务驱动的**再触发入口**（承载"检查点再跑"）
+  api_trigger_probe_check:
+    - *probe_task
+  api_trigger_probe_resume:
+    - *probe_task
+  issue.comment@npc:
+    - *npc_comment_task
+  pull_request.comment@npc:
+    - *npc_comment_task
+  issue.open:
+    - *npc_comment_task
+  issue.update:
+    - *npc_comment_task
   vscode:
     - docker:
         image: node:20

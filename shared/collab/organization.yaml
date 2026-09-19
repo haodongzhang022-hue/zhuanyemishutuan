@@ -1,0 +1,136 @@
+# ============================================================
+# 组织级协同规则包（**跨仓库共享 · 一组织一份**）
+# ============================================================
+# 已确认口径 #3：「探测规则推到**组织级共享**」。
+#
+# 层级关系（装载顺序见 secretary.collab.rules.load_rules）：
+#   组织级（本文件 / CNB_ORG_COLLAB_RULES / CNB_ORG_SHARED_DIR）
+#     → 仓库级（各仓 shared/collab/collab-rules.yaml，**只允许覆写数值**）
+#       → 内置默认（代码兜底）
+#
+# 为什么放组织级而不是单仓：
+#   「探什么、最多探几次、怎么等、判出来怎么走」是 **agent ↔ agent 的协同礼仪**，
+#   与任何仓库的业务无关。放单仓 → A 仓探 6 次、B 仓探 9 次，**换仓即行为漂移**；
+#   跨仓协作时双方对同一件事的处置也会不一致（正是"循环"的温床）。
+#
+# 覆写规则（**硬约束**）：
+#   - 仓库级**只允许改数值**（次数/秒数/关键词），**不允许改语义**；
+#   - `probe.drivers` 的**成员资格不可改**（只能重排）：否则换个仓库就能把
+#     "落点"改成非平台语义（本地 sleep/轮询），那正是要防的漏口；
+#   - 不存在「一律挂 await」这条回退路径：落点分工（≤5min await / >5min crontab）
+#     是组织级固定口径。
+# Ref: #14 追问（三点确认：落点分工 / 固定 */5 / 组织级共享）
+#
+# v0.3（Issue #14 本轮：**对齐官方平台语义**）：
+#   查证官方文档后发现 `cnb:await` 有两条会**让落点失效**的硬约束：
+#     ① 「只能对**同一个事件**触发的 pipeline 做 await/resolve」——两侧事件不同
+#        就配不上对，挂上去**永远等不到**（靠平台死锁检测才发现）；
+#     ② 「一个 `key` **仅能 resolve 一次**」——复用同一 key，第 2 次起必死等。
+#   故落点判定**先过平台约束**：不满足 → 自动降级 `crontab`（平台代跑 +
+#   平台死锁检测兜底），且 await key **按轮次唯一**（`probe:<key>:r<n>`）。
+#   出处：/zh/build/internal-steps/cnb/await-resolve.md
+#   另：`cnb:await` 只能跑在流水线的 `stages`（`endStages`/`failStages` 内不生效）。
+#
+#   同轮还对齐了官方**增量**最佳实践（SCA 插件：「同一组件同一 CVE 不重复阻断」、
+#   「内容未变化的文件重命名不重复产生」）：
+#     - 评审侧新增**评审项指纹**（类别 + 语义锚点，**不含路径/行号**）→
+#       同一问题不报第二遍，重复项自动结转（`review/fingerprint.py`）；
+#     - 执行侧新增**能力探测降级**：算不出受影响面时**保守放行**
+#       （判不出就不增量；漏跑比多跑危险）。
+# ============================================================
+
+# ---- 等待/退避：从少到多，到顶即停（组织级统一） ----
+backoff:
+  ladder: [10, 30, 60, 180, 360, 600]
+  max_attempts: 6
+
+# ---- 探测：非轮询检查点，最多 6 次（组织级统一） ----
+probe:
+  max_checks: 6
+  # 落点清单：成员资格**不可改**（组织级口径；仓库级只可重排）
+  drivers: ["platform_await", "platform_crontab", "external_webhook",
+            "delegate_event", "handoff_resume"]
+  # 落点分工**阈值**：≤ 此值挂 cnb:await（零占用）；> 此值交平台 crontab
+  # （已确认口径 #1；默认即平台定时任务下限 5 分钟）
+  await_max_sec: 300
+  # 平台定时任务最小间隔（官方文档下限；低于此值配置无法提交）
+  crontab_min_interval_sec: 300
+  # 平台定时任务间隔：**固定 */5 一档扫**（已确认口径 #2；不随阶梯档位放大）
+  crontab_interval_minutes: 5
+  # 判别式（语义域：判定只看可判定事实，不看 agent 自述）
+  checks: ["confirm", "lock", "version", "event", "resource"]
+
+# ---- 锁：延迟 → 持续 → 聚合台账（组织级统一） ----
+locks:
+  # 首次"正在编辑"的延迟窗（秒）= **等待阶梯第一档**（10s）。
+  # 用户原话「延迟可以到 1 分钟」指**阶梯中可达 1 分钟**（60s 档），不是首档 1 分钟。
+  # 🔴D-1：此数值**真被消费**（SecretarySession 的锁窗口/评审延迟窗取它）。
+  retry_delay_sec: 10
+  persistent_grace_sec: 180
+  registry_shared: true
+
+# ---- 循环熔断：门禁往返的上界（组织级统一） ----
+loop:
+  max_rounds: 3
+  max_advisory_fix_rounds: 1
+  max_total_rounds: 5
+  max_stall_repeats: 2
+
+# ---- 审查范围：日常只审变化，全量只在大版本（组织级统一） ----
+scan:
+  major_version_tags: ["major-version", "大版本", "release-major"]
+  full_scan_keywords: ["大版本", "全量", "major version", "full scan"]
+  scan_keywords: ["只审变化", "增量", "只跑增量", "scan only"]
+  # 默认档位：**日常=增量**。除大版本外一律增量，不需要有人"记得"去选。
+  default_mode: "scan"
+  # 同口径重复执行上界（Issue #14 本次追问的核心）：
+  # 「同一个口径几乎不会产生分歧」——**同一范围 + 同一版本 + 同一命令**再跑没有新信息。
+  # 1 = 同一口径只跑一次；第 2 次起判为重复，直接跳过（不消耗构建/测试）。
+  # 允许因"上一轮结论为红"而重跑（见 repeat_rerun_on_failure）。
+  max_identical_repeats: 1
+  # 仅当上一轮结论是"不绿"时才允许同口径重跑（红→修→再跑是有信息的）
+  repeat_rerun_on_failure: true
+  # 「不绿 → 复跑」的**上界**（🔴F 结转项，复评第 5 轮落上界）。
+  # 文档/修法一直写"复跑**一次**"，但实测**无上界**：连续 5 轮"修了仍红"→
+  # 全 `run`（同版本红重复亦同）→ 例外把判重自己架空。
+  # 默认 1 = 文档口径；置 0 = 不允许因不绿而复跑。
+  max_rerun_on_failure: 1
+  # 判"同一口径"的比较键（缺一不可）：范围档位 + 版本 + 受影响面 + 命令行
+  repeat_keys: ["mode", "revision", "impact", "command"]
+  # 是否允许"连跑 N 次同一命令"作为稳定性论证（**默认禁止**）
+  # 跑法固定时，重复跑不会产生分歧，只是重复烧构建/测试 —— 无判别力
+  allow_stability_repeats: false
+  # 稳定性论证的正规替代：先跑一次增量，再对**可疑项**做定点/变异探针，或换用
+  # 变更集不同的独立口径（见 stability_via）
+  stability_via: ["targeted_probe", "mutation_probe", "independent_scenario"]
+  # ---- 全量门禁（Issue #14 本轮追问：**默认全量根本不跑**）----
+  # 去升级口：判重时版本字段怎么算。
+  #   `content`（默认）= 按**受审内容**归一（同一份变更集在不同 revision 下重跑
+  #   → 判为重复）。这才是"同口径"的真实含义：
+  #   若按 `revision` 算，**改一行代码 revision 就变** → 每次都算新口径 →
+  #   每次都放行 → 就变成"每开发一步跑一次 600 多项验证"（用户看到的现象）。
+  #   `revision` = 旧行为（留给"每个提交都必须跑一次"的特殊仓，但**默认不这样**）。
+  repeat_scope: "content"
+  # **不含有测试阶段**的触发事件：这些事件下一律**不得跑全量**（防跨仓污染）。
+  # 评论/目录/定时/触发类事件既没有基线、也没有变更集，跑全量只是纯空烧。
+  blocked_events: ["issue.comment", "pull_request.comment", "issue.open",
+                   "issue.update", "crontab", "api_trigger", "web_trigger"]
+  # 流水线兜底变更的**路径白名单**（最小权限）。
+  # 兜底一旦能被用来"顺手改别的"，就把它变成绕过门禁的后门；
+  # 故只允许改规则文件本身，其余走正常 PR。
+  pipeline_allowlist: ["shared/collab/"]
+
+# ---- 平台计费口径（跨仓同一句话：等待不计 CPU） ----
+platform:
+  cpu_unit: "核时"
+  cpu_formula: "自然月内累积用量 − 免费额度；启动后每 5min 冻结 5min × 节点规格（免费额度 160 核时/月）"
+  ai_unit: "AI Credits"
+  ai_formula: "每次模型调用按实际 Token 消耗计（NPC / AI 评审 / 内置 CodeBuddy）"
+  waiting_billed: false
+  waiting_note: >-
+    平台只有「云原生构建/开发 CPU 核时」与「AI Credits」两项与任务相关：CPU 按任务
+    实际运行时长计，Token 按模型调用计，二者都**没有"等待"这一计费项**。因此等待
+    本身不占用 CPU 计费——**前提是等待走了平台的等待/挂起语义**（如 cnb:await），
+    没有在本地 sleep、空转轮询或持续产出日志。本地空转 10 分钟 = 8 核 ×10min ≈
+    1.33 核时（约 ¥0.17），而平台挂起同一段时间不计 CPU。
+  pause_hint: "阶梯到顶（10 分钟）即停；长等待交给平台等待/挂起语义，本地不做轮询"

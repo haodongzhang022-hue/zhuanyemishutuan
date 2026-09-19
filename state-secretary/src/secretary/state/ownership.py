@@ -25,6 +25,7 @@ from typing import List, Optional
 
 from .models import StateCard, TaskRecord
 from .manager import StateManager
+from .lock_registry import KIND_CARD_WRITE
 
 
 class StateConflict(Exception):
@@ -94,14 +95,21 @@ class OwnershipGuard:
 
     LOCK_SUFFIX = ".owner.json"
 
+    # 卡片写租约在聚合台账里的锁键（"所有锁应该被聚合的管理"）
+    REGISTRY_KEY_SUFFIX = ":card_write"
+
     def __init__(self, session_id: str, state_manager: StateManager,
-                 secretary: str = "secretary"):
+                 secretary: str = "secretary",
+                 lock_registry: Optional[object] = None):
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id 不能为空")
         self.session_id = session_id
         self.sm = state_manager
         self.secretary = secretary or "secretary"
         self._data_dir = state_manager.data_dir
+        # 锁聚合台账（可选）：单锁文件仍是终态判据，台账只是镜像 + 聚合视图。
+        # 台账读写异常**不得**影响单锁行为（宽进：锁机制强于台账机制）。
+        self.lock_registry = lock_registry
 
     # ---- 只读 ----
 
@@ -466,6 +474,28 @@ class OwnershipGuard:
         except Exception:
             return None
 
+    def registry_key(self) -> str:
+        """本会话卡片写租约在聚合台账中的锁键。"""
+        return f"{self.session_id}{self.REGISTRY_KEY_SUFFIX}"
+
+    def _registry_call(self, action: str, **kwargs) -> None:
+        """台账同步（失败静默：台账异常不得影响单锁语义）。"""
+        reg = self.lock_registry
+        if reg is None:
+            return
+        try:
+            if action == "register":
+                reg.register(
+                    self.registry_key(), kind=KIND_CARD_WRITE,
+                    holder=kwargs.get("holder", ""), scope="状态卡写入",
+                    reason=kwargs.get("reason", ""))
+            elif action == "release":
+                reg.heartbeat(self.registry_key(), kwargs.get("holder", ""))
+                reg.release(self.registry_key(), by=kwargs.get("by", ""),
+                            reason=kwargs.get("reason", ""))
+        except Exception:  # noqa: BLE001 - 台账是观测面，不参与写授权
+            pass
+
     def _store_lease(self, lease: CardLease) -> None:
         # 原子写 lease 文件
         dir_path = os.path.dirname(os.path.abspath(self._lease_path()))
@@ -481,6 +511,9 @@ class OwnershipGuard:
             except OSError:
                 pass
             raise
+        # 台账镜像（聚合视图；写租约本体仍以 .owner.json 为准）
+        self._registry_call("register", holder=lease.holder,
+                            reason="卡片写租约（=正在编辑）")
 
     def _clear_lease(self) -> None:
         path = self._lease_path()
@@ -489,3 +522,6 @@ class OwnershipGuard:
                 os.remove(path)
             except OSError:
                 pass
+        # 台账同步释放（"别遗留锁一直不打开"）：过期/被清理的租约不再挂账
+        self._registry_call("release", holder=self.secretary,
+                            by=self.secretary, reason="写租约释放（编辑结束）")

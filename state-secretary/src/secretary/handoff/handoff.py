@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+from dataclasses import fields as dc_fields
 from typing import List, Optional
 
 from .models import HandoffCard
@@ -232,8 +233,16 @@ class HandoffBus:
 
     def create_handoff(self, source_unit: str, target_unit: str,
                        intent: str, context: str = "",
-                       auto_state_card: bool = False) -> HandoffCard:
+                       auto_state_card: bool = False,
+                       wake: bool = True,
+                       fuse_reason: str = "") -> HandoffCard:
         """创建一张交接卡（线程安全）。
+
+        **唤醒开关（Issue #14 循环熔断）**：``wake=False`` 创建**静默交接卡**
+        ——接收方（下一个 agent）**只登记、不唤醒**，不得据此再开一轮
+        「修复 → 复评」。用于循环熔断后把「已到轮次上界 / 无必要修复项已修满」
+        的事实交接出去，同时**堵死自动复活**（仅人工 ``resume`` 可恢复）。
+        ``wake=True``（默认）为历史行为，接收方正常唤醒接力。
 
         auto_state_card=True 时自动创建关联的 M9 StateCard，
         交接卡获得唯一会话ID，供下游秘书状态管理使用。
@@ -255,6 +264,10 @@ class HandoffBus:
         ``card_id`` 须为 ``[A-Za-z0-9_-]+``（🔴 P1-3 白名单）；非法值不参与
         路径拼接（防路径穿越删除面）。
 
+        ``wake`` 须为 ``bool``（非 bool 抛 ``TypeError``）：显式拒绝
+        ``wake="false"`` 这类真值字符串被静默当作"可唤醒"，避免熔断语义被
+        调用方误用绕过。
+
         **入参校验（🔴 P1-3 补充）**：``card_id`` 由 ``source_unit`` /
         ``target_unit`` 拼接而成，故二者亦须为 ``[A-Za-z0-9_-]+``（非空）。
         否则 ``create_handoff("../state/VICTIM", …)`` 会让 ``_save`` 把卡写到
@@ -266,6 +279,13 @@ class HandoffBus:
         if not _is_valid_card_id(target_unit):
             raise ValueError(
                 f"非法 target_unit: {target_unit!r}。仅允许 [A-Za-z0-9_-]。")
+        # wake 严格 bool（Issue #14）：非 bool 一律拒绝，防 "false" 字符串等
+        # 真值静默绕过"静默交接不唤醒"语义。
+        if not isinstance(wake, bool):
+            raise TypeError(
+                f"非法 wake: {wake!r}（须为 bool；唤醒开关不得用真值字符串绕过）。")
+        if not isinstance(fuse_reason, str):
+            raise TypeError(f"非法 fuse_reason: {fuse_reason!r}（须为 str）。")
         with self._lock:
             # 用纳秒时间戳 + 自增序号保证同秒同源唯一（秒级时间戳碰撞会覆盖丢卡）
             card_id = f"{source_unit}-{target_unit}-{time.time_ns()}"
@@ -324,6 +344,8 @@ class HandoffBus:
                 context=context,
                 state_card_id=state_card_id,
                 created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                wake=wake,
+                fuse_reason=fuse_reason,
             )
             self._save(card)
             # 引用登记：与 ho-* 卡同根，供存活引用检查发现"交接卡目录与
@@ -378,7 +400,11 @@ class HandoffBus:
                 return None
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return HandoffCard(**data)
+            if not isinstance(data, dict):
+                return None
+            # 字段级容错：忽略未知字段（旧卡缺 ``wake`` 时默认 True，见 models）
+            known = {f.name for f in dc_fields(HandoffCard)}
+            return HandoffCard(**{k: v for k, v in data.items() if k in known})
 
     def update_status(self, card_id: str, status: str) -> bool:
         """更新交接卡状态（线程安全）"""
@@ -469,6 +495,10 @@ class HandoffBus:
                 "status": card.status,
                 "state_card_id": card.state_card_id,
                 "created_at": card.created_at,
+                # Issue #14：静默交接字段须落盘，否则跨实例读回后 wake 失真
+                # （默认 True）→ 静默交接被当成可唤醒接力，循环复活。
+                "wake": card.wake,
+                "fuse_reason": card.fuse_reason,
             }, f, ensure_ascii=False, indent=2)
 
     def validate_card(self, card: HandoffCard) -> dict:
@@ -476,7 +506,8 @@ class HandoffBus:
         return card.completeness_check()
 
     def create_standard_handoff(self, source_unit: str, target_unit: str,
-                                intent: str, context: str = "") -> HandoffCard:
+                                intent: str, context: str = "",
+                                wake: bool = True) -> HandoffCard:
         """创建符合 M5 × M9 跨单元标准的交接卡（强制关联 StateCard）。
 
         与 create_handoff 区别：
@@ -489,6 +520,7 @@ class HandoffBus:
             intent=intent,
             context=context,
             auto_state_card=True,
+            wake=wake,
         )
         check = card.completeness_check()
         if not check["passed"]:
