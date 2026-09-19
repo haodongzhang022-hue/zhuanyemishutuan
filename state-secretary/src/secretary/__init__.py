@@ -7,6 +7,8 @@
 - secretary.context: M10 上下文装配层 — 三层物理隔离 + 稳定前缀
 - secretary.handoff: M5 交接总线 — 与状态管理秘书协同
 - secretary.session: 会话门面层 — SecretarySession（L3 会话秘书统一入口）
+- secretary.gate:    增量跑测门禁 — 只跑有效增量 / 反全量冗余 / 计数权责一致
+                    （Issue #14）
 
 使用示例：
     from secretary.session import SecretarySession
@@ -21,5 +23,6 @@ from . import state
 from . import context
 from . import handoff
 from . import session
+from . import gate
 
-__all__ = ["state", "context", "handoff", "session"]
+__all__ = ["state", "context", "handoff", "session", "gate"]
