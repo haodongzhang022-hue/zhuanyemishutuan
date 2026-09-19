@@ -1,0 +1,18 @@
+# 引用方仓库 C（路线 B：include 共享模板 → 拿到 `$` 下的组织默认 job 段）
+include:
+  - ../../templates/npc-guard-job.yml
+
+# 本仓只需为**个别角色**单独写顶层 key；不写就沿用 `$` 的默认护栏
+"秘书·评审":
+  pull_request.comment@npc:
+    - docker:
+        image: docker.cnb.cool/xqitw/docker/npc-dsh:latest
+      runner:
+        cpus: 1                      # 允许向下收紧
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 1h                # 允许向下收紧
+          env:
+            DSH_MAX_STEPS: "48"      # 允许向下收紧
+            DSH_MODEL: deepseek-v4.1-flash

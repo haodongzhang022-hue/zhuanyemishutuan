@@ -1,0 +1,31 @@
+# 引用方仓库 A（镜像路线）：.cnb/npc.yml
+# 生产写法：imports 指向共享仓 URL
+#   - https://cnb.cool/dongdongxiaozu/npc-guard/-/blob/main/baseline/npc-guard-env.yml
+# 离线样例改为仓内相对路径（内容等价）
+.npc-job-base: &npc-job-base
+  docker:
+    image: docker.cnb.cool/xqitw/docker/npc-dsh:latest
+  runner:
+    cpus: 2
+  services:
+    - docker
+
+.base-stage: &base-stage
+  script: sh /app/start.sh
+  timeout: 2h
+
+"秘书·评审":
+  issue.comment@npc:
+    - <<: *npc-job-base
+      imports:
+        - ../../baseline/npc-guard-env.yml
+      stages:
+        - name: npc go
+          <<: *base-stage
+  pull_request.comment@npc:
+    - <<: *npc-job-base
+      imports:
+        - ../../baseline/npc-guard-env.yml
+      stages:
+        - name: npc go
+          <<: *base-stage

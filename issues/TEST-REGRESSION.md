@@ -2289,3 +2289,39 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 - **PR 评论 `@npc` 自触发**：建议编排层合并同 PR 同分钟 `@npc`，NPC 自身产出不触发下一棒。
 - **长尾 stall**：`cnb-teg` 跑 37 min 后 error，实为 agent 自我回滚致零产出；
   建议加"连续 N 回合无文件产出即收尾"软护栏。
+
+---
+
+## 30. 组织级成本护栏方案（PR #28）· 🔴 返工
+
+> 交付物：`docs/npc-cost-guard-org-rollout.md`（v1.1）+ `docs/npc-guard-org/`（可跑资产包）
+> 触发：架构·评审 🔴 必修 3 项（跨文件锚点 / 鉴权声明放错文件 / 校验契约字段不对齐）
+
+### 30.1 必修项处置
+
+| 编号 | 问题 | 处置 | 证据 |
+| --- | --- | --- | --- |
+| 🔴-1 | 跨文件锚点平台不支持；`*anchor.stages[0]` 非法；数组追加会重复 stage | 核心机制改为**值注入（路线 A，推荐）+ 完整 job 段模板（路线 B）**；锚点仅同文件内用 | 交付 `baseline/*.yml`（imports/optionsFrom）+ `templates/npc-guard-job.yml`（挂 `$` 下）；`resolve_includes` 按官方合并规则模拟判定重复 stage |
+| 🔴-2 | 鉴权字段写在 `rules/` 上，真正被引用的模板没有；`allow_events` 漏 `pull_request`/`push` | 鉴权移到**每个被引用文件**；`allow_events` 补齐四类事件；`rules.required_allow_events` 固化为组织标准并逐文件核对 | 变异 M13–M16 各拦 1–2 条 |
+| 🔴-3 | `max_turns`/`DSH_MAX_STEPS`/`maxTurns` 三名混用；两路线未区分；"值来源"断言在 include 后失效 | 统一按**路线分派**：镜像=`env.DSH_MAX_STEPS`、`npc:go`=`options.maxTurns`，混用即 FAIL；基线按路线分列两份；值来源断言重写为「源码声明计数 + 基线实读字段」两条独立判据 | 变异 M7/M9 拦混用；M3/M10 拦住"基线被改坏"（v1.0 判据全绿） |
+
+### 30.2 自测
+
+- 门禁脚本 `checks/check_npc_cost_guard.py`（460 行，仅标准库 + pyyaml）
+- 四个样例：镜像路线 / `npc:go` 路线 / 路线 B 正确写法 → **rc=0**；重复 stage 反例 → **rc=1**
+- **变异矩阵 16 个、漏网 0**：`python3 docs/npc-guard-org/selftest/mutation_matrix.py`
+  - M1 cpus 2→8 (3)｜M2 timeout 2h→10h (2)｜M3 基线模型名去点 (2)｜M4 基线去 `DSH_MAX_STEPS` (2)
+  - M5 基线去 `DSH_MODEL` (2)｜M6 本地再写一处 cpus (1)｜M7 镜像路线混用 `maxTurns` (1)
+  - M8 `npc:go` 基线去 `maxTurns` (2)｜M9 `npc:go` 混用 `DSH_MAX_STEPS` (1)｜M10 基线回合上限 72→200 (2)
+  - M11 基线引用指向不存在文件 (2)｜M12 与模板重复写 stages (1)｜M13 漏 `allow_events` (1)
+  - M14 漏 `allow_slugs` (1)｜M15 `allow_events` 漏 `pull_request` (1)｜M16 基线缺鉴权 (2)
+- 本仓现状 `--config .cnb/npc.yml` 通过（local 形态：`cpus` 本地唯一来源）
+- 全量 pytest：**407 passed**（本次仅文档与新增资产，未触碰模块代码）
+- markdownlint：新文档 **0 error**（MD013 关闭表格/代码块口径）；对照 v1.0 为 2 error
+- 机制事实实测：跨文件锚点 → `ComposerError: undefined alias`；`*anchor.stages[0]` → `ScannerError`
+- URL 形式：`/-/blob/…` 与 `/-/git/raw/…` 均可读（脚本内部归一为 raw）
+
+### 30.3 遗留
+
+- 共享仓 `npc-guard` 尚未建仓；本 PR 先交付"整目录可平移"的资产包 + 方案文档。
+- 引用方 CI 门禁样例中 `pyyaml` 需显式安装（脚本缺依赖以 rc=2 大声失败，不静默跳过）。

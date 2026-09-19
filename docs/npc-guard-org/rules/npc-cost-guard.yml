@@ -1,0 +1,23 @@
+allow_slugs:
+  - "dongdongxiaozu/**"
+allow_events:
+  - issue.comment@npc
+  - pull_request.comment@npc
+  - pull_request
+  - push
+# 被引用文件必须显式覆盖的事件（PR 类属不可信事件；push 供门禁自身跑）
+required_allow_events:
+  - issue.comment@npc
+  - pull_request.comment@npc
+  - pull_request
+  - push
+max_cpus: 2
+max_stage_timeout: "2h"
+max_turns: 72
+max_context_window: "128k"
+max_tokens: "64k"
+thinking_level_max: "medium"
+models_allow:
+  - deepseek-v4.1-flash
+models_deny:
+  - deepseek-v4-flash
