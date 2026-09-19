@@ -1,0 +1,4 @@
+# 与护栏无关的本地 include（不该被要求声明 allow_slugs / allow_events）
+lint:
+  rules:
+    - no-todo

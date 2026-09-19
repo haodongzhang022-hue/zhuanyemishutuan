@@ -1,4 +1,4 @@
-# 引用方仓库 B（npc:go 路线）：.cnb.yml
+# 引用方仓库 B（npc:go 路线 · 路线 A'：optionsFrom 值注入）
 .npc-job-base: &npc-job-base
   docker:
     image: cnbcool/default-npc:latest

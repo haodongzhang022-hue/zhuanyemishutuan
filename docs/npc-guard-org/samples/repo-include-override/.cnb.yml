@@ -1,8 +1,8 @@
-# 引用方仓库 C（路线 B：include 共享模板 → 拿到 `$` 下的组织默认 job 段）
+# 引用方仓库 D（路线 B + 角色级向下收紧）：只为个别角色写顶层 key
 include:
   - ../../templates/npc-guard-job.yml
 
-# 本仓只需为**个别角色**单独写顶层 key；不写就沿用 `$` 的默认护栏
+# 角色 key 下的同名事件**覆盖** `$` 下的同名事件（官方 NPC 文档口径），不会重复执行
 "秘书·评审":
   pull_request.comment@npc:
     - docker:

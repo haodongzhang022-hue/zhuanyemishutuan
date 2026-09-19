@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """组织级 NPC 成本护栏校验（共享仓 npc-guard/checks/ 维护，引用方 CI 调用）。
 
-三层判据：值断言 / **值来源断言** / **路线分派**（镜像路线与 npc:go 路线不可混用）。
+四层判据，**互不替代**：
 
-两条路线的字段名**不同且不可互换**，因此校验按 stage 入口自动分派：
-
-* 镜像路线（`script: sh /app/start.sh`）：回合上限字段 = `DSH_MAX_STEPS`（镜像私有变量）
-* npc:go 路线（`type: npc:go`）：回合上限字段 = `options.maxTurns`（官方内置）
+1. **值断言** —— 引用方本地的核数 / timeout / 回合上限 / 模型名必须在组织基线上界内。
+2. **值来源断言** —— 本地 cpus 声明 ≤1 处；0 处时必须由共享文件提供；且可注入型护栏值
+   必须**经正确通道**来自**共享仓**（`imports`→env / `optionsFrom`→options）。
+3. **被引用文件自身也过同一套值断言** —— 兼容两种形态：平铺基线（`baseline/*.yml`）与
+   模板嵌套（`templates/*.yml` 的 `$.*[].stages[].env` 与 `runner.cpus`）。
+   否则"共享值被改坏"是校验盲区（模板 cpus 8 + 回合 500 + 模型名去点三处同改仍全绿）。
+4. **路线分派 + 通道分派** —— 镜像路线与 npc:go 路线的字段名不同且不可互换；
+   且 env 字段只能走 `env`/`imports`、options 字段只能走 `options`/`optionsFrom`。
+   字段混用或通道错配**都是静默失效**，一律判 FAIL。
 
 退出码：0 通过；1 断言失败；2 依赖或入参错误（大声失败，不静默跳过）。
 """
@@ -15,6 +20,7 @@ import os
 import re
 import sys
 import urllib.request
+from collections import namedtuple
 
 try:
     import yaml
@@ -22,10 +28,32 @@ except ImportError:  # 依赖必须显式声明，缺 yaml 时以 rc=2 大声失
     sys.stderr.write("FATAL: 需要 pyyaml（引用方 CI 镜像请预装或 pip install pyyaml）\n")
     sys.exit(2)
 
-MIRROR_ENTRY = "sh /app/start.sh"   # 镜像路线入口
-MIRROR_FIELD = "DSH_MAX_STEPS"      # 镜像路线回合上限字段名
-NPCGO_FIELD = "maxTurns"            # npc:go 路线回合上限字段名
-GUARD_REPO_MARK = "npc-guard"       # 共享仓标识（值来源可追溯）
+MIRROR_ENTRY = "sh /app/start.sh"          # 镜像路线入口
+MIRROR_FIELD = "DSH_MAX_STEPS"             # 镜像路线回合上限字段名（env 通道）
+MIRROR_MODEL = "DSH_MODEL"                 # 镜像路线模型字段名（env 通道）
+NPCGO_FIELD = "maxTurns"                   # npc:go 路线回合上限字段名（options 通道）
+NPCGO_MODEL = "model"                      # npc:go 路线模型字段名（options 通道）
+GUARD_REPO_MARK = "npc-guard"              # 共享仓标识（值来源可追溯）
+
+#: 路线 → 该路线的护栏字段（通道即字段名决定：env 字段 vs options 字段）
+ROUTE_FIELDS = {
+    "mirror": (MIRROR_FIELD, MIRROR_MODEL),
+    "npc:go": (NPCGO_FIELD, NPCGO_MODEL),
+}
+#: 通道 → 该通道能喂到的字段集合（喂错通道 = 静默失效）
+CHANNEL_FIELDS = {
+    "imports": (MIRROR_FIELD, MIRROR_MODEL),
+    "optionsFrom": (NPCGO_FIELD, NPCGO_MODEL),
+}
+#: 路线 → 能承载该路线字段的**通道**（include 可承载两者：路线 B 的 stage 级字段由合并而来）
+ROUTE_CHANNELS = {
+    "mirror": ("imports", "include"),
+    "npc:go": ("optionsFrom", "include"),
+}
+ALL_TURNS_FIELDS = (MIRROR_FIELD, NPCGO_FIELD)
+ALL_MODEL_FIELDS = (MIRROR_MODEL, NPCGO_MODEL)
+
+Ref = namedtuple("Ref", "raw resolved channel ignore_error")
 
 
 def repo_root_of(config_path):
@@ -79,6 +107,20 @@ def leaves(node, path=""):
         yield path, node
 
 
+def iter_jobs(node, path=""):
+    """遍历所有 **job**（dict，含 `stages` 或 `runner` 者），跳过顶层 `.` 开头的锚点定义。"""
+    if isinstance(node, dict):
+        if isinstance(node.get("stages"), list):
+            yield path, node
+        for key, val in node.items():
+            if path == "" and str(key).startswith("."):
+                continue
+            yield from iter_jobs(val, f"{path}.{key}")
+    elif isinstance(node, list):
+        for idx, val in enumerate(node):
+            yield from iter_jobs(val, f"{path}[{idx}]")
+
+
 def find_stages(node, path=""):
     """遍历所有 stage。
 
@@ -86,19 +128,10 @@ def find_stages(node, path=""):
     它们不是可执行的 stage，只是给角色 `<<` 复用的模板；模型名等角色级字段
     由引用它的角色段声明，对锚点断言必然误报。
     """
-    if isinstance(node, dict):
-        for key, val in node.items():
-            if key == "stages" and isinstance(val, list):
-                for idx, st in enumerate(val):
-                    if isinstance(st, dict):
-                        yield f"{path}.stages[{idx}]", st
-            else:
-                if path == "" and str(key).startswith("."):
-                    continue
-                yield from find_stages(val, f"{path}.{key}")
-    elif isinstance(node, list):
-        for idx, val in enumerate(node):
-            yield from find_stages(val, f"{path}[{idx}]")
+    for jpath, job in iter_jobs(node, path):
+        for idx, st in enumerate(job["stages"]):
+            if isinstance(st, dict):
+                yield f"{jpath}.stages[{idx}]", st
 
 
 def minutes(text):
@@ -162,7 +195,7 @@ def resolve_includes(path, seen=None, depth=0):
             ref = item if str(item).startswith("http") else os.path.join(base_dir, item)
             merged = merge_config(merged, resolve_includes(ref, seen, depth + 1))
         elif isinstance(item, dict):
-            if item.get("config"):
+            if item.get("config"):          # 内联对象：不是文件，无需加载
                 merged = merge_config(merged, item["config"])
             elif item.get("path"):
                 ref = item["path"]
@@ -196,28 +229,152 @@ def duplicate_npc_stages(merged):
     return dupes
 
 
-def referenced_files(cfg, base_dir):
-    """所有被引用的**外部文件**（include / imports / optionsFrom），按顺序去重。"""
-    refs = []
-    for path, val in leaves(cfg):
-        if ".imports" in path or ".optionsFrom" in path:
-            refs.append(val)
+def _dict_nodes(node):
+    """遍历配置里的所有 dict 节点（job 与 stage 均可承载 imports / optionsFrom）。"""
+    if isinstance(node, dict):
+        yield node
+        for val in node.values():
+            yield from _dict_nodes(val)
+    elif isinstance(node, list):
+        for val in node:
+            yield from _dict_nodes(val)
+
+
+def collect_refs(cfg, base_dir):
+    """所有被引用的**外部文件**，带**通道**信息（imports / optionsFrom / include）。
+
+    通道是判据的一部分：`imports` 只喂 env、`optionsFrom` 只喂 options，
+    走错通道即静默失效。内联 `- config: {...}` 不是文件，不收。
+    """
+    refs, seen = [], set()
+
+    def add(raw, channel, ignore_error=False):
+        if not isinstance(raw, str):
+            return
+        resolved = raw if raw.startswith("http") else os.path.join(base_dir, raw)
+        key = (resolved, channel)
+        if key not in seen:
+            seen.add(key)
+            refs.append(Ref(raw=raw, resolved=resolved, channel=channel,
+                            ignore_error=ignore_error))
+
+    # imports / optionsFrom 可出现在 job 或 stage 上（单 job stage 可省略层级，字段同级）
+    for node in _dict_nodes(cfg):
+        for channel in ("imports", "optionsFrom"):
+            val = node.get(channel)
+            if val is None:
+                continue
+            for item in (val if isinstance(val, list) else [val]):
+                add(item, channel)
     for item in (cfg.get("include") or []):
         if isinstance(item, str):
-            refs.append(item)
+            add(item, "include")
         elif isinstance(item, dict) and item.get("path"):
-            refs.append(item["path"])
-    out = []
-    for ref in refs:
-        if not isinstance(ref, str):
-            continue
-        resolved = ref if ref.startswith("http") else os.path.join(base_dir, ref)
-        if resolved not in out:
-            out.append(resolved)
+            add(item["path"], "include", bool(item.get("ignoreError")))
+    return refs
+
+
+#: 共享资产包里**允许承载护栏值**的目录（值来源判据只认这三个目录）
+SHARED_DIRS = ("rules", "baseline", "templates")
+
+
+def shared_roots(rules_path):
+    """与 `--rules` 同源的**共享资产包根目录**（本地路径形态）。
+
+    生产接入用共享仓 URL（`npc-guard`），离线/自测用同一份资产包的相对路径——两者等价。
+    引用方**仓内自建**的基线不在共享资产包内，不算共享：否则 D1/D2 名存实亡。
+    """
+    if str(rules_path).startswith("http"):
+        return []
+    rules_dir = os.path.dirname(os.path.abspath(rules_path))
+    root = os.path.dirname(rules_dir) if os.path.basename(rules_dir) == "rules" else rules_dir
+    return [os.path.join(root, d) for d in SHARED_DIRS]
+
+
+def make_is_shared(rules_path, shared_mark=GUARD_REPO_MARK):
+    roots = shared_roots(rules_path)
+
+    def is_shared(ref):
+        raw = ref.raw if isinstance(ref, Ref) else str(ref)
+        if shared_mark in raw:
+            return True
+        resolved = ref.resolved if isinstance(ref, Ref) else str(ref)
+        if str(resolved).startswith("http"):
+            return False
+        abs_ref = os.path.abspath(resolved)
+        return any(abs_ref == root or abs_ref.startswith(root + os.sep) for root in roots)
+
+    return is_shared
+
+
+def guard_fields_of(data):
+    """被引用文件里声明的**护栏字段**集合（兼容平铺基线与模板嵌套两种形态）。"""
+    if not isinstance(data, dict):
+        return set()
+    found = set()
+    for path, _ in leaves(data):
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf in ALL_TURNS_FIELDS + ALL_MODEL_FIELDS:
+            found.add(leaf)
+    return found
+
+
+def guard_values_of(data):
+    """被引用文件里的**护栏值**（路径 → 值），供"文件自身也过值断言"使用。"""
+    out = {"cpus": [], "timeout": [], "turns": [], "models": []}
+    if not isinstance(data, dict):
+        return out
+    for path, val in leaves(data):
+        leaf = path.rsplit(".", 1)[-1]
+        if leaf == "cpus":
+            out["cpus"].append((path, val))
+        elif leaf in ALL_TURNS_FIELDS:
+            out["turns"].append((path, val))
+        elif leaf in ALL_MODEL_FIELDS:
+            out["models"].append((path, val))
+        elif leaf == "timeout" and ".stages[" in path:
+            out["timeout"].append((path, val))
     return out
 
 
-def check_auth(path):
+def assert_guard_values(label, data, rules):
+    """同一套值断言：对**任何**被引用文件（基线或模板）都跑一遍。"""
+    fails, notes = [], []
+    max_cpus = rules["max_cpus"]
+    base_timeout = rules["max_stage_timeout"]
+    max_turns = rules["max_turns"]
+    allow, deny = rules.get("models_allow", []), rules.get("models_deny", [])
+    vals = guard_values_of(data)
+    for path, val in vals["cpus"]:
+        if not isinstance(val, int) or val > max_cpus:
+            fails.append(f"{label}{path} = {val!r} 超出组织上限 {max_cpus}"
+                         "（按核计费，加核不减时只加钱）")
+    for path, val in vals["timeout"]:
+        got = minutes(val)
+        if got is None or got > minutes(base_timeout):
+            fails.append(f"{label}{path} timeout={val!r} 超出基线 {base_timeout}"
+                         "（挂死兜底，不是目标值）")
+    for path, val in vals["turns"]:
+        turns = minutes(val)
+        if turns is None:
+            fails.append(f"{label}{path} 的回合上限 {val!r} 不是合法数值")
+        elif turns > minutes(max_turns):
+            fails.append(f"{label}{path} 的回合上限 {val!r} 超出组织上限 {max_turns}"
+                         "（基线是全组织共同上界，只能由共享仓 PR 调整）")
+    for path, val in vals["models"]:
+        if val in deny:
+            fails.append(f"{label}{path} 的模型 {val!r} 在黑名单"
+                         "（实测被路由到思考档，折算 33×）")
+        elif val not in allow:
+            fails.append(f"{label}{path} 的模型 {val!r} 不在白名单 {allow}"
+                         "（扩展须走共享仓 PR）")
+    if not fails and (vals["cpus"] or vals["turns"] or vals["models"]):
+        notes.append(f"{label} 值断言通过（cpus {len(vals['cpus'])} / 回合 "
+                     f"{len(vals['turns'])} / 模型 {len(vals['models'])} 处）")
+    return fails, notes
+
+
+def check_auth(ref):
     """被引用文件必须自带鉴权声明（跨仓私有引用，否则被权限检查拦下）。
 
     返回 (问题列表, 声明的 allow_events)。注意：鉴权字段要写在**被引用文件**上，
@@ -225,124 +382,132 @@ def check_auth(path):
     """
     problems = []
     try:
-        doc = load(path)
+        doc = load(ref.resolved)
     except Exception as exc:
-        return [f"被引用文件不可读：{exc}"], []
+        return [f"被引用文件不可读：{ref.raw}（{type(exc).__name__}: {exc}）"], []
     if not isinstance(doc, dict):
-        return [f"被引用文件顶层不是对象：{path}"], []
-    slugs = doc.get("allow_slugs")
-    if not slugs:
-        problems.append(f"{path}: 缺 allow_slugs（私有且非同源仓库的文件必须显式授权仓库范围）")
+        return [f"被引用文件顶层不是对象：{ref.raw}"], []
+    if not doc.get("allow_slugs"):
+        problems.append(f"{ref.raw}: 缺 allow_slugs（私有且非同源仓库的文件必须显式授权仓库范围）")
     events = doc.get("allow_events") or []
     if isinstance(events, str):
         events = [e.strip() for e in re.split(r"[,|]", events) if e.strip()]
     if not events:
-        problems.append(f"{path}: 缺 allow_events（不可信事件引用外部文件时，被引用文件必须显式声明）")
+        problems.append(f"{ref.raw}: 缺 allow_events"
+                        "（不可信事件引用外部文件时，被引用文件必须显式声明）")
     return problems, events
 
 
-def count_cpus_decls(source):
-    """值来源判据（include 场景重写版）：按**源码声明**计数，不按解析后的展开值。
+def cpus_decl_nodes(cfg):
+    """值来源判据：**解析结果**里声明了 cpus 的节点，按对象身份去重。
 
-    YAML 锚点展开会让解析结果里出现多份 cpus（锚点 + 继承），那不是"各写各的"。
-    判据因此落在源码：本地 `cpus:` 声明必须 **0 或 1 处**。
+    按源码文本数 `cpus:` 行会被 flow-style（`runner: {cpus: 2}`）绕过；按解析结果数又会被
+    YAML 锚点展开重复计数（锚点 + 继承是同一份值）。故按**对象身份**去重：
+    锚点复用的多处 runner 是同一个对象（计 1），各角色各写一份则是不同对象（计 N）。
     """
-    hits = []
-    for line in source.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("cpus:") or stripped.startswith("#"):
-            continue
-        hits.append(re.split(r"\s+#", stripped, maxsplit=1)[0].strip())  # 去掉行尾注释
-    return hits
+    out = {}
+
+    def walk(node, path=""):
+        if isinstance(node, dict):
+            if "cpus" in node:
+                out.setdefault(id(node), (f"{path}.cpus", node["cpus"]))
+            for key, val in node.items():
+                walk(val, f"{path}.{key}")
+        elif isinstance(node, list):
+            for idx, val in enumerate(node):
+                walk(val, f"{path}[{idx}]")
+
+    walk(cfg)
+    return list(out.values())
 
 
-def check(config_path, rules_path):
+def check(config_path, rules_path, shared_mark=GUARD_REPO_MARK, auth_scope="guard"):
+    """四层判据全量校验。返回 (fails, notes)。"""
     fails, notes = [], []
+    is_shared = make_is_shared(rules_path, shared_mark)
     base_dir = None if str(config_path).startswith("http") else repo_root_of(config_path)
     cfg, rules = load(config_path), load(rules_path)
-    source = config_path
-    if not str(config_path).startswith("http"):
-        with open(config_path, encoding="utf-8") as fh:
-            source = fh.read()
     if not isinstance(rules, dict) or "max_cpus" not in rules:
         fails.append(f"基线文件缺 max_cpus（--rules 应指向 rules/npc-cost-guard.yml）：{rules_path}")
         return fails, notes
-    merged_cfg = {}
-    if not str(config_path).startswith("http"):
-        merged_cfg = resolve_includes(os.path.abspath(config_path))
     max_cpus = rules["max_cpus"]
     base_timeout = rules["max_stage_timeout"]
     max_turns = rules["max_turns"]
     allow, deny = rules.get("models_allow", []), rules.get("models_deny", [])
 
-    # ① 值来源断言（include 场景重写版）：按**源码声明**计数，不按解析后的展开值。
-    #    YAML 锚点展开会让解析结果里出现多份 cpus（锚点 + 继承），那不是"各写各的"。
-    #    三种合法形态，判定顺序：本地声明 >1 处直接失败；
-    #    本地 1 处 = 自持（锚点内唯一来源）；本地 0 处 = 必须由 include/imports 提供。
-    decls = count_cpus_decls(source) if isinstance(source, str) else []
-    for path, val in ((p, v) for p, v in leaves(cfg) if p.endswith(".runner.cpus")):
-        if not isinstance(val, int) or val > max_cpus:
-            fails.append(f"{path} = {val!r} 超出组织上限 {max_cpus}（按核计费，加核不减时只加钱）")
-
-    # ② 值来源断言：可注入型基线值必须可追溯到共享仓（imports 支持跨仓 + 鉴权）
-    # 值来源引用：imports / optionsFrom（引用方显式写）+ include（合并进来的基线字段）
-    refs = [v for p, v in leaves(cfg) if ".imports" in p or ".optionsFrom" in p]
+    # 合并后的配置（include 是配置级合并）：路线 B 的 stage 只存在于合并结果里，
+    # 故**所有 stage 判定都走 merged**，否则"只 include 模板、不写本地角色 key"会被误判。
+    merged_cfg = {}
     if not str(config_path).startswith("http"):
-        for item in (cfg.get("include") or []):
-            refs.append(item.get("path") if isinstance(item, dict) else item)
-    shared_ref = any(GUARD_REPO_MARK in str(r) for r in refs)
-    # 基线文件实际声明了什么：值来源断言必须落到"字段真的在基线里"，否则只是"看着像"
-    # （生产用法是共享仓 URL；本地/离线场景用相对路径指向同一份基线文件，等价成立）
-    baseline_fields, unreadable = set(), []
-    for ref in refs:
-        try:
-            data = load(ref, base_dir)
-        except Exception as exc:  # 读不到即大声失败，不静默放过
-            unreadable.append(f"{ref}（{type(exc).__name__}: {exc}）")
-            continue
-        if isinstance(data, dict):
-            baseline_fields |= {k for k in data if isinstance(k, str)}
-    if unreadable:
-        fails.append(f"基线引用不可读：{unreadable}")
-    traceable = bool(baseline_fields & {MIRROR_FIELD, NPCGO_FIELD})
-    mode = "shared" if traceable else "local"
-    merged_cpus = [v for p, v in leaves(merged_cfg) if p.endswith(".runner.cpus")] if merged_cfg else []
+        merged_cfg = resolve_includes(os.path.abspath(config_path))
+    effective = merged_cfg if isinstance(merged_cfg, dict) and merged_cfg else cfg
+    cfg_stage_paths = {p for p, _ in find_stages(cfg)}
+
+    refs = collect_refs(cfg, base_dir or ".")
+
+    # ① 值来源断言：本地 cpus 声明 ≤1 处（防各角色各写各的）；0 处必须由共享文件提供
+    decls = cpus_decl_nodes(cfg)
+    merged_cpus = [v for p, v in leaves(effective) if p.endswith(".cpus")]
     if len(decls) > 1:
-        fails.append(f"本地 cpus 声明 {len(decls)} 处（应 ≤1 处，防各角色各写各的）：{decls}")
+        fails.append(f"本地 cpus 声明 {len(decls)} 处（应 ≤1 处，防各角色各写各的）："
+                     f"{[p for p, _ in decls]}")
     elif len(decls) == 1:
-        notes.append(f"值来源：cpus 本地自持（{decls[0]}，唯一来源）")
+        notes.append(f"值来源：cpus 本地自持（{decls[0][0]} = {decls[0][1]!r}，唯一来源）")
     elif merged_cpus:
-        notes.append("值来源：cpus 由 include 的共享模板提供，本地 0 处声明")
+        notes.append(f"值来源：cpus 由共享文件提供（本地 0 处声明，合并后 {merged_cpus[0]!r}）")
     else:
         fails.append("本地无 cpus 声明，且 include/imports 也没提供 —— 值来源不可判"
                      "（要么本地锚点内写一处，要么 include 共享模板）")
-    if mode == "shared":
-        notes.append(f"值来源：{len(refs)} 处基线引用，字段 {sorted(baseline_fields)} 可读")
 
-    # ②b 基线自身也要过同一套值断言——否则"共享值被改坏"是校验盲区
-    #     （变异 M3/M10：基线里模型名去点、回合上限放宽，引用方却依然全绿）
+    # ② 被引用文件：可读性 + 通道↔字段匹配 + 鉴权 + **文件自身也过同一套值断言**
+    ref_docs = {}
     for ref in refs:
         try:
-            data = load(ref, base_dir)
-        except Exception:
-            continue  # 不可读已在 ② 报 FAIL
-        if not isinstance(data, dict):
-            continue
-        for label, raw in ((MIRROR_FIELD, data.get(MIRROR_FIELD)),
-                           (NPCGO_FIELD, data.get(NPCGO_FIELD))):
-            if raw is None:
+            ref_docs[ref] = load(ref.resolved, base_dir)
+        except Exception as exc:
+            if ref.ignore_error:
+                notes.append(f"被引用文件 {ref.raw} 不可读但声明 ignoreError，按平台语义跳过")
                 continue
-            turns = minutes(raw)
-            if turns is None:
-                fails.append(f"基线 {ref} 的 {label}={raw!r} 不是合法数值")
-            elif turns > minutes(max_turns):
-                fails.append(f"基线 {ref} 的 {label}={raw!r} 超出组织上限 {max_turns}"
-                             "（基线是全组织共同上界，只能由共享仓 PR 调整）")
-        model = data.get("DSH_MODEL") or data.get("model")
-        if model in deny:
-            fails.append(f"基线 {ref} 的模型 {model!r} 在黑名单（实测被路由到思考档，33×）")
-        elif model is not None and model not in allow:
-            fails.append(f"基线 {ref} 的模型 {model!r} 不在白名单 {allow}")
+            fails.append(f"基线引用不可读：{ref.raw}（{type(exc).__name__}: {exc}）")
+    for ref, data in ref_docs.items():
+        # 值断言只跑**护栏提供方**：共享资产包文件，或经 imports/optionsFrom 显式声明的基线。
+        # 与护栏无关的本地 include（lint 配置等）不在此列，避免误报（🟡-2）。
+        if not (is_shared(ref) or ref.channel in CHANNEL_FIELDS):
+            continue
+        label = f"被引用文件 {ref.raw}"
+        sub_fails, sub_notes = assert_guard_values(f"{label} 的", data, rules)
+        fails.extend(sub_fails)
+        notes.extend(sub_notes)
+        fields = guard_fields_of(data)
+        allowed = set(CHANNEL_FIELDS.get(ref.channel, fields))
+        if ref.channel in CHANNEL_FIELDS and fields - allowed:
+            fails.append(f"{label}：经 {ref.channel} 引入，却声明了该通道喂不到的字段 "
+                         f"{sorted(fields - allowed)}"
+                         "（imports 只注入 env、optionsFrom 只注入 options，走错通道静默失效）")
+
+    # ②b 鉴权声明：必须落在**被引用文件**上，且覆盖用到的事件
+    used_events = set()
+    for top, events in cfg.items():
+        if isinstance(events, dict):
+            used_events |= {e for e in events if isinstance(e, str) and "@npc" in e}
+    required = set(rules.get("required_allow_events") or []) | used_events
+    for ref in refs:
+        data = ref_docs.get(ref)
+        if data is None or not audit_scope_ok(ref, data, auth_scope, is_shared):
+            continue
+        problems, declared = check_auth(ref)
+        fails.extend(problems)
+        if problems:
+            continue
+        missing = sorted(e for e in required
+                         if e not in declared and not any(
+                             re.fullmatch(d.replace("*", ".*"), e) for d in declared))
+        if missing:
+            fails.append(f"{ref.raw}: allow_events 未覆盖 {missing}"
+                         "（PR 类事件属不可信事件，被引用文件必须显式声明；"
+                         "漏 push 会让门禁自身引用失败）")
+        else:
+            notes.append(f"鉴权：{ref.raw} 声明 allow_events={declared}")
 
     # ②c 重复 stage 判定（include 是"数组追加"，片段带 stages 会与本地的并存）
     if merged_cfg:
@@ -350,101 +515,158 @@ def check(config_path, rules_path):
         for top, event, hits in dupes:
             fails.append(f"include 合并后 {top}/{event} 出现 {len(hits)} 个 npc go stage "
                          f"{hits}——数组追加会重复执行；引用方勿为模板已覆盖的事件再写 stages")
-        if not dupes and any("stages" in str(j) for j in [merged_cfg]):
+        if not dupes and any(True for _ in iter_jobs(merged_cfg)):
             notes.append("include 合并：每个事件键下恰好 1 个 npc go stage（无重复执行）")
 
-    # ②d 鉴权声明（🔴-2）：必须落在**被引用文件**上，且覆盖用到的事件
-    used_events = set()
-    for top, events in cfg.items():
-        if isinstance(events, dict):
-            used_events |= {e for e in events if isinstance(e, str) and "@npc" in e}
-    for ref in referenced_files(cfg, base_dir or "."):
-        if str(ref).startswith("http") and GUARD_REPO_MARK not in str(ref):
-            continue  # 只审计共享护栏文件的鉴权（其余引用不在本门禁职责内）
-        problems, declared = check_auth(ref)
-        fails.extend(problems)
-        if not problems:
-            # 组织标准事件集（rules.required_allow_events）∪ 本仓实际用到的事件
-            required = set(rules.get("required_allow_events") or []) | used_events
-            missing = sorted(e for e in required
-                             if e not in declared and not any(
-                                 re.fullmatch(d.replace("*", ".*"), e) for d in declared))
-            if missing:
-                fails.append(f"{ref}: allow_events 未覆盖 {missing}"
-                             "（PR 类事件属不可信事件，被引用文件必须显式声明；"
-                             "漏 push 会让门禁自身引用失败）")
-        if not problems:
-            notes.append(f"鉴权：{ref} 声明 allow_events={declared}")
-
-    # ③ 值断言 + 路线分派：字段名必须与路线一致，混用即失败
-    npc_stages = [(p, s) for p, s in find_stages(cfg) if "npc" in str(s.get("name", "")).lower()]
+    # ③ 值断言 + 路线分派 + **通道分派**（字段名与通道都必须与路线一致）
+    npc_stages = [(p, s) for p, s in find_stages(effective)
+                  if "npc" in str(s.get("name", "")).lower()]
     if not npc_stages:
-        fails.append("未找到 npc go stage（--config 应指向本仓 .cnb/npc.yml）")
+        fails.append("未找到 npc go stage（--config 应指向本仓 .cnb/npc.yml，"
+                     "或 include 的共享模板里应含 npc go stage）")
     for path, st in npc_stages:
         route = route_of(st)
         if route is None:
             fails.append(f"{path}: 既非镜像入口（{MIRROR_ENTRY}）也非 type: npc:go，路线不可判")
             continue
+        jpath = path.rsplit(".stages[", 1)[0]
+        from_include = path not in cfg_stage_paths
+        # 该 stage 的**提供方**：stage / 所在 job 上的 imports|optionsFrom；
+        # 来自 include 的 stage（路线 B）另加 include 引用
+        raws = set(ref_raws_of(st, job_of(effective, jpath), job_of(cfg, jpath)))
+        providers = [r for r in refs
+                     if (r.channel in CHANNEL_FIELDS and r.raw in raws)
+                     or (from_include and r.channel == "include")]
+
+        turns_field, model_field = ROUTE_FIELDS[route]
+        other_route = "npc:go" if route == "mirror" else "mirror"
+        env = st.get("env") or {}
+        opts = st.get("options") or {}
+        # ③a 路线混用：另一条路线的字段出现在本 stage
+        for field in ROUTE_FIELDS[other_route]:
+            if field in env or field in opts:
+                why = ("镜像私有变量，npc:go 不读" if field.startswith("DSH_")
+                       else "仅 type: npc:go 生效，镜像不读")
+                fails.append(f"{path}: {route} 路线不得混用 {field}（{why}）")
+        # ③b 通道分派：本路线字段须经**正确通道**取自**共享仓**（否则静默失效 / 来源不单一）
+        ok_channels = ROUTE_CHANNELS[route]
+        for field, channel, holder_name in ((turns_field, ok_channels[0],
+                                             "env" if route == "mirror" else "options"),):
+            holder = env if holder_name == "env" else opts
+            if field in holder:
+                continue
+            declaring = [r for r in providers if field in guard_fields_of(ref_docs.get(r, {}))]
+            declared_by = [r for r in declaring if r.channel in ok_channels]
+            for r in [x for x in declaring if x.channel not in ok_channels]:
+                fails.append(f"{path}: {route} 路线的 {field} 由 {r.raw} 经 {r.channel} 引入，"
+                             f"**通道错配**（{r.channel} 只喂 "
+                             f"{'env' if r.channel == 'imports' else 'options'}，"
+                             f"{holder_name}.{field} 永远拿不到 → 静默失效）")
+            shared = [r for r in declared_by if is_shared(r)]
+            if not declared_by:
+                fails.append(f"{path}: {route} 路线缺 {holder_name}.{field}，"
+                             f"且未被任何引用文件经 {'/'.join(ok_channels)} 提供"
+                             "（回合上限缺省即失控，必须显式声明）")
+            elif not shared:
+                fails.append(f"{path}: {route} 路线的 {field} 来自 "
+                             f"{[r.raw for r in declared_by]}，**不在共享资产包内**"
+                             f"（共享仓 {shared_mark} 或与 --rules 同源）——"
+                             "D1/D2 防线要求单一来源，仓内自建基线不算共享（改坏无人评审）")
+            else:
+                notes.append(f"{path}: {field} 经 {shared[0].channel} 取自共享仓 "
+                             f"{shared[0].raw}")
         got = minutes(st.get("timeout"))
         if got is None or got > minutes(base_timeout):
             fails.append(f"{path}: timeout={st.get('timeout')!r}，须声明且 ≤ 基线 {base_timeout}"
                          "（挂死兜底，不是目标值）")
-        env = st.get("env") or {}
-        opts = st.get("options") or {}
-        if route == "mirror":
-            if MIRROR_FIELD not in env and MIRROR_FIELD not in baseline_fields:
-                fails.append(f"{path}: 镜像路线缺 {MIRROR_FIELD}，且共享基线里也没有该字段"
-                             "（回合上限缺省即失控，必须显式声明）")
-            if NPCGO_FIELD in opts:
-                fails.append(f"{path}: 镜像路线不得混用 options.{NPCGO_FIELD}"
-                             "（仅 type: npc:go 生效，写了会静默失效）")
-        else:
-            # npc:go 路线的基线必须走 options / optionsFrom（imports 只注入 env，喂不到 options）
-            opts_from = st.get("optionsFrom") or []
-            if isinstance(opts_from, str):
-                opts_from = [opts_from]
-            opts_shared = any(GUARD_REPO_MARK in str(o) for o in opts_from)
-            if NPCGO_FIELD not in opts and NPCGO_FIELD not in baseline_fields:
-                fails.append(f"{path}: npc:go 路线缺 options.{NPCGO_FIELD}，"
-                             f"且 optionsFrom 未指向共享仓 {GUARD_REPO_MARK}"
-                             "（imports 只注入 env，喂不到 options）")
-            if MIRROR_FIELD in env:
-                fails.append(f"{path}: npc:go 路线不得混用 {MIRROR_FIELD}"
-                             "（镜像私有变量，npc:go 不读）")
-        for label, raw in ((MIRROR_FIELD, env.get(MIRROR_FIELD)),
-                           (NPCGO_FIELD, opts.get(NPCGO_FIELD))):
-            if raw is None:
-                continue
+        raw = env.get(turns_field) or opts.get(turns_field)
+        if raw is not None:
             turns = minutes(raw)
             if turns is None:
-                fails.append(f"{path}: {label}={raw!r} 不是合法数值")
+                fails.append(f"{path}: {turns_field}={raw!r} 不是合法数值")
             elif turns > minutes(max_turns):
-                fails.append(f"{path}: {label}={raw!r} 超出基线 {max_turns}"
+                fails.append(f"{path}: {turns_field}={raw!r} 超出基线 {max_turns}"
                              "（例外须写实测理由，且只在该角色上放宽）")
             elif turns < minutes(max_turns):
-                notes.append(f"{path}: {label}={raw!r} 比基线更紧（允许的向下收紧）")
+                notes.append(f"{path}: {turns_field}={raw!r} 比基线更紧（允许的向下收紧）")
 
-        # ④ 模型白名单（含"缺点号"黑名单；未声明时须有共享基线兜底）
-        model = env.get("DSH_MODEL") or opts.get("model")
+        # ③c 模型白名单（含"缺点号"黑名单；未声明时须有共享基线兜底）
+        model = env.get(MIRROR_MODEL) or opts.get(NPCGO_MODEL)
         if model is None:
-            if not (baseline_fields & {"DSH_MODEL", "model"}):
-                fails.append(f"{path}: 未声明模型名，基线也未提供（缺省档位不可控，"
+            fallback = [r for r in providers if is_shared(r)
+                        and guard_fields_of(ref_docs.get(r, {})) & set(ALL_MODEL_FIELDS)]
+            if not fallback:
+                fails.append(f"{path}: 未声明模型名，且共享仓未提供（缺省档位不可控，"
                              "写错模型名会静默升档）")
             else:
-                notes.append(f"{path}: 模型取共享基线默认值")
+                notes.append(f"{path}: 模型取共享基线默认值（{fallback[0].raw}）")
         elif model in deny:
             fails.append(f"{path}: 模型 {model!r} 在黑名单（实测被路由到思考档，折算 33×）")
         elif model not in allow:
             fails.append(f"{path}: 模型 {model!r} 不在白名单 {allow}（扩展须走共享仓 PR）")
+
+    # ④ 合并后（含共享模板）的核数与 timeout 也过同一套值断言
+    for path, val in ((p, v) for p, v in leaves(effective) if p.endswith(".cpus")):
+        if not isinstance(val, int) or val > max_cpus:
+            fails.append(f"{path} = {val!r} 超出组织上限 {max_cpus}"
+                         "（按核计费，加核不减时只加钱）")
+    for path, val in ((p, v) for p, v in leaves(effective) if p.endswith(".timeout")):
+        got = minutes(val)
+        if got is None or got > minutes(base_timeout):
+            fails.append(f"{path} timeout={val!r} 超出基线 {base_timeout}")
     return fails, notes
+
+
+def job_of(cfg, jpath):
+    """按路径取 job 节点（`path.rsplit(".stages[", 1)[0]` 的结果）。"""
+    for p, job in iter_jobs(cfg):
+        if p == jpath:
+            return job
+    return None
+
+
+def ref_raws_of(*nodes):
+    """取若干节点（stage / 所在 job）上的 imports / optionsFrom 引用原文。
+
+    通道分派的判据来源：字段由**哪个通道**提供，必须与路线匹配。
+    """
+    out = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        for channel in ("imports", "optionsFrom"):
+            val = node.get(channel)
+            for item in (val if isinstance(val, list) else ([val] if val else [])):
+                if isinstance(item, str):
+                    out.append(item)
+    return out
+
+
+def audit_scope_ok(ref, data, scope, is_shared):
+    """鉴权审计范围：默认只审"与护栏有关"的被引用文件，避免无关本地 include 误报。
+
+    * `guard`（默认）：共享资产包文件 ∪ 声明了护栏字段的文件
+    * `shared`：仅共享资产包文件；`all`：全部；`none`：不审
+    """
+    if scope == "none":
+        return False
+    if scope == "all":
+        return True
+    if scope == "shared":
+        return is_shared(ref)
+    return is_shared(ref) or bool(guard_fields_of(data))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True, help="引用方 .cnb/npc.yml")
+    ap.add_argument("--config", required=True, help="引用方 .cnb/npc.yml（路径或 URL）")
     ap.add_argument("--rules", required=True, help="共享仓 rules/npc-cost-guard.yml（路径或 URL）")
+    ap.add_argument("--shared-mark", default=GUARD_REPO_MARK,
+                    help=f"共享仓标识（默认 {GUARD_REPO_MARK}）：值来源须指向它")
+    ap.add_argument("--auth-scope", default="guard", choices=("guard", "shared", "all", "none"),
+                    help="鉴权审计范围（默认 guard：只审共享仓文件与声明护栏字段的文件）")
     args = ap.parse_args()
-    fails, notes = check(args.config, args.rules)
+    fails, notes = check(args.config, args.rules, args.shared_mark, args.auth_scope)
     for line in notes:
         print(f"[note] {line}")
     for line in fails:
