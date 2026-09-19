@@ -53,6 +53,27 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TEST_ROOT = "state-secretary/tests"
 NEW_TEST_FILE = f"{TEST_ROOT}/test_incremental_gate_issue14.py"
 
+#: 本增量**新增**的测试文件集合（按提交序列追加，不删旧项）。
+#: 为什么是集合而非单值：`plan_sweep(base=LEGACY_BASE)` 的计划面就是
+#: "LEGACY_BASE 之后新增的测试文件"。每加一个新增测试文件就要同步这里，
+#: 否则 G1 的"小增量只落一个文件"断言会把**合法的第二个新文件**误判成
+#: "夹带无关用例"——这是**期望值**需要维护，不是门禁缺陷。
+#: 历史：`test_incremental_gate_issue14.py`（Issue #14）→
+#:       `test_npc_cost_guard.py`（Issue #24 成本护栏）。
+NEW_TEST_FILES = [
+    f"{TEST_ROOT}/test_incremental_gate_issue14.py",
+    f"{TEST_ROOT}/test_npc_cost_guard.py",
+]
+
+#: 相对 `LEGACY_MID` 的新增测试文件集合。`LEGACY_MID` 早于本增量序列的起点，
+#: 故比 `NEW_TEST_FILES` 多一个 `test_acceptance_matrix_issue4.py`。
+#: 两个基线**分别**维护，不共用（共用会把"基线早于某文件"混成"门禁夹带"）。
+NEW_TEST_FILES_AT_MID = [
+    f"{TEST_ROOT}/test_acceptance_matrix_issue4.py",
+    f"{TEST_ROOT}/test_incremental_gate_issue14.py",
+    f"{TEST_ROOT}/test_npc_cost_guard.py",
+]
+
 # 历史增量节点（本仓库真实存在的提交）：用于增量 diff 判定的真实复核
 # 🟡10：原契约写的 798e80d / 0ed083d 在本仓库不存在（git cat-file 失败）→
 # 3 项永久 skip、"跨版复核"不可复现。此处改用**真实存在**的修订。
@@ -155,8 +176,9 @@ class TestG1IncrementalOnly:
         gate = _gate()
         plan = gate.plan_sweep(base=LEGACY_BASE)
         full = gate.collect("WORKTREE")
-        assert plan.planned_files == [NEW_TEST_FILE], (
-            f"单文件增量却计划触及 {plan.planned_files} → 夹带无关用例")
+        assert sorted(plan.planned_files) == sorted(NEW_TEST_FILES), (
+            f"增量新增文件 {NEW_TEST_FILES} 却计划触及 {plan.planned_files}"
+            " → 夹带无关用例或漏掉新文件")
         assert plan.planned_count < len(full) * 0.25, (
             f"小增量计划 {plan.planned_count} 例 / 全量 {len(full)} 例 → "
             "未体现『只跑增量』")
@@ -499,9 +521,12 @@ class TestG8RealRepoEndToEnd:
                    if looks_like_test_path(c["path"])}
         assert not (set(plan.planned_files) - touched), \
             "计划不得含与 diff 无关的既有文件"
-        # 中等增量对照：两个文件新增
+        # 中等增量对照：`LEGACY_MID` 之后新增的测试文件（基线早于本序列起点，
+        # 故面比 `NEW_TEST_FILES` 多一个，见 `NEW_TEST_FILES_AT_MID`）
         plan_mid = gate.plan_sweep(base=LEGACY_MID)
-        assert len(plan_mid.planned_files) == 2, plan_mid.planned_files
+        assert sorted(plan_mid.planned_files) == sorted(NEW_TEST_FILES_AT_MID), (
+            f"LEGACY_MID 增量计划面 {sorted(plan_mid.planned_files)} != "
+            f"新增集 {sorted(NEW_TEST_FILES_AT_MID)}")
 
     def test_g8_gate_module_self_consistent(self):
         """门禁自身：计划/报告/计数三处口径一致（不变量断言）。"""
