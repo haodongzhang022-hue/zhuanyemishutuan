@@ -139,6 +139,8 @@ python3 state-secretary/poc/incremental_gate.py counter \
 2. **新增文件内既有用例**：文件级新增时全部用例计 `added`（含从别处搬来的
    用例）→ 属"多跑"，方向安全；
 3. **浅克隆**：`git archive` 不可用时跨版采集回退为文件级消解（保守）；
+   基线**完全不可解析**（HEAD 未建立 / 拼写错误）时同理走 `_degraded_plan`
+    全树降级（**不**静默空计划），降级原因在 `plan.degraded_reason` 可见；
 4. **非 Python 测试**：仅识别 `*.py` 测试面；其他语言测试面需扩展
    `looks_like_test_path`。
 
@@ -163,6 +165,9 @@ python3 state-secretary/poc/incremental_gate.py counter \
 | 变异体 **M14**：`pythonpath` 回退仓库根相对口径（🔴-A） | **5 FAIL**（多基线端到端 rc=4 + 口径单元） |
 | 变异体 **M15**：`counts[status]` 键名不符（🔴-B） | **2 FAIL**（`KeyError('error')` 崩栈） |
 | 变异体 **M16**：`_fill_results` 不收窄捕获 `JUnitParseError` | **1 FAIL**（解析异常逃逸） |
+| 变异体 **M17**：基线不可解析改为放行（还原旧行为，🔴-C） | **2 FAIL** |
+| 变异体 **M18**：降级分支退化为空计划（还原假绿，🔴-C） | **1 FAIL** |
+| 变异体 **M19**：沙箱去掉 gpgsign 对消（还原"不封闭沙箱"，🔴-C） | **5 FAIL** |
 
 ## 10.1 复评第 2 轮定点修复（🔴-1 / 🔴-2 / 🔴-3 清零）
 
@@ -188,6 +193,29 @@ python3 state-secretary/poc/incremental_gate.py counter \
 可复现判别）。多基线用例剔除本门禁文件防递归（其判别面
 `test_acceptance_matrix_issue4.py` / `test_secretary_session.py` **无**
 `sys.path.insert`，正是 🔴-A 的暴露面）。
+
+## 10.3 收口轮定点修复（🔴-C 清零 · 「查不到」≠「没有」）
+
+> 触发：Issue #14 收口轮全量复跑实测 **2 项失败**，初判像"环境噪声"，
+> 追查后确认是**两个真缺陷叠加**——且其中一个正是本门禁最危险的失败模式。
+
+| 项 | 病灶 | 修复 |
+|---|---|---|
+| 🔴-C1 **沙箱不封闭** | `_sandbox_repo_for_rewrite` 只配 `user.email/name`，**未对消宿主全局 `commit.gpgsign`**。CI 镜像全局 `commit.gpgsign=true` 而签名器不可用 → `git commit` **静默失败（rc=128 *"gpg failed to sign the data"*）** → 沙箱**根本没有 HEAD** → 表现为 `IndexError / AssertionError`。**判别力为零**（无论实现对不对都失败） | 新增 `_hermetic_git_init()`：`commit.gpgsign=false` + `tag.gpgsign=false` + `core.hooksPath=/dev/null`，**并断言 commit 成功 + HEAD 存在**；断言把"沙箱坏了"显式暴露，不再伪装成业务失败 |
+| 🔴-C2 **把「查不到」当「没有」** | `changed_files` 用 `_run`（**不校验 rc**）：`git diff --numstat <base>` 在 base 解析失败时返回 **128 + 空 stdout**，与"无变更"**无从区分** → 空条目 / **空计划**。空计划会被读成"本轮无需跑测" = **假绿**（"只跑增量"最危险的失败模式） | ① 新增 `_run_checked()`：git 非零 rc → 抛 `GateError`；② 新增 `_assert_base_usable()` 基线预检；③ `plan_sweep` 对不可解析基线走 **`_degraded_plan()` 保守降级**（文件级消解 = 全树重跑，宁多跑不漏跑）+ `plan.degraded/degraded_reason` **留痕可见**，**绝不返回空计划** |
+
+**为什么不是 fail-fast 一种**：`changed_files`（底层 API）对不可解析基线**抛错**
+（调用方自负其责）；生产入口 `plan_sweep` 走**保守降级**——因为这里存在一条
+*安全* 的保守路径（不变量 6 的"指纹缺失 → 保守回退文件级消解"），
+没必要为"基线缺失"卡住干活。两种处置的共同底线是：**绝不静默给空计划**。
+
+**回归防线**：新增 `TestG14BaseUnresolvable`（5 项，含 2 项反向对照）——
+① 不可解析 → 抛错；② **反向对照**：基线合法且确无改动 → 仍返回空列表
+（证明只把"查不到"与"没有"分开，没改"真的没有"）；③ 降级**非空**且原因可见；
+④ **反向对照**：合法基线 + 真增量 → **不**降级；⑤ 沙箱对宿主 gpgsign 封闭。
+
+**变异矩阵（判别力实证）**：M17/M18/M19 分别触发 **2 / 1 / 5 FAIL**，
+本实现上 **5/5 PASS** → 断言非恒真。
 
 ## 11. 与既有门禁的关系
 

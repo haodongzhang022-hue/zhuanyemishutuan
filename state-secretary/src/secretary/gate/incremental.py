@@ -87,6 +87,25 @@ def _run(cmd: Sequence[str], cwd: str,
             f"子进程超时（{timeout}s）: {' '.join(list(cmd))}") from exc
 
 
+def _run_checked(cmd: Sequence[str], cwd: str,
+                 what: str) -> subprocess.CompletedProcess:
+    """执行 git 子进程；**非零返回码即失败**，不静默当作"无变更"。
+
+    🔴 根因（Issue #14 收口）：原实现把 ``git diff --numstat <base>`` 的
+    非零 rc 与空 stdout **同等看待** —— base 解析失败（如 ``HEAD`` 尚不存在、
+    浅克隆缺基线）时返回 128 + 空输出，被读成"**无增量**"。
+    那是最危险的一类错：门禁把「查不到变更」当成「没有变更」，
+    静默给出**空计划**（正是"只跑增量"最怕的假绿）。
+    此处把 git 的失败**显式抛出**，让调用方降级/报错。
+    """
+    out = _run(cmd, cwd)
+    if out.returncode != 0:
+        raise GateError(
+            f"{what} 失败（rc={out.returncode}）: {' '.join(list(cmd))}\n"
+            f"stderr: {out.stderr.strip()}")
+    return out
+
+
 def _is_git_repo(path: str) -> bool:
     try:
         out = _run(["git", "rev-parse", "--git-dir"], path)
@@ -144,6 +163,9 @@ class IncrementalGate:
         # 🟢 优化：`git show rev:path` 结果缓存（同一路径在 defs/指纹两处复用），
         # 把 O(变更文件) 次子进程降为每 (rev, path) 一次。
         self._show_cache: Dict[Tuple[str, str], Optional[str]] = {}
+        # 🔴 收口：base 解析失败（浅克隆/HEAD 未建立）时的**降级留痕**。
+        # 空计划 + 假绿是本门禁最危险的失败模式，故降级必须可见。
+        self.degraded: List[str] = []
 
     # ------------------------------------------------------------------
     # git 增量识别
@@ -157,6 +179,22 @@ class IncrementalGate:
                    self.repo_root)
         return out.stdout.strip() if out.returncode == 0 else None
 
+    def _assert_base_usable(self, base: str) -> None:
+        """基线可用性预检：``WORKTREE`` 恒可；否则须能解析为提交。
+
+        🔴 收口：把「基线不存在」与「确实没有变更」**彻底分开**。
+        基线不可解析 → 抛 :class:`GateError`（fail-fast），
+        绝不静默返回空计划——空计划会被读成"本轮无需跑测"（假绿）。
+        调用方若要容错，须**显式**走 :meth:`plan_sweep` 的保守降级分支
+        （该分支会往 :attr:`degraded` 留痕）。
+        """
+        if not base or base == "WORKTREE":
+            return
+        if self.resolve(base) is None:
+            raise GateError(
+                f"基线不可解析: {base!r}（浅克隆/HEAD 未建立/拼写错误）。"
+                "拒绝静默返回空增量——「查不到变更」≠「没有变更」。")
+
     def changed_files(self, base: str, head: str = "WORKTREE") -> List[dict]:
         """列出 base→head 的变更文件（含新增/改动行数）。
 
@@ -165,7 +203,9 @@ class IncrementalGate:
         """
         if head == "WORKTREE":
             # 工作区：已跟踪改动 + 未跟踪新增
-            tracked = _run(["git", "diff", "--numstat", base], self.repo_root)
+            self._assert_base_usable(base)
+            tracked = _run_checked(["git", "diff", "--numstat", base],
+                                   self.repo_root, f"git diff --numstat {base}")
             untracked = _run(
                 ["git", "ls-files", "--others", "--exclude-standard"],
                 self.repo_root)
@@ -189,7 +229,9 @@ class IncrementalGate:
                                      "total_lines": self._total_lines(path)}
             return list(entries.values())
 
-        out = _run(["git", "diff", "--numstat", base, head], self.repo_root)
+        self._assert_base_usable(base)
+        out = _run_checked(["git", "diff", "--numstat", base, head],
+                           self.repo_root, f"git diff --numstat {base} {head}")
         added_out = _run(["git", "diff", "--name-only", "--diff-filter=A",
                           base, head], self.repo_root)
         new_paths = {p.strip() for p in added_out.stdout.splitlines() if p.strip()}
@@ -405,6 +447,48 @@ class IncrementalGate:
     # 计划（本轮要跑什么）
     # ------------------------------------------------------------------
 
+    def _degraded_plan(self, base: str, head: str, reason: str) -> SweepPlan:
+        """基线不可用时的**保守降级计划**：全树测试文件按「消解」纳入。
+
+        🔴 收口要点（"查不到" ≠ "没有"）：
+        - **绝不返回空计划**（空计划 = 假绿：本轮实跑 0 例被读成"无需跑"）；
+        - 降级**可见**：原因写入 ``plan.degraded_reason`` 并登记 ``self.degraded``；
+        - 方向安全：宁多跑（文件级消解）不漏跑，符合不变量 6
+          （指纹缺失 → 保守回退文件级消解）。
+
+        与 fail-fast 的关系：:meth:`changed_files` 仍对不可解析基线**抛错**
+        （直接调用者必须自己负责）；而生产入口 :meth:`plan_sweep` 走本降级，
+        因为这里有一条**安全**的保守路径可用，没必要卡住干活。
+        """
+        note = f"基线不可解析 → 保守降级为文件级消解（全树重跑）: {reason}"
+        self.degraded.append(note)
+        plan = SweepPlan(base=base, head=head, test_root=self.test_root)
+        plan.degraded_reason = note
+        plan.degraded = True
+        files = self._all_test_files(head)
+        plan.measured_suite_total = len(self.collect(head, files or None))
+        for path in files:
+            rel = self._pytest_rel(path)
+            for nodeid in self.collect(head, [rel]):
+                plan.targets.append(SweepTarget(
+                    nodeid=nodeid, kind=INCREMENT_DISSOLVED, path=path,
+                    name=nodeid.split("::")[-1]))
+        return plan
+
+    def _all_test_files(self, head: str = "WORKTREE") -> List[str]:
+        """全树测试文件（仓库相对）——降级路径的标的来源。"""
+        root = os.path.join(self.repo_root, self.test_root)
+        found: List[str] = []
+        for dirpath, _dirs, names in os.walk(root):
+            for name in sorted(names):
+                if not name.endswith(".py"):
+                    continue
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, self.repo_root).replace(os.sep, "/")
+                if looks_like_test_path(rel):
+                    found.append(rel)
+        return sorted(found)
+
     def plan_sweep(self, base: str, head: str = "WORKTREE",
                    guards: Optional[Sequence[str]] = None,
                    include_redundant: bool = False) -> SweepPlan:
@@ -417,6 +501,15 @@ class IncrementalGate:
             include_redundant: 是否把冗余项也纳入计划（默认 False = 剔除）。
         """
         plan = SweepPlan(base=base, head=head, test_root=self.test_root)
+        # 🔴 收口：基线不可解析（浅克隆 / HEAD 未建立）→ **保守降级**：
+        # 不静默给空计划，也**不死锁**——退化为「文件级消解 = 全树需重跑」，
+        # 并在计划里**显式留痕**降级原因（空计划假绿是更坏的结局）。
+        # 注：交付方要求的"保守放行"（宁多跑不漏跑）在此统一落地。
+        try:
+            self._assert_base_usable(base)
+        except GateError as exc:
+            return self._degraded_plan(base, head, str(exc))
+
         changed = self.changed_files(base, head)
         # 🟡9：统一走 `changed_test_files`（与 `looks_like_test_path` 单一判定源），
         # 再把 diff 元数据（is_new / changed_lines）贴回。

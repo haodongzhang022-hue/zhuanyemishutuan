@@ -125,8 +125,8 @@ state-secretary/
 │       └── session/             # 会话门面层（L3 秘书统一入口）
 │           ├── __init__.py
 │           └── session.py       # SecretarySession（推荐使用）
-├── tests/                       # 380 项测试（门面 148 + 独立探针 65 + 验收矩阵 13
-│                                #   + 增量门禁 72 + 其余既有回归，含评审回归）
+├── tests/                       # 397 项测试（门面 148 + 独立探针 65 + 验收矩阵 13
+│                                #   + 增量门禁 89 + 其余既有回归，含评审回归）
 ├── src/secretary/gate/          # 增量跑测门禁（Issue #14）
 │   ├── models.py                # 三态模型 SweepTarget/Plan/Report + 全量告警视图
 │   ├── rules.py                 # 增量分类 + 冗余剔除 + 有效覆盖面兜底
