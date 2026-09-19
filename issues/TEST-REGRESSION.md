@@ -2239,6 +2239,12 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 共用会把"基线早于某文件"混成"门禁夹带"。已在注释写明这是**期望值需要维护**，
 不是门禁缺陷（门禁行为未变）。
 
+> **⚠️ 已被 §33 取代（2026-09-19）**：集合常量仍是**硬编码快照**——PR #15
+> 一次新增 19 个测试文件后立刻过期，直接造成 §33 的 F1–F3 三项失败。
+> 现改为由 `git diff --name-status` **独立推导**，并在断言层只锁定
+> **语义不变量**（计划面 == 新增面 / deferred 与计划不相交）。
+> 本节保留作沿革记录。
+
 ### 32.4 自测
 
 - `test_npc_cost_guard.py`：**10 passed**；变异 M1/M2/M3 各触发 **2 FAIL**。
@@ -2263,3 +2269,58 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 - **PR 评论 `@npc` 自触发**：建议编排层合并同 PR 同分钟 `@npc`，NPC 自身产出不触发下一棒。
 - **长尾 stall**：`cnb-teg` 跑 37 min 后 error，实为 agent 自我回滚致零产出；
   建议加"连续 N 回合无文件产出即收尾"软护栏。
+
+## 33. Issue #21 收口 · 合并后 6 项失败处置（2026-09-19）
+
+来源：PR #15 合并（`89c95a3`）后复跑 `tests/test_incremental_gate_issue14.py`
+（main 侧文件，**本 Issue 范围外但被合并暴露**）→ **6 failed / 83 passed**。
+本轮将其**逐项定位并根治**（不跑全量，只跑定向用例）。
+
+### 33.1 六项失败 → 根因（三类）
+
+| # | 用例 | 根因类别 | 真因 |
+| --- | --- | --- | --- |
+| F1 | `test_g1_small_increment_plan_is_small` | 期望值过期 | 硬编码新增面 2 个文件；PR #15 实为 **19** 个 |
+| F2 | `test_g8_real_pr_increment_is_small_not_full` | 快照式断言 | 断言 `planned < deferred`；大增量（946 > 308）合法却判失败 |
+| F3 | `test_g8_big_increment_plan_matches_real_diff` | 期望值过期 | 同上，`NEW_TEST_FILES_AT_MID` 冻结为 3 个 |
+| F4 | `test_g10_plan_count_matches_pytest_collection` | **真缺陷（源码）** | `test_loop_guard_issue14.py:321` 用例名 **typo** `testinherit_`（缺 `_`）→ 门禁 `_DEF_RE` 要求 `test_` 前缀 ⇒ **漏计 4 例参数化**（946 vs 942） |
+| F5/F6 | `test_g12_real_repo_multi_base_run_is_green[e3195ea/d6abaab]` | **真缺陷（源码）** | ① 914 个 selector ≈ 541 KB → `E2BIG`；② **单个** nodeid **140 KB** > `MAX_ARG_STRLEN`（128 KB）→ 该参数**永远无法**经 argv 传递 |
+
+**关键澄清**：F1–F3 **不是门禁缺陷**——`plan_sweep(a455608)` 计划 19 个文件
+与 `git diff --name-status a455608..HEAD` 的 19 个新增**完全一致**，门禁行为正确；
+过期的是**测试里的期望快照**。F4/F5/F6 是**真缺陷**（分别漏计、崩栈）。
+
+### 33.2 修复
+
+| 项 | 修复 | 文件 |
+| --- | --- | --- |
+| F1–F3 | 期望集合改为由 `git diff --name-status` **独立推导**（不复用门禁 `changed_files()`，避免自证循环）；断言回到**语义不变量**（计划面 == 新增面、deferred 与计划不相交） | `tests/test_incremental_gate_issue14.py` |
+| F4 | 用例名 `testinherit_…` → `test_inherit_…`（全库唯一一处；已全库扫描确认无第二处） | `tests/test_loop_guard_issue14.py` |
+| F5 | `run()` 增加 **argv 分片**：按 `max_argv_bytes`（默认 96 KiB）切批，逐批起子进程后**聚合**计数/nodeid；保序不丢项 | `src/secretary/gate/incremental.py` |
+| F6 | 对抗参数化补 **显式短 `ids`**（默认 id 会把 100 KB 参数拼进 nodeid） | `tests/test_collab_round8_fixes_issue14.py` |
+
+### 33.3 口径（分片为何不是"少传 selector"）
+
+- 少传 selector → **静默丢用例**（假绿）⇒ 不可接受；
+- 退化为文件级 selector → 整文件全跑，**违反"只跑增量"** ⇒ 不可接受；
+- 故唯一保语义解法是**分批 + 聚合**。分片后仍校验不变量 1
+  （计划跑测数 == 报告实跑数），跨批计数**求和**、退出码取**最坏**、
+  计数来源取**最低可信度**。
+
+### 33.4 定向自测（未跑全量）
+
+| 用例集 | 结果 |
+| --- | --- |
+| `test_incremental_gate_issue14.py` | **89 passed**（原 6 failed / 83 passed） |
+| `test_loop_guard_issue14.py` + `test_collab_round8_fixes_issue14.py` + `test_issue21_scan_rework.py` | **233 passed** |
+| `test_full_gate` / `test_run_scope` / `test_checkpoint_probe` / `test_collab_rules` / `test_collab_confirm` | **199 passed** |
+| 端到端多批实测（`--base e3195ea`，918 例） | rc=0 / 实跑 918 == 计划 918 / 🟢 / `counts_source=junitxml` |
+| 单批路径对照（`test_npc_cost_guard.py`，10 例） | rc=0 / 实跑 10 == 计划 10 / 🟢（分片未改变单批语义） |
+
+### 33.5 遗留（显式登记，不静默）
+
+- `max_argv_bytes` 取 96 KiB 为**保守值**（容器实测 `SC_ARG_MAX`=2 MiB，但
+  `E2BIG` 实际阈值受环境块大小影响，实测真实 selector 集在 ~343 KB 失败）。
+  正常增量仍**只有一次**子进程；仅超大增量分片。
+- 单个 selector 若**自身**超 `MAX_ARG_STRLEN`（128 KB），分片**无法**救
+  ——须按 F6 在**参数化源头**补显式 `ids`（本轮已修，全库最长 nodeid < 8 KB）。

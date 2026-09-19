@@ -2,7 +2,7 @@
 
 > version: v1.0 · Issue #14
 > 模块：`state-secretary/src/secretary/gate/`
-> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（72 项）
+> 用例：`state-secretary/tests/test_incremental_gate_issue14.py`（89 项）
 > CLI：`state-secretary/poc/incremental_gate.py`
 
 ## 1. 用户口径（原文要点）
@@ -216,6 +216,47 @@ python3 state-secretary/poc/incremental_gate.py counter \
 
 **变异矩阵（判别力实证）**：M17/M18/M19 分别触发 **2 / 1 / 5 FAIL**，
 本实现上 **5/5 PASS** → 断言非恒真。
+
+## 10.4 合并后收口（Issue #21 · 真缺陷 2 类 + 期望快照 2 类）
+
+> 触发：PR #15 合并（`89c95a3`）后 `test_incremental_gate_issue14.py`
+> **6 failed / 83 passed**。逐项定位后分两类：**2 项真缺陷**（门禁代码）
+> + **4 项期望快照过期**（测试自身，门禁行为正确）。
+
+### 真缺陷 ①：argv 上限（`E2BIG`）
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| `--base e3195ea` → `OSError: [Errno 7] Argument list too long` | `run()` 把**全部** selector 拼进单次 `subprocess` argv。914 例 ≈ **541 KB**；更致命的是**单个** nodeid 可达 **140 KB** > `MAX_ARG_STRLEN`（Linux 128 KB）→ 该参数**永远无法**经 argv 传递 | ① `run()` 增加 **argv 分片**：按 `max_argv_bytes`（默认 96 KiB）切批，逐批子进程后**聚合**；② 对抗参数化补**显式短 `ids`**（根治单参数超限） |
+
+**分片口径（为何不是别的解法）**：
+
+- 少传 selector → **静默丢用例**（假绿）⇒ 不可接受；
+- 退化为文件级 selector → 整文件全跑，**违反"只跑增量"** ⇒ 不可接受；
+- 故唯一保语义解法是**分批 + 聚合**。聚合规则：计数**求和**、退出码取**最坏**、
+  计数来源取**最低可信度**（任一 `none` → `none`）；分片后**仍**校验
+  不变量 1（计划跑测数 == 报告实跑数）。
+
+### 真缺陷 ②：用例名 typo 致漏计
+
+`test_loop_guard_issue14.py` 的 `def testinherit_non_silent_payload_does_not_fuse`
+**缺一个下划线**。pytest 仍收集它（`test*` 前缀），但门禁 `_DEF_RE`
+要求 `test_` → 该用例对计划**不可见** → `planned=942 ≠ collected=946`
+（差 4 例参数化）。修复：改名 `test_inherit_…`（全库唯一一处）。
+
+> **教训**：`_DEF_RE = test_[A-Za-z0-9_]+` 与 pytest 的收集规则
+> （`python_functions = test_*` 之外的宽松匹配）存在**口径差**。
+> 当前以"命名规范"兜底；若再出现同类问题，应在 `plan_sweep` 侧对
+> `collect()` 与 `parse_test_defs()` 的结果做**双向差集告警**（而非静默漏计）。
+
+### 期望快照过期（非门禁缺陷）
+
+`NEW_TEST_FILES` 等硬编码补充列表在 PR #15 后过期（base `a455608` 与 HEAD
+之间**合法新增 19 个**测试文件）。修复：改为由 `git diff --name-status`
+**独立推导**（**不**复用门禁 `changed_files()`，避免"用被测对象证明被测对象"）；
+断言层只锁定**语义不变量**：`计划面 == 新增面`、`deferred ∩ 计划 = ∅`、
+`deferred` 不含触及文件。原 `planned < deferred`（"增量须小于既有"）
+与 `planned < full * 0.25` 均属**规模快照**，大增量下必假失败，已删除。
 
 ## 11. 与既有门禁的关系
 

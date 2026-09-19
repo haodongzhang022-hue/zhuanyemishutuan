@@ -72,6 +72,17 @@ _DEF_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?:async\s+)?def\s+(test_[A-Za-z0-9_]+)\s*\(")
 _CLASS_RE = re.compile(r"^(?P<indent>[ \t]*)class\s+([A-Za-z0-9_]+)\s*[:(]")
 _TOP_INDENT = ("", "    ")   # 顶层 / 类内一层
+# 单次子进程 argv 总字节上限（保守值）。
+# 为什么需要显式上限：`execve` 的 `E2BIG`（`[Errno 7] Argument list too long`）
+# 由 **OS/容器**判定，与用例数**耦合**——增量越大，selector 列表越长。
+# 实测容器：64 000 个短参数 OK、128 000 个失败；本门禁 `--base e3195ea`
+# 计划 914 例 ≈ 540 KB 字符串 → 直接 `E2BIG`（旧实现**没有任何分片**，
+# 大增量在真实仓库上必崩，且崩在 `subprocess` 调用处而非断言处）。
+# 取 96 KiB 留足安全余量（`SC_ARG_MAX` 实测 2 MiB，但 `MAX_ARG_STRLEN`
+# 与环境开销会显著低于该值），同时保证正常增量仍**只有一次子进程**。
+_MAX_ARGV_BYTES = 96 * 1024
+
+
 _NODEID_RE = re.compile(
     r"^(?P<path>[^:]+\.py)(?:::?(?P<rest>.*))?$")
 
@@ -147,7 +158,8 @@ class IncrementalGate:
                  test_root: str = "state-secretary/tests",
                  src_pythonpath: str = "state-secretary/src",
                  rules: Optional[SweepRules] = None,
-                 pytest_cmd: Optional[Sequence[str]] = None):
+                 pytest_cmd: Optional[Sequence[str]] = None,
+                 max_argv_bytes: int = _MAX_ARGV_BYTES):
         self.repo_root = os.path.abspath(repo_root or os.getcwd())
         if not os.path.isdir(self.repo_root):
             raise GateError(f"仓库根不存在: {self.repo_root}")
@@ -159,6 +171,10 @@ class IncrementalGate:
         self.src_pythonpath = src_pythonpath
         self.rules = rules or DEFAULT_RULES
         self._pytest = list(pytest_cmd or [sys.executable, "-m", "pytest"])
+        # 单次子进程 argv 上限（字节）。超过此值 → **分片跑测**（见 `run()`），
+        # 不得让 `OSError: [Errno 7] Argument list too long` 逃逸成
+        # "跑不了 = 报红"，也不得因超限退化为省略 selector（会丢用例）。
+        self.max_argv_bytes = int(max_argv_bytes)
         self._cache: Dict[str, List[str]] = {}
         # 🟢 优化：`git show rev:path` 结果缓存（同一路径在 defs/指纹两处复用），
         # 把 O(变更文件) 次子进程降为每 (rev, path) 一次。
@@ -768,40 +784,136 @@ class IncrementalGate:
                 "请检查计划标的路径口径。")
 
         pkg = os.path.join(self.repo_root, "state-secretary")
-        cmd = self._pytest + ["-q", "-p", "no:cacheprovider"]
         # 🟡3：src_pythonpath 接线为 pytest `pythonpath` ini。
         # 🔴-A：pytest 的 `pythonpath` ini 相对 **rootdir**（由 pytest.ini
         # 决定 = state-secretary/）解析，而形参默认值是**仓库根相对**
         # （`state-secretary/src`）→ 直接注入会指向
         # `state-secretary/state-secretary/src`（不存在）→ collection error
         # （rc=2）。故注入前一律转运行目录相对（`pythonpath_ini_value()`）。
+        base_cmd = self._pytest + ["-q", "-p", "no:cacheprovider"]
         ini_value = self.pythonpath_ini_value()
         if ini_value:
-            cmd += ["-o", f"pythonpath={ini_value}"]
-        cmd += list(extra_args)
-        cmd += selectors + files
+            base_cmd += ["-o", f"pythonpath={ini_value}"]
+        base_cmd += list(extra_args)
 
+        # 🔴-E（argv 上限）：**分片跑测**——按 argv 字节上限把 selectors/files
+        # 切成多批，逐批起子进程，最后**聚合**计数与 nodeid。
+        # 为何不是"少传些 selector"：那会静默丢用例（假绿）。
+        # 为何不是"文件级 selector"：会退化为整文件全跑（违反"只跑增量"）。
+        # 故唯一保语义的解法是**分批 + 聚合**。
+        batches = self._chunk_argv(base_cmd, selectors, files)
         import tempfile
-        fd, xml_path = tempfile.mkstemp(prefix="gate-junit-", suffix=".xml")
-        os.close(fd)
-        cmd += [f"--junitxml={xml_path}"]
-        # 🟡5：留痕命令须与**实际执行**一致 → 在拼接 `--junitxml=` 之后生成。
-        report.command = " ".join(cmd)
+
+        executed: List[str] = []
+        passed: List[str] = []
+        failed: List[str] = []
+        errors: List[str] = []
+        skipped: List[str] = []
+        counts_sum: Dict[str, int] = {"passed": 0, "failed": 0,
+                                      "errors": 0, "skipped": 0}
+        worst_rc = 0
+        raws: List[str] = []
+        summaries: List[str] = []
+        sources: List[str] = []
+        all_reliable = True
+        degraded: List[str] = []
+        commands: List[str] = []
+
         start = time.time()
-        out = _run(cmd, pkg, timeout=timeout)
+        for idx, chunk_args in enumerate(batches):
+            xml_path = tempfile.mkstemp(prefix="gate-junit-",
+                                        suffix=f"-{idx}.xml")[1]
+            try:
+                cmd = list(base_cmd) + list(chunk_args) + [
+                    f"--junitxml={xml_path}"]
+                commands.append(" ".join(cmd))
+                out = _run(cmd, pkg, timeout=timeout)
+                rc = out.returncode
+                raw = (out.stdout or "") + (out.stderr or "")
+                raws.append(raw)
+                summaries.append(self._summary_line(out.stdout or ""))
+                if rc and not worst_rc:
+                    worst_rc = rc
+                elif rc and worst_rc in (1, 5) and rc not in (1, 5):
+                    worst_rc = rc
+
+                part = SweepReport(plan)
+                part.exit_code = rc
+                part.raw_output = raw
+                part.summary_line = summaries[-1]
+                self._fill_results(part, xml_path, out)
+                sources.append(part.counts_source)
+                if not part.counts_reliable:
+                    all_reliable = False
+                if part.degraded_reason:
+                    degraded.append(part.degraded_reason)
+                passed.extend(part.passed)
+                failed.extend(part.failed)
+                errors.extend(x for x in part.errors)
+                skipped.extend(x for x in part.skipped)
+                executed.extend(part.executed)
+                for k in counts_sum:
+                    counts_sum[k] += int(part.counts.get(k, 0) or 0)
+            finally:
+                try:
+                    os.unlink(xml_path)
+                except OSError:  # pragma: no cover
+                    pass
+
         report.duration_sec = time.time() - start
-        report.exit_code = out.returncode
-        report.raw_output = (out.stdout or "") + (out.stderr or "")
-        report.summary_line = self._summary_line(out.stdout or "")
-
-        self._fill_results(report, xml_path, out)
-        try:
-            os.unlink(xml_path)
-        except OSError:  # pragma: no cover
-            pass
-
+        report.exit_code = worst_rc
+        report.raw_output = "\n".join(raws)
+        report.summary_line = summaries[-1] if summaries else ""
+        report.command = " ; ".join(commands)
+        report.executed = executed
+        report.passed = passed
+        report.failed = failed
+        report.errors = errors
+        report.skipped = skipped
+        report.counts = dict(counts_sum)
+        report.suite_total = sum(counts_sum.values())
+        report.counts_verified = all_reliable and bool(sources)
+        # 计数来源：单批照旧；多批取**最低可信度**（任一不可核实 → 不可核实）。
+        if len(set(sources)) == 1:
+            report.counts_source = sources[0]
+        elif sources:
+            report.counts_source = ("none" if "none" in sources
+                                    else "stdout" if "stdout" in sources
+                                    else "junitxml")
+        if degraded:
+            report.degraded_reason = "；".join(dict.fromkeys(degraded))
         self._verify_consistency(report, selectors + files)
         return report
+
+    def _chunk_argv(self, base_cmd: Sequence[str],
+                    selectors: Sequence[str],
+                    files: Sequence[str]) -> List[List[str]]:
+        """把 selector/file 列表按 **argv 字节上限** 切分为若干批。
+
+        口径：
+        - 每个 **参数** 自身的字节数不得超限（单个 selector 极长 → 单独成批，
+          由调用方保证不会出现，否则 `E2BIG` 仍会命中）；
+        - 单批 `base_cmd + 参数` 的**总字节** ≤ ``max_argv_bytes``；
+        - 文件级 selector 排在最后（文件级放大会一次跑整文件，放末尾便于
+          在正常增量下保持"nodeid 优先"的语义）；
+        - 保序、不丢项：`flatten(batches) == list(selectors) + list(files)`。
+        """
+        limit = max(1024, int(self.max_argv_bytes))
+        fixed = sum(len(a) + 1 for a in base_cmd) + len("--junitxml=") + 260
+        batches: List[List[str]] = []
+        cur: List[str] = []
+        cur_bytes = fixed
+        for item in list(selectors) + list(files):
+            need = len(item) + 1
+            if cur and cur_bytes + need > limit:
+                batches.append(cur)
+                cur = []
+                cur_bytes = fixed
+            cur.append(item)
+            cur_bytes += need
+        if cur:
+            batches.append(cur)
+        return batches
 
     @staticmethod
     def _summary_line(stdout: str) -> str:

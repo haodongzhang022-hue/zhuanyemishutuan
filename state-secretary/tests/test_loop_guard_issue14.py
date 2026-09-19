@@ -318,7 +318,7 @@ class TestCrossAgentNoRevive:
         '{ this is not json',
         '["not", "an", "object"]',
     ])
-    def testinherit_non_silent_payload_does_not_fuse(self, tmp_dir, payload):
+    def test_inherit_non_silent_payload_does_not_fuse(self, tmp_dir, payload):
         """反向对照：非静默载荷（wake=True / 空 / 坏 JSON / 数组）不熔断。"""
         sec = SecretarySession("x3", data_dir=tmp_dir)
         assert sec.inherit_silent_handoff(payload) is False

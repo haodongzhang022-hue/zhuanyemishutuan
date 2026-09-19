@@ -479,9 +479,17 @@ class TestComplexityStaysBounded:
         got = json_objects_in(text)
         return time.perf_counter() - t0, got
 
+    # 🟡💥 argv 上限：**必须**给显式短 `ids`。默认 id 会把整个 100 KB 参数
+    # 拼进 nodeid（最长实测 **140 KB**），而单个 argv 参数受 `MAX_ARG_STRLEN`
+    # （Linux 128 KB）限制 → 门禁把计划 nodeid 喂给 `subprocess` 时抛
+    # `OSError: [Errno 7] Argument list too long`（`--base e3195ea` 实测必现）。
+    # 显式 `ids` 同时让 nodeid **稳定**（不随参数内容漂移）→ 缓存/留痕可比对。
     @pytest.mark.parametrize("text", [
         "{" * 20000, "{" * 40000, "if (x) {" * 3000, '"' * 20000,
         '"{' * 50000, '{"a":' * 20000, '{"a": "' * 20000,
+    ], ids=[
+        "braces-20k", "braces-40k", "ifx-3k", "quotes-20k",
+        "quote-brace-50k", "obj-colon-20k", "obj-colon-str-20k",
     ])
     def test_adversarial_inputs_are_fast(self, text):
         dt, _ = self._t(text)

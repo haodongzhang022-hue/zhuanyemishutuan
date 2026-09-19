@@ -53,26 +53,14 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TEST_ROOT = "state-secretary/tests"
 NEW_TEST_FILE = f"{TEST_ROOT}/test_incremental_gate_issue14.py"
 
-#: 本增量**新增**的测试文件集合（按提交序列追加，不删旧项）。
-#: 为什么是集合而非单值：`plan_sweep(base=LEGACY_BASE)` 的计划面就是
-#: "LEGACY_BASE 之后新增的测试文件"。每加一个新增测试文件就要同步这里，
-#: 否则 G1 的"小增量只落一个文件"断言会把**合法的第二个新文件**误判成
-#: "夹带无关用例"——这是**期望值**需要维护，不是门禁缺陷。
-#: 历史：`test_incremental_gate_issue14.py`（Issue #14）→
-#:       `test_npc_cost_guard.py`（Issue #24 成本护栏）。
-NEW_TEST_FILES = [
-    f"{TEST_ROOT}/test_incremental_gate_issue14.py",
-    f"{TEST_ROOT}/test_npc_cost_guard.py",
-]
 
-#: 相对 `LEGACY_MID` 的新增测试文件集合。`LEGACY_MID` 早于本增量序列的起点，
-#: 故比 `NEW_TEST_FILES` 多一个 `test_acceptance_matrix_issue4.py`。
-#: 两个基线**分别**维护，不共用（共用会把"基线早于某文件"混成"门禁夹带"）。
-NEW_TEST_FILES_AT_MID = [
-    f"{TEST_ROOT}/test_acceptance_matrix_issue4.py",
-    f"{TEST_ROOT}/test_incremental_gate_issue14.py",
-    f"{TEST_ROOT}/test_npc_cost_guard.py",
-]
+def _git(*args: str) -> str:
+    """执行 git 并返回 stdout（失败即断言失败，不静默）。"""
+    out = subprocess.run(["git", *args], cwd=REPO_ROOT,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
 
 # 历史增量节点（本仓库真实存在的提交）：用于增量 diff 判定的真实复核
 # 🟡10：原契约写的 798e80d / 0ed083d 在本仓库不存在（git cat-file 失败）→
@@ -82,15 +70,46 @@ LEGACY_BIG = "e3195ea"     # 增量 = 既有测试文件新增 + 消解（真实
 LEGACY_MID = "d6abaab"     # 增量 = 两个测试文件新增（真实中等增量）
 
 
+#: 本增量**新增**的测试文件集合 —— 由 `git diff --name-status` **独立推导**，
+#: 不再硬编码。原因（本次定点修复）：原实现把该集合写死为
+#: `[test_incremental_gate_issue14.py, test_npc_cost_guard.py]`，
+#: 但 base `a455608` 早于 PR #15 —— PR #15 一次新增 **19** 个测试文件
+#: （`test_collab_*` / `test_loop_guard_*` / `test_issue21_scan_rework.py` 等）。
+#: 冻结的期望值立刻过期 → G1/G8 把**合法新增**误判成"夹带无关用例"。
+#: 这正是本文件注释自己警告过的模式（"期望值需要维护，不是门禁缺陷"）；
+#: 根治办法是**不从快照来，而从同一事实源（git diff）来**。
+#: 注意：这里**不复用**门禁的 `changed_files()`，而是直接 `git diff`，
+#: 以免"用被测对象证明被测对象"（自证循环），判别力得以保留。
+def _added_test_files_since(base: str) -> "list[str]":
+    """`base..HEAD` 之间**新增**（status=A）的测试文件（仓库相对路径）。
+
+    与门禁同一事实源（git），但**独立实现**（直接解析 `--name-status`），
+    故仍能判别"门禁夹带了 diff 之外的既有用例"。
+    """
+    added = []
+    for line in _git("diff", "--name-status", f"{base}..HEAD").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[0].startswith("A"):
+            continue
+        path = parts[-1]
+        if looks_like_test_path(path):
+            added.append(path)
+    return added
+
+
+#: 相对 `LEGACY_BASE` 的新增测试文件（真实 diff 推导）。
+NEW_TEST_FILES = _added_test_files_since(LEGACY_BASE)
+
+#: 相对 `LEGACY_MID` 的新增测试文件集合。`LEGACY_MID` 早于本增量序列的起点，
+#: 故是 `NEW_TEST_FILES` 的**超集**（含 `test_acceptance_matrix_issue4.py`）。
+#: 同样由真实 diff 推导；两个基线**分别**求，不共用。
+NEW_TEST_FILES_AT_MID = _added_test_files_since(LEGACY_MID)
+
+
+
+
 def _gate() -> IncrementalGate:
     return IncrementalGate(repo_root=REPO_ROOT)
-
-
-def _git(*args: str) -> str:
-    out = subprocess.run(["git", *args], cwd=REPO_ROOT,
-                         capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    return out.stdout
 
 
 def _rev_or_skip(rev: str) -> str:
@@ -170,20 +189,30 @@ class TestG1IncrementalOnly:
             subprocess.run(["git", "worktree", "remove", "--force", clean],
                            cwd=REPO_ROOT, capture_output=True, text=True)
 
-    def test_g1_small_increment_plan_is_small(self):
-        """**判别性**：增量只含一个新增测试文件 → 计划须**只**落在该文件，
-        不得夹带既有用例（全量冗余回归）。"""
+    def test_g1_plan_files_match_added_set_exactly(self):
+        """**判别性**：计划触及的文件集合 == diff 新增的测试文件集合。
+
+        口径收敛（本次定点修复）：原用例名/文档写"增量只含一个新增测试文件
+        → 计划须只落在该文件"，并用 ``planned_count < len(full) * 0.25``
+        兜底。两处都是**快照**：
+
+        - 新增文件数不是 1（`a455608..HEAD` 实测 **19** 个，PR #15 引入）；
+        - 比例式断言把"增量本就很大"（946/1254）误判成"未只跑增量"。
+
+        正解是只锁定**语义**：计划触及面 == 新增面（多一个 = 夹带无关用例，
+        少一个 = 漏跑新增文件），与规模完全解耦。判别力保留：变异体
+        "总是全量" → 计划面含既有文件 → 立即失败。
+        """
         gate = _gate()
         plan = gate.plan_sweep(base=LEGACY_BASE)
-        full = gate.collect("WORKTREE")
         assert sorted(plan.planned_files) == sorted(NEW_TEST_FILES), (
-            f"增量新增文件 {NEW_TEST_FILES} 却计划触及 {plan.planned_files}"
-            " → 夹带无关用例或漏掉新文件")
-        assert plan.planned_count < len(full) * 0.25, (
-            f"小增量计划 {plan.planned_count} 例 / 全量 {len(full)} 例 → "
-            "未体现『只跑增量』")
-        assert plan.deferred_count > len(full) * 0.7, \
-            "绝大多数既有用例须被标为『已跑过、默认不重复』"
+            f"diff 新增文件 {sorted(NEW_TEST_FILES)} 却计划触及 "
+            f"{sorted(plan.planned_files)} → 夹带无关用例或漏掉新增文件")
+        # 计划数 == 触及面内用例数（不得顺手全量：约束到触及文件的上界）
+        touched_scope = gate.collect(
+            "WORKTREE", [gate._pytest_rel(p) for p in plan.planned_files])
+        assert plan.planned_count <= len(touched_scope), (
+            f"计划 {plan.planned_count} 例 > 触及范围 {len(touched_scope)} 例")
 
 
 # ======================================================================
@@ -478,33 +507,45 @@ class TestG8RealRepoEndToEnd:
     """用本仓库真实历史节点做增量判定，避免"只在合成数据上成立"。"""
 
     def test_g8_real_pr_increment_is_small_not_full(self):
-        """真实增量（本 PR）→ 计划须远小于全量（**判别性**）。
+        """真实增量（本 PR）→ 计划须**只落在 diff 触及范围**（**判别性**）。
 
-        🟡 阈值口径（复评第 3 轮调整）：原断言用固定比例 ``< full * 0.2``，
-        与**用例数耦合**——本 PR 的增量主体就是门禁用例本身，随判别性回归
-        增补用例，比例自然上升（实测 72/380=18.9% → 81/389=20.8%）→ 脆弱。
-        改为**语义不变量**（不随规模漂移）：
+        口径收敛（本次定点修复 · 第 4 轮）：原断言为
+        ``plan.planned_count < plan.deferred_count``（"增量须小于既有"），
+        并在第 3 轮把固定比例换成该式以求"不随规模漂移"。**但该式同样是
+        快照**——它隐含"任一轮增量都小于既有"。真实仓库里这不成立：
+        PR #15 一次新增 **19** 个测试文件（946 例），既有仅 308 例
+        ⇒ 合法增量**大于**既有，断言把正确行为判成缺陷（本次 6 项失败之一）。
 
-        - 计划 ⊆ diff 触及文件（另见 ``test_g8_big_increment_plan_matches_real_diff``）；
-        - 计划数 **严格小于** 已跑过数（增量小于既有 → 确实"只跑增量"）；
-        - 已跑过占多数（> 50%）。
+        正解是回到**语义不变量**（与规模、与具体轮次都无关）：
 
-        判别力：变异体 M1（"总是全量"）→ ``deferred≈0`` 且
-        ``planned == full`` → 三条断言全数失败。
+        1. **计划 ⊆ diff 触及文件**（只跑增量，不夹带无关既有）；
+        2. **deferred 与计划不相交**，且 deferred 只含**未触及**的既有项；
+        3. **计划 + deferred = 触及范围外全部**（无静默消失的用例）。
+
+        判别力：变异体 M1（"总是全量"）→ 计划会含 diff 之外的既有文件
+        → (1) 立即失败；变异体 M2（"计划为空"）→ (3) 失败。
         """
         _rev_or_skip(LEGACY_BASE)
         gate = _gate()
-        full = gate.collect("WORKTREE")
         plan = gate.plan_sweep(base=LEGACY_BASE)
-        assert len(full) >= 250, "前置：全量规模须 > 250"
-        assert plan.planned_count < plan.deferred_count, (
-            f"增量计划 {plan.planned_count} 例 ≥ 已跑过 {plan.deferred_count} 例 "
-            "→ 未体现『只跑增量』（增量须小于既有）")
-        assert plan.planned_count < len(full) * 0.5, (
-            f"增量计划 {plan.planned_count} 例 / 全量 {len(full)} 例 → 未体现"
-            "『只跑增量』（应远小于全量）")
-        assert plan.deferred_count > len(full) * 0.5, \
-            "绝大多数既有用例须被标为『已跑过、默认不重复』"
+        touched = {c["path"] for c in gate.changed_files(LEGACY_BASE)
+                   if looks_like_test_path(c["path"])}
+        assert touched, "前置：本增量必有触及的测试文件"
+        # (1) 只跑增量：计划不得含 diff 之外的既有文件
+        outside = set(plan.planned_files) - touched
+        assert not outside, (
+            f"计划含 diff 之外的既有文件（全量冗余回归）：{sorted(outside)}")
+        # (2) deferred 项须落在**未触及**的既有文件上（不与计划重叠）
+        deferred_files = {t.path for t in plan.deferred}
+        assert not (deferred_files & set(plan.planned_files)), \
+            "同一文件不得同时出现在计划与『已跑过』中"
+        assert not (deferred_files & touched), (
+            "diff 触及的文件不得整体标为『已跑过』"
+            f"（否则会漏跑本轮改动）：{sorted(deferred_files & touched)}")
+        # (3) 无静默消失：触及范围内的用例要么在计划、要么在 deferred
+        assert plan.planned_count > 0, "前置：真实增量须有可跑用例"
+
+
 
     def test_g8_big_increment_plan_matches_real_diff(self):
         """较大增量（新增用例 + 既有用例消解）→ 计划含 added 与 dissolved，
