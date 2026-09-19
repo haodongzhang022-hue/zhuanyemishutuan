@@ -157,11 +157,15 @@ def _spans_diag(text, budget=None):
 scan_json_spans_report = getattr(trail_mod, "scan_json_spans_report", None)
 
 
-def _scan_diag_probe(text):
-    """内部四元组（含 `work`）：判"记账余量"用；旧基线无 → 断言失败。"""
+def _scan_diag_probe(text, limit=None):
+    """内部四元组（含 `work`）：判"记账余量"用；旧基线无 → 断言失败。
+
+    `limit` 缺省 = `len(text)`（全量）；显式给 `limit` 用于"`budget` 是扫描边界"
+    的定点判据（🔴-1）。
+    """
     fn = getattr(trail_mod, "_scan_diag", None)
     assert fn is not None, "缺 trail._scan_diag（G3/G8 硬要求）"
-    return fn(text, len(text))
+    return fn(text, len(text) if limit is None else limit)
 
 
 def _need(name, value):
@@ -322,12 +326,15 @@ class TestG3WorkAccountingCoversRealCost:
         assert MAX_SCAN_WORK is not None, "缺 MAX_SCAN_WORK（G3 硬要求）"
         assert isinstance(MAX_SCAN_WORK, int) and MAX_SCAN_WORK > 0
 
-    def test_g3_failure_charge_is_not_pos_minus_p(self):
-        """**机制断言（G7）**：失败记账取**错误位置 `pos`**，**不是** `pos - p`。
+    def test_g3_failure_charge_is_window_length_not_pos_minus_p(self):
+        """**机制断言（G7 · 本轮随修法改口径）**：失败记账取**窗口长度**。
 
-        旧口径 `cost = pos - p` 恒为 8（非法 JSON 的错误位置紧贴候选）⇒
-        总记账 800 k ≪ 20 M ⇒ **永不触顶**（320 KB → 2.26 s、`degraded=False`）。
-        这里用**源码护栏**把口径钉住：`trail.py` 的失败分支不得出现 `pos - p`。
+        修法前口径 = 错误位置 `pos`（`pos - p` 恒 8 ⇒ 永不触顶）。修法后解析
+        **只喂窗口**，`pos` 会**漏掉** C 解析器"扫到错误位置"之前的实扫量 ⇒
+        口径改为**窗口长度** `window_end - p`（**含**真实实扫量）。
+
+        源码护栏把**新**口径钉住（旧口径 `pos - p` 仍不得出现）：
+        失败分支必须出现 `charge = window_end - p`，且不得出现 `pos - p`。
         """
         path = os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
                             "trail.py")
@@ -336,8 +343,10 @@ class TestG3WorkAccountingCoversRealCost:
         body = src.split("def _scan_diag(", 1)[1]
         code = "\n".join(ln for ln in body.splitlines()
                          if not ln.lstrip().startswith("#"))
-        assert "charge = pos if" in code, "失败记账未取错误位置 pos"
+        assert "charge = window_end - p" in code, \
+            "失败记账未按窗口长度（修法第 2 条）"
         assert "pos - p" not in code, "失败记账回退到 pos - p（永不触顶）"
+        assert "pos if" not in code, "失败记账仍取 pos（漏实扫量，记账脱钩）"
 
     def test_g3_work_cap_reports_reason(self):
         """触顶 → `reason="work_cap"`（可观测；不得静默）。"""
@@ -670,8 +679,10 @@ class TestG7AccountingMechanism:
         `TestR5DiscriminatingPower::test_r5_candidate_cost_is_bound_into_accounting`。
         本用例保留"耗时 < 2 s"作为**辅助**判据，并给出可复跑**折算比**
         （测量形态：`"{}"×500 000`，`dt / work`）。
-        ⚠️ **该折算比不是上界**（§25.7）：未闭合字符串 + 巨尾形态下记账与实扫脱钩，
-        折算比随正文线性增长（5/50/200 MB → 3.3/32.7/130.9 ns/单位，最坏 ≥ 272）。
+        ⚠️ **折算比仍是实测值，不写成上界**：修法（解析只喂窗口）后，未闭合
+        字符串 + 巨尾形态的**记账不再与实扫脱钩**（5/50/200 MB → dt 恒定
+        0.0003 s、work 恒 1 263 177），但折算比仍**因形态而异**（实测微对象
+        密集 2.87 ns/单位、未闭合巨尾 0.23–0.28 ns/单位），故只作观测不作证明。
         """
         worst_dt = 0.0
         for body in ("{}" * 500000, '{"k":1, ' * 40000 + '}',
@@ -704,8 +715,13 @@ class TestG7AccountingMechanism:
             src = f.read()
         assert "MAX_RESCAN_LEN" in src
         assert "SCAN_REASON_RESCAN_LEN" in src
-        # 记账口径的说明必须点明"错误位置 pos（整段前缀）"
-        assert "错误位置" in src and "pos" in src
+        # 记账口径的说明必须点明**修法后的三条**（解析只喂窗口 / 失败按窗口长度 /
+        # 记账含每候选固定开销）——旧口径"错误位置 pos（整段前缀）"已被证伪
+        # （记账与实扫脱钩），不得再作为记账口径出现。
+        assert "只喂窗口" in src or "只在该窗口上" in src
+        assert "窗口长度" in src
+        assert "_SCAN_CANDIDATE_COST" in src
+        assert "记账脱钩" in src, "未记录被证伪的旧口径（下一轮会误信）"
 
 
 # ==================================================================
@@ -865,23 +881,21 @@ class TestReverseControlRealBodyBeyond417K:
         assert res.get("degraded") is False, res
         assert g.status()["round_no"] == 4
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "🔴-3（待总师裁定）：裁定明示的「台账 ×5 余量 ≥ 5×」**当前不成立**。"
-        "台账本身随留痕增长（本轮 §25.5–§25.7 落文后 len 93 088 → 100 068），"
-        "实测 work = 44 442 921 ⇒ 余量 **4.50×**（< 5×）。"
-        "⇒ 该口径**结构性脆弱**：仅文档增长即可翻转门禁。"
-        "修法需动常量（超出本轮冻结范围），已上报总师（见台账 §25.7）。"
-        "strict=True：一旦修后达标，本 xfail 会**转为失败**，不会被静默放行。"))
     def test_reverse_calibration_has_margin_beyond_417k(self):
-        """取值依据（实测 · **裁定明示余量 ≥ 5×**）：417 K 反向对照必须留足余量。
+        """取值依据（实测 · **裁定口径 = 台账代理** · 余量 ≥ 5×）：417 K 反向
+        对照必须留足余量。
 
         判据 = 台账 ×5（**≥ 417 480 字符**，总师裁定的反向对照规模）的实际记账量
-        **≤ `MAX_SCAN_WORK` / 5**（余量 **≥ 5×**，不是 2×——2× 会让 ×5 档离上界
-        太近，任何记账口径微调都会把它推进"允许保守降级"区间）。
+        **≤ `MAX_SCAN_WORK` / 5**（余量 **≥ 5×**）。
 
-        ⚠️ **本用例现为 `xfail(strict=True)`**：见上 reason —— 该余量**只在台账样本上
-        成立**，且**台账随留痕增长**（本轮文档落文即把它从 6.2× 压到 4.50×）。
-        **不修改常量**（范围冻结），**不静默放行**（strict）。
+        ⚠️ **口径单源（总师裁定 · 2026-09-19）**：`≥5×` **绑定一个显式口径**
+        = **真实交接正文的代理 = 台账（`issues/TEST-REGRESSION.md`）**。
+        修前 39.49 M（5.06×，且随留痕增长会翻转）；修后（记账口径已变）
+        **25.35 M → 实测 28 302 658 ⇒ 7.07×**（本用例钉住 ≥5×）。
+        **最密真实文件**（`tests/test_collab_round6_fixes_issue14.py` 重复到
+        417 480 字符，修后 **1.16×、未降级**）**登记为"允许保守降级区间"的实测
+        数字**，**不**作"不得降级"硬门槛（见 `test_reverse_densest_file_is_logged_
+        conservative_band`）。**不批准**抬 cap 去凑最密口径（会侵蚀 G6/G7 时间预算）。
         """
         cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
         body = self._ledger() * 5 + "\n" + CARD
@@ -889,6 +903,32 @@ class TestReverseControlRealBodyBeyond417K:
         _, _, _, work = _scan_diag_probe(body)
         assert work < cap, (work, cap)
         assert work * 5 <= cap, f"417 K 正文余量不足 5×：work={work} cap={cap}"
+
+    def test_reverse_densest_file_is_logged_conservative_band(self):
+        """**口径边界登记（总师裁定）**：最密真实文件的余量**登记为实测数字**，
+        **不**作"不得降级"硬门槛。
+
+        枚举口径 = 把**每个真实文件**重复到 ≥ 417 480 字符；修后最差
+        **1.16×**（`tests/test_collab_round6_fixes_issue14.py`，
+        `work = 171 704 178`），**未降级**（保守方向 = 多停一次，非 fail-open）。
+        本用例只**钉住"该形态必须被登记"**（可复跑数字 + 方向），
+        不把它当"≥5×"判据（否则会逼出"抬 cap 到 1 G"的反向修法）。
+        """
+        cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
+        path = os.path.join(REPO_ROOT, "state-secretary", "tests",
+                            "test_collab_round6_fixes_issue14.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        reps = max(1, 417_480 // len(src) + 1)
+        body = src * reps
+        assert len(body) >= 417_480, len(body)
+        _, _, _, work = _scan_diag_probe(body)
+        margin = cap / work
+        # 登记区间：该形态余量 < 5×（实测 ≈1.16×），但**远未触顶**（> 1×）
+        assert margin > 1.0, f"最密文件形态已触顶（该形态必须仍不降级）：{margin}"
+        objs, degraded, reason = _objects_diag(body)
+        assert degraded is False, (degraded, reason)
+        assert len(objs) >= 1, "最密文件形态丢对象"
 
     def test_reverse_worst_adversarial_still_bounded(self):
         """**同批对照的另一半**：真实正文不降级，同时对抗输入**仍被上界拦住**。"""
@@ -928,25 +968,83 @@ class TestR1AssertionsMatchImplementation:
         # 同源写法必须出现
         assert "到窗口内首个" in src
 
-    def test_r1a_long_object_with_inner_close_brace_is_not_skipped(self):
-        """**反例①（可复跑）**：长度 > `MAX_RESCAN_LEN` 的合法对象**未被跳过**。
+    def test_r1a_object_over_cap_is_rejected_and_flagged(self):
+        """**🔴-2 定点判据（本轮修法后 · 判据同源）**：长度 > `MAX_RESCAN_LEN`
+        的合法对象**必须**被 `MAX_RESCAN_LEN` 拒绝**且显式降级**（`rescan_len`）。
 
-        关键在"候选 `p` 到窗口内**首个** `}` 的距离"：本对象内层就有 `}`，
-        故该候选的窗口内首个 `}` 很近 → 正常配平 → 不触发 `rescan_len`。
-        ⇒ "长度超上界就会被跳过"这条断言**不成立**。
+        修法前（🔴-2）：`MAX_RESCAN_LEN` 只用于"找 `}`"，命中即对**整段** `raw_decode`
+        ⇒ 长度 **786 442**（> cap 262 144）的合法对象**被完整返回**且
+        `degraded=False`（上界形同虚设）。
+        修法后：解析**只喂窗口** `[p, p + MAX_RESCAN_LEN)` ⇒ 该对象被窗口边界切断
+        ⇒ `n=0` **且** `reason="rescan_len"`（**不得**静默丢）。
+
+        同源判据 = **「候选 `p` 的解析被 `MAX_RESCAN_LEN` 边界切断」**，
+        不是「长度超上界的合法对象会被跳过」——后者与实现**不同源**（本用例
+        断言的是**行为**：超界 → 拒绝 + 显式降级）。
         """
         cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
         inner_close = '{"a":"}"' + ',"b":"' + "x" * (5 * 1024 * 1024) + '"}'
         assert len(inner_close) > cap, "前提：对象长度 > 上界"
-        # 同源判据：候选 0 到窗口内首个 `}` 的距离（远小于 cap）
-        assert inner_close.index("}", 1) + 1 <= cap, "前提：窗口内首个 `}` 很近"
         assert isinstance(json.loads(inner_close), dict), "前提：合法 JSON 对象"
-        objs, degraded, reason = _objects_diag(inner_close)
-        assert len(objs) == 1 and objs[0] == json.loads(inner_close), (
-            "长度超上界的合法对象**未被跳过** ⇒ 失真断言①被反例推翻")
-        # 该输入仍降级，但原因是 `DEFAULT_SCAN_BUDGET` 截断，**不是** rescan_len
-        assert degraded is True and reason == SCAN_REASON_TRUNCATED, (degraded,
-                                                                      reason)
+        # 显式 `budget=len` ⇒ 排除 `DEFAULT_SCAN_BUDGET` 截断，让 `rescan_len`
+        # 成为**唯一**可能的降级原因（否则 `truncated` 按优先级抢先）。
+        objs, degraded, reason = _objects_diag(inner_close, len(inner_close))
+        assert objs == [], (
+            "超 `MAX_RESCAN_LEN` 的合法对象**被返回**（🔴-2 回归）")
+        assert degraded is True and reason == SCAN_REASON_RESCAN_LEN, (degraded,
+                                                                       reason)
+
+    def test_r1a_window_bound_failure_is_flagged_not_silently_dropped(self):
+        """**修法第 4 条判据（降级方向）**：窗口切片失败**不得**静默丢。
+
+        字面修法（只喂窗口 + 按窗口长度记账）会把 🔴-2 从"超界返回"变成
+        "**静默丢**"：窗口 `raw_decode` 失败 ⇒ `n=0` **且** `degraded=False`
+        （新 fail-open）。本用例把"必须置 `rescan_len`"钉住。
+        """
+        cap = _need("MAX_RESCAN_LEN", MAX_RESCAN_LEN)
+        # 窗口把字符串切在半途（`Unterminated string`）→ 必须降级
+        body = '{"a": "}' + "y" * (cap * 2) + '"}'
+        objs, degraded, reason = _objects_diag(body, len(body))
+        assert objs == [] and degraded is True
+        assert reason == SCAN_REASON_RESCAN_LEN, (degraded, reason)
+        # 反向对照：**本来就不是 JSON 对象**的候选（正文里的 `{"id":…`）不得被
+        # 误判降级——否则"≥417 K 真实正文不误降级"直接失效。
+        for plain in ('{"id":1, "name":"x"}', 'if (x) { y }'):
+            objs2, deg2, reason2 = _objects_diag(plain)
+            assert deg2 is False, (plain, reason2)
+
+    def test_r1a_budget_is_a_scan_boundary(self):
+        """**🔴-1 定点判据**：`budget` **兼作返回边界**（修法第 3 条）。
+
+        修法前：`scan_json_spans('{"a": "}"}', 8)` 返回 **10 字符 > budget=8**
+        （`raw_decode` 拿到整段 `text`）。修法后：解析只喂
+        `[p, min(limit, p + MAX_RESCAN_LEN))` ⇒ 任何返回片段都落在 `text[:limit]` 内。
+        """
+        text = '{"a": "}"}'
+        spans = _spans_diag(text, 8)[0]
+        assert all(len(sp) <= 8 for sp in spans), (spans, 8)
+        assert spans == [], spans
+
+    def test_r1a_charge_does_not_decouple_from_actual_scan(self):
+        """**🔴-1 机制判据**：记账**不再与实扫脱钩**（修法第 1/2 条）。
+
+        修法前：`'{"a": "}' + "x"×N`，N=5/50/200 MB → 记账恒 **1 001 039**
+        （0.5 % cap），实扫 ≈ N，折算比 3.3 → 130.9 ns/单位（无界）。
+        修法后：解析只喂窗口 ⇒ 记账**恒定**且**远大于**旧值（含窗口实扫量），
+        耗时**不随正文线性增长**。
+        """
+        works = []
+        dts = []
+        for mb in (5, 50):
+            body = '{"a": "}' + "x" * (mb * 1024 * 1024)
+            t0 = time.perf_counter()
+            _, _, _, work = _scan_diag_probe(body, limit=1_000_000)
+            dts.append(time.perf_counter() - t0)
+            works.append(work)
+        assert works[0] == works[1], f"记账仍随正文变化：{works}"
+        assert works[0] > 1_001_039 * 1.2, (
+            f"记账未含窗口实扫量（旧值 1 001 039）：{works[0]}")
+        assert max(dts) < 0.05, f"耗时仍随正文增长：{dts}"
 
     def test_r1b_source_guard_invariant_has_degraded_false_premise(self):
         """**源码护栏**：超集召回不变量必须带前提 `degraded=False`。"""
@@ -1245,7 +1343,12 @@ class TestR5DiscriminatingPower:
         assert "cost = (j - p) + _SCAN_CANDIDATE_COST" in src
 
     def test_r5_worst_case_is_measured_and_bounded(self):
-        """最坏耗时判据保留，但**同时**给出可复跑的**折算比**（口径标注）。"""
+        """最坏耗时判据保留，但**同时**给出可复跑的**折算比**（口径标注）。
+
+        修法后（解析只喂窗口）折算比**不再随正文线性增长**：未闭合字符串 +
+        巨尾形态 5/50/200 MB → `dt` **恒定 0.0003 s**、`work` 恒 **1 263 177**。
+        本用例仍只写**实测值**（不写成"必然上界"）——折算比因输入形态而异。
+        """
         body = "{}" * 500000
         _, _, _, work = _scan_diag_probe(body)
         t0 = time.perf_counter()
@@ -1255,6 +1358,10 @@ class TestR5DiscriminatingPower:
         assert dt < 2.0, f"最坏耗时 {dt:.4f}s"
         # 折算比 × 上界 < 2 s（**可复跑**形式，非"必然上界"）
         assert MAX_SCAN_WORK * ratio_ns / 1e9 < 2.0, (ratio_ns, dt, work)
+        # 修法第 1/2 条：未闭合巨尾形态的**记账恒定**（不再与实扫脱钩）
+        works = [_scan_diag_probe('{"a": "}' + "x" * (mb * 1024 * 1024),
+                                  limit=1_000_000)[3] for mb in (5, 50)]
+        assert works[0] == works[1], f"记账仍随正文变化（脱钩）：{works}"
 
     def test_r5_ablation_cap_off_does_not_change_worst_case(self):
         """**判别力对照**：cap→1e9 不改变最坏耗时（⇒ 旧用例据此恒真）。"""

@@ -97,12 +97,12 @@ def attributed(record: Any, field: str, value: Any) -> bool:
 # 复评第 5 轮（本文件的上界被证伪：两段式"线性主扫描 + 有界修复"会**丢卡**，
 # 且丢卡方向是 fail-open）→ 按总师裁定**改实现路径**：
 #
-# * **构造性"不漏"**：每个候选 `{` 用 ``json.JSONDecoder().raw_decode`` **独立起算**
+# * **构造性"不漏"**：每个候选 `{` 用 `json.JSONDecoder().raw_decode` **独立起算**
 #   ——与旧实现"每个起点重扫"的语义等价（能捞到的都捞到），但解析交给 C，
 #   且未闭合/非法即 fail-fast。**不再**依赖"预算够就捞到"。
 # * **不变量 = 超集召回（仅在 ``degraded=False`` 时成立）**：`a7847f9` 的
-#   `extract_json_objects` 能取到的、且长度 **≤ ``MAX_RESCAN_LEN``** 的对象，
-#   本实现**必须**全取到（差分 fuzz 须 `LOST=0`）——**前提是本次扫描没有降级**。
+#   `extract_json_objects` 能取到的对象，本实现**必须**全取到（差分 fuzz 须
+#   `LOST=0`）——**前提是本次扫描没有降级**。
 #   **降级（`degraded=True`）下允许丢段**（这是**已批准语义**，见 R4 降级 fuzz）：
 #   反例（可复跑）——14 B 的 `{"wake":false}` 接在 400 000 个 `{}` 之后，
 #   `reason="work_cap"`，卡被丢而基线能捞到。判据因此写
@@ -112,33 +112,45 @@ def attributed(record: Any, field: str, value: Any) -> bool:
 #   总量）触界时保留**已取到的**片段，只把"未扫到的区间"判为"不表态"，
 #   并**显式标记**（``..._diag`` 的 `degraded` + 三态 `reason`）。
 #
-# ⚠️ **安全断言与实现同源**（复评第 5 轮总师点名 · `[HIGH]`）：本文件**不得**
-# 再出现"记账 ≥ 真实扫描量，故本上界同时是**真实耗时**的上界"这类**失真断言**。
-# 现在的口径是**可验证**的两条：
-#   ① 记账**含** `raw_decode` 的异常构造代价（失败取错误位置 `pos`，
-#      不是 `pos - p`——后者恒为 8，会让总上界**永不触顶**）；
-#   ② 记账**另含每候选固定开销**（``_SCAN_CANDIDATE_COST``）与一次基扫（`limit`）。
+# ⚠️ **本轮修法（总师裁定 · PR #15 · 2026-09-19）**：上两轮的"记账口径"有两条
+# **结构性失真**（总师独立复现，见 `issues/TEST-REGRESSION.md` §25.7）：
 #
-# ⚠️ **本节自纠（2026-09-19）**：原先这里写"记账**覆盖** `raw_decode` 的**实扫量**，
-# 折算比有**实测上界 2.0 ns/单位**"——**两者都不成立**（与实现不同源，总师点名的
-# `[HIGH]` 同类）。实测（可复跑）：
+#   ① `raw_decode` 拿到的是**整段 `text`**（不是 `text[:limit]`）⇒ 未闭合字符串
+#      分支的 `pos` 停在开引号、记账 ≈ 常数，而**实扫随正文线性增长** ⇒ 记账与
+#      耗时**脱钩**：`'{"a": "}' + "x"×N`，N=5/50/200 MB → 记账恒 1 001 039
+#      （0.5 % cap），实测 dt **0.0054 / 0.0525 / 0.2055 s**（折算比 3.3 → 130.9
+#      ns/单位，最坏 ≥ 272、无界）。`budget` 因此**不是**扫描边界：
+#      `scan_json_spans('{"a": "}"}', 8)` 返回 **10 字符 > budget=8**。
+#   ② 同一机制下 `MAX_RESCAN_LEN` **不约束被解析对象长度**（窗口只用于"找 `}`"，
+#      命中即对整段 `raw_decode`）：串内含 `}` 的 **786 442** 字符合法对象
+#      （> 上界 262 144）仍被完整返回且 `degraded=False`。
 #
-#     text = '{"a": "}' + 'x' * N        # `}` 在字符串内、字符串未闭合
-#     N=5 MB   → 实扫 ≈ 5 MB，记账 work = 1 001 039（0.5% cap），折算比   3.3 ns/单位
-#     N=50 MB  → 实扫 ≈ 50 MB，记账 work = 1 001 039，          折算比  32.7 ns/单位
-#     N=200 MB → 实扫 ≈ 200 MB，记账 work = 1 001 039，         折算比 130.9 ns/单位
+# 修法（**已批准**，四条**同批**）：
 #
-# ⇒ ① `raw_decode` 拿到的是**整段 `text`**（不是 `text[:limit]`）⇒ 未闭合字符串
-# 分支的 `pos` 停在**开引号**，记账 ≈ 常数，而**实扫随正文线性增长**；记账与耗时
-# **脱钩** ⇒ `MAX_SCAN_WORK` **不是**耗时上界，折算比**无界**（实测最坏 ≥ 272 ns/单位）。
-# ⇒ ② 同一机制下 `MAX_RESCAN_LEN` 也**不约束被解析对象长度**（窗口只用于"找 `}`"，
-# 命中即对整段 `raw_decode`）：串内含 `}` 的 786 442 字符对象（> 上界 262 144）
-# 仍被完整返回且 `degraded=False`。
+#   1. **两级切片**（先短切片、再窗口）——**不得**恒切片：恒切片把快乐路径
+#      `"{}"×500 000` 从 **0.30 s 拖到 2.8–3.1 s**（总师实测）；两级 = 0.30–0.32 s。
+#      实现：候选 `p` 先在 `[p, close+1]` 上 `json.loads`（`close` = 窗口内首个
+#      `}`）；失败再对**窗口** `[p, min(limit, p + MAX_RESCAN_LEN))` 起算
+#      `raw_decode`。解析**只喂窗口** ⇒ 实扫有界（同时闭合 ① 的耗时无界）。
+#   2. **失败按窗口长度记账**（`we - p`）——记账**含**真实扫描量（闭合 ① 的记账脱钩）。
+#   3. **`budget` 兼作返回边界**：任何返回片段都落在 `text[:limit]` 内（闭合 ① 的
+#      "span > budget"），且 `MAX_RESCAN_LEN` **真的**约束被解析对象长度（闭合 ②）。
+#   4. **窗口绑定失败 ⇒ 置 `rescan_len`**（闭合**降级方向**）：仅当窗口是绑定约束
+#      （`we < limit`）**且**失败形态表明**窗口边界切断了本次解析**
+#      （`_window_cut_the_parse`）时置位。判据**必须**含"边界切断"这一层：
+#      只按 `we < limit` 置位会把**本来就不是 JSON 对象**的候选（正文里的
+#      `{"id":…`）全判降级 —— 实测台账 ×5 会因此**误降级 62 次**（真值应为 0）。
 #
-# **待总师裁定**（需动实现，超出本轮冻结范围，已上报）：`raw_decode` 只喂
-# `[p, min(limit, p + MAX_RESCAN_LEN))` 窗口 + 失败按窗口长度记账 + `budget` 兼作
-# 返回边界（同时闭合上述两条）。**修前**本文件**不得**再宣称"记账覆盖实扫量"
-# 或"折算比有实测上界"。
+# 修后实测（可复跑）：🔴-1 200 MB **dt 0.2055 → 0.0004 s**；🔴-2 反例 →
+# `n=0` + `rescan_len`；真实语料（84 文件）**0 误降级**；台账 ×5（≥ 417 K）
+# **不降级**、余量 **6.34×**（≥5×）。
+#
+# ⚠️ **安全断言与实现同源**：本文件**不得**出现"记账 ≥ 真实扫描量，故本上界同时是
+# **真实耗时**的上界"这类**失真断言**（上一轮 `[HIGH]` 点名，本轮已复发一次）。
+# 现在的口径是**可验证**的三条：
+#   ① 记账**含**解析实扫量（失败按**窗口长度**，不是 `pos`）；
+#   ② 记账**另含每候选固定开销**（``_SCAN_CANDIDATE_COST``）与一次基扫（`limit`）；
+#   ③ 解析**只喂窗口**（`[p, min(limit, p + MAX_RESCAN_LEN))`），故实扫有界。
 #
 #: 正文扫描的**默认上界**（字符数）：上界远大于任何真实交接卡/评论正文
 #: （含历史留痕累积）；超出部分不再尝试解析（保守：判不出 → 不表态）。
@@ -165,11 +177,10 @@ DEFAULT_SCAN_BUDGET = 1_000_000
 #: 且给出可观测的 ``rescan_len`` 原因），**不构成本实现的正确性前提**。
 #:
 #: 语义（**与实现同源**）：对候选 `p`，只在窗口 ``[p, min(limit, p + MAX_RESCAN_LEN))``
-#: 里找 `}`；窗口内**没有** `}` → 该候选不表态（跳过）且 `reason="rescan_len"`。
-#: 判据的正确写法是**「候选 `p` 到窗口内首个 `}` 的距离 > ``MAX_RESCAN_LEN``」**，
-#: **不是**「长度超上界的合法对象会被跳过」——后者**有反例**（可复跑）：
-#: 含内层 `}` 的 **5.2 MB** 合法对象（`'{"a":"}"' + ',"b":"' + "x"×(5 MiB) + '"}'`）
-#: → `n=1`、**未被跳过**（`degraded=True` 只因 `DEFAULT_SCAN_BUDGET` 截断）。
+#: 里找 `}`，并**只在该窗口上**做解析；窗口内**没有** `}`、或解析失败且窗口边界
+#: 切断了本次解析 → 该候选不表态（跳过）且 `reason="rescan_len"`。
+#: 判据的正确写法是**「候选 `p` 的解析被 `MAX_RESCAN_LEN` 边界切断」**，
+#: **不是**「长度超上界的合法对象会被跳过」——后者与实现**不同源**。
 #:
 #: 取值依据（实测，非拍脑袋）：本仓库全部语料（`issues/*.md`、`docs/**/*.md`、
 #: `state-secretary/src/**/*.py`、`state-secretary/tests/*.py`）里"候选 → 最近 `}`
@@ -179,34 +190,34 @@ MAX_RESCAN_LEN = 262_144
 
 #: 候选解析的**总工作量上界**（折算单位，见 `_SCAN_CANDIDATE_COST`）——「② 总上界」。
 #:
-#: 记账口径（复评第 5 轮裁定 · G3：**记账 ≥ 真实扫描量**，且须覆盖**异常构造代价**）：
+#: 记账口径（**本轮修法后** · 三条同源）：
 #:
 #:     work += 候选扫描区间长度（窗口内到 `}` 的字符数）
 #:           + 每候选固定开销折算（`_SCAN_CANDIDATE_COST`）
-#:           + raw_decode 实扫量：成功 `end - p`；失败取**错误位置 `pos`**
-#:             （**不是** `pos - p`——异常消息的构造代价随 `pos` 线性增长，
-#:             `pos - p` 恒为 8 ⇒ 总记账 800 k ≪ 上界 ⇒ **永不触顶**，
-#:             正是 2.26 s / 21.7 s 的机制）；无 `pos`（`RecursionError`）
-#:             取剩余长度上限。
+#:           + 解析实扫量：短切片成功取 `end - p`；窗口成功取 `rel`；
+#:             **窗口失败取窗口长度 `we - p`**（不是 `pos`——`pos` 会漏掉
+#:             C 解析器"扫到错误位置"之前的实扫量，正是上一轮"记账脱钩"的来源）
 #:
 #: 触顶即**降级**：保留已取到的片段 + 显式标记 `degraded` / `reason="work_cap"`，
 #: 绝**不**丢弃整段结果（"静默收摊"正是丢卡来源）。
 #:
-#: 取值依据（**实测值，不是上界** —— 见本文件顶部"自纠"段）：
+#: 取值依据（**实测值，不是上界**）：
 #:
-#: * **上侧**：实测折算比**因输入形态而异、且无上界**。在**记账与实扫量一致**的
-#:   形态上测得最坏 **2.0 ns/单位**（测量形态：`"{}"×500 000` 微对象密集，
-#:   `work=199 999 339`、`dt=0.3999 s`，折算比 = `dt/work`）；但在
-#:   **未闭合字符串 + 巨尾**形态上，记账 ≈ 常数而实扫随正文线性 ⇒ 折算比
-#:   **3.3 → 130.9 ns/单位（5 MB → 200 MB）**，最坏实测 **≥ 272 ns/单位**。
-#:   ⇒ **本上界当前不是耗时上界**；须先修 `raw_decode` 窗口化（见顶部自纠段）。
-#: * **下侧（不误降级）**：台账 ×5（**491 655 字符 ≥ 417 480**）实测折算量
-#:   **39 493 168** ⇒ 本上界留 **5.06×** 余量。
-#:   ⚠️ **口径边界（如实标注）**：该余量**只在台账样本上成立**；按同一枚举口径把
-#:   **每个真实文件**重复到 417 480 字符后，**84 个文件里 19 个余量 < 5×**，
-#:   最差 **1.00×**（`tests/test_collab_round6_fixes_issue14.py`，
-#:   `work=199 844 416`）。故"≥5×"**不是**对"本仓最密真实正文"成立的结论 ——
-#:   口径（台账 vs 本仓最密真实文件）**待总师裁定**（已上报）。
+#: * **上侧（不失控）**：解析**只喂窗口** ⇒ 实扫有界，折算比不再随正文线性增长。
+#:   实测 `'{"a": "}' + "x"×N`：N=5/50/200 MB → **dt 0.0004 s（恒定）**，
+#:   `work = 1 263 177`（含窗口失败记账）。对抗输入（含 `}`）**< 1 s** 由 G6 钉住。
+#: * **下侧（不误降级）**：**口径 = 台账代理**（`issues/TEST-REGRESSION.md`，总师裁定）。
+#:   台账 ×5（**500 340 字符 ≥ 417 480**）实测折算量 **31 551 802** ⇒ 余量 **6.34×**
+#:   （≥5× 硬要求）。台账 ×8（830 008 字符）**3.40×** 仍**不降级**；×16（1.66 MB）
+#:   因**超 `DEFAULT_SCAN_BUDGET`** 判 `truncated`（非 `work_cap`，方向保守）——
+#:   规模阶梯在 G/HIGH 对照里钉住。
+#:   ⚠️ **口径边界（如实标注 · 总师裁定"登记为保守区间"）**：按同一枚举口径把
+#:   **每个真实文件**重复到 417 480 字符后，**84 个文件里 15 个余量 < 5×**，
+#:   最差 **1.16×**（`tests/test_collab_round6_fixes_issue14.py`，
+#:   `work = 171 704 178`，**未降级**）。该形态**登记为"允许保守降级区间"的实测
+#:   数字**，**不**作"不得降级"硬门槛（最密形态降级 = **保守**（多停一次），
+#:   非 fail-open）。**不批准**抬 cap 到 ~1 G 去凑最密口径：实测 cap=1 G 时微对象
+#:   密集 ≈ 1.5 s，侵蚀 G6(<1 s)/G7(<2 s) 时间预算。
 #:
 #: ⇒ 触顶只出现在**恶意/极端密集**正文（含 `}` 的 320 KB 对抗输入、微对象密集串）。
 MAX_SCAN_WORK = 200_000_000
@@ -223,7 +234,7 @@ _SCAN_CANDIDATE_COST = 1_024
 #: 并把原因写进留痕。
 SCAN_REASON_TRUNCATED = "truncated"    # 正文被 `budget` 截断（尾部未表态）
 SCAN_REASON_WORK_CAP = "work_cap"      # 总工作量触顶而提前停止（尾部未表态）
-SCAN_REASON_RESCAN_LEN = "rescan_len"  # 有候选因「每候选上界」被跳过（该候选未表态）
+SCAN_REASON_RESCAN_LEN = "rescan_len"  # 有候选的解析被「每候选上界」边界切断
 
 #: `reason` 的**优先级**（越靠前越"外层"：未表态的区间越靠后、越"整段"）。
 #: 多个原因同时成立时取最外层的一个——确定性（与出现顺序无关）。
@@ -240,6 +251,49 @@ _JSON_WS = " \t\n\r"
 _JSON_WS_RE = re.compile(r"[ \t\n\r]*")
 _JSON_DECODER = json.JSONDecoder()
 
+#: **窗口边界切断判据**（修法第 4 条）：`raw_decode` 在窗口上失败时，判断
+#: "失败是不是因为窗口边界把输入切断了"。命中 = 该候选**必须**显式标记
+#: `rescan_len`（否则就是"窗口切片失败 ⇒ n=0 且不降级"的**新 fail-open**）。
+#:
+#: 三类命中（其余一律视为"本来就不是合法对象"，**不**置位）：
+#:   * `RecursionError`（深嵌套，无 `pos`）——无法证明是文本非法，保守置位；
+#:   * `Unterminated string`——窗口切在字符串中间，后续可能补全；
+#:   * 错误位置 `pos` 落在**窗口末字符**，或其**后缀**恰是"被截断的字面量前缀"
+#:     （`n`/`nu`/`nul`/`t`/`tru`/`f`/`fals`/`-`/`1.`/`1e`…）——即窗口把
+#:     `true`/`null`/数字等切在半途。
+#:
+#: 为什么**必须**加这一层（总师点名 `[HIGH]`）：只按 `we < limit` 置位，会把
+#: 正文里**本来就不是 JSON 对象**的候选（`{"id":…`）全判降级 —— 实测台账 ×5
+#: 误降级 **62 次**（真值 0），且台账 ×4…×16 全部翻成 `degraded=True`，
+#: 直接违反"≥ 417 K 真实正文不误降级"（G/HIGH 反向对照）。
+_SCAN_PARTIAL_LITERAL_RE = re.compile(
+    r"[ \t\n\r]*(?:n(?:u(?:l(?:l)?)?)?|t(?:r(?:u(?:e)?)?)?"
+    r"|f(?:a(?:l(?:s(?:e)?)?)?)?|-?(?:\d+(?:\.\d*)?(?:[eE][+-]?\d*)?)?)"
+    r"[ \t\n\r]*\Z")
+
+
+def _window_cut_the_parse(exc: BaseException, window: str) -> bool:
+    """`raw_decode` 在**窗口**上的失败，是否由**窗口边界**造成（修法第 4 条）。
+
+    `True` ⇒ 该候选的解析被 `MAX_RESCAN_LEN` 边界切断 ⇒ 调用方**必须**置
+    `rescan_len`（显式降级），不得静默返回 `n=0`。`False` ⇒ 该候选本来就不是
+    合法对象（文本自身非法），"不表态"是**确证**而非降级。
+
+    判据**只依赖异常信息**（`RecursionError` / 错误位置 / 错误后缀），故与实现
+    同源、可复跑；穷举验证：对随机合法 JSON 值的**全部前缀截断**（12 176 例）
+    命中率 **100 %**（0 漏），对台账 ×1…×16 与 84 个真实文件的**误报 0**。
+    """
+    if isinstance(exc, RecursionError):
+        return True
+    if str(exc).startswith("Unterminated string"):
+        return True
+    pos = getattr(exc, "pos", None)
+    if not isinstance(pos, int):
+        return True
+    if pos >= len(window) - 1:
+        return True
+    return bool(_SCAN_PARTIAL_LITERAL_RE.match(window[pos:]))
+
 
 def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
     """扫描 ``text[:limit]`` 里的顶层 ``{...}`` 片段。
@@ -249,18 +303,23 @@ def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
     "静默收摊、整段丢卡"的区别）。``reason`` 说明**哪一段**未表态（三态见
     ``SCAN_REASON_*``；多个原因同时成立时按该处列出的优先级取**最外层**的一个）。
 
-    实现（**构造性"不漏"**）：
+    实现（**构造性"不漏"** + **解析只喂窗口**）：
 
-    * **候选起算独立**：对每个候选 ``{`` 调 ``raw_decode``（**不共享**前一个候选
-      的字符串状态）——等价旧实现"每个起点按括号配平重扫 + ``json.loads``"的
-      语义，但解析在 C 里做，且未闭合/非法即 fail-fast。
+    * **候选起算独立**：对每个候选 ``{`` 调 ``json.JSONDecoder().raw_decode``
+      （**不共享**前一个候选的字符串状态）——等价旧实现"每个起点按括号配平重扫 +
+      ``json.loads``"的语义，但解析在 C 里做，且未闭合/非法即 fail-fast。
+    * **两级切片**（修法第 1 条）：先在 ``[p, close+1]``（``close`` = 窗口内首个
+      ``}``）上 ``json.loads`` —— 快乐路径（`"{}"×N`）走这一级，**不**把整段
+      窗口喂给 C 解析器（恒切片会把快乐路径从 0.30 s 拖到 2.8–3.1 s）。失败再对
+      **窗口** ``[p, min(limit, p + MAX_RESCAN_LEN))`` 起算 ``raw_decode``。
     * **O(1) 预检**（短路 `"{"×n` / `if (x) {` 类输入）：
       ① 区间内**必须还有** `}`（``rfind``，一次 O(n) 定全局上界）；
       ② ``{`` 之后跳过空白**必须**是 `"` 或 `}`（JSON 对象的唯一两种起头）。
     * **两条上界**（**归因：① = 冗余兜底 / ② = 承载上界**，非"缺一不可"）：
-      ① **每候选**：窗口 ``[p, p + MAX_RESCAN_LEN)`` 内没有 `}` → 跳过该候选
-        （`rescan_len`）。**冗余兜底**：消融实测 `MAX_RESCAN_LEN→1e9` 后
-        adv320 仍 0.0062 s（被 ② 拦住），故 ① 不是正确性前提；
+      ① **每候选**：窗口 ``[p, p + MAX_RESCAN_LEN)`` 内没有 `}`、或解析被窗口
+        边界切断 → 跳过该候选（`rescan_len`）。**冗余兜底**：消融实测
+        `MAX_RESCAN_LEN→1e9` 后 adv320 仍 0.0062 s（被 ② 拦住），故 ① 不是
+        正确性前提；但它是 **② 之前的返回边界**（防"超界对象被返回"）。
       ② **总工作量**：折算量超过 ``MAX_SCAN_WORK`` → 停止尝试（`work_cap`）。
         **承载上界**：消融实测 `MAX_SCAN_WORK→1e18` 后 adv320 升到 2.8619 s。
     * **降级（只降级、不丢段）**：两条上界都**只**让"未扫到的区间"不表态，
@@ -275,7 +334,7 @@ def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
     # 截断（``limit < len(text)``）同样是"该区间不表态" → 显式标记（不得静默）。
     # **G8**：`limit = 0`（`budget <= 0`）也走这一行 —— 不再有绕过它的分支。
     truncated = limit < len(text)
-    # 基扫（一次 ``rfind``）计入记账：总上界因此也是"含基扫"的真实耗时上界。
+    # 基扫（一次 ``rfind``）计入记账。
     work = limit
     hit_work_cap = False
     hit_rescan_len = False
@@ -311,26 +370,37 @@ def _scan_diag(text: str, limit: int) -> "tuple[List[str], bool, str, int]":
             hit_rescan_len = True
             i = p + 1
             continue
+        # **两级切片**（修法第 1 条）：先短切片（快乐路径），失败再喂窗口。
+        got: Optional[dict] = None
+        end = p + 1
+        charge = 0
         try:
-            got, end = _JSON_DECODER.raw_decode(text, p)
-        except (ValueError, RecursionError) as exc:
-            # 失败代价 = ``raw_decode`` 的**错误位置 ``pos``**（整段前缀）——
-            # 异常消息的构造代价随 ``pos`` 线性，取 ``pos - p``（恒 8）会让
-            # 记账**永不触顶**（复评第 5 轮实测：320 KB → 2.26 s 而 `degraded`
-            # 恒 `False`）。``RecursionError`` 无 pos（深嵌套）：按剩余长度上限计。
-            pos = getattr(exc, "pos", None)
-            charge = pos if isinstance(pos, int) and pos > p else (limit - p)
-            if work + charge > MAX_SCAN_WORK:
-                hit_work_cap = True
-                break
-            work += charge
-            i = p + 1            # 失败候选：下一个起点（旧实现跳到配平末尾）
-            continue
-        if work + (end - p) > MAX_SCAN_WORK:
+            parsed = json.loads(text[p:close + 1])
+            end = close + 1
+            if isinstance(parsed, dict):
+                got = parsed
+        except (ValueError, RecursionError):
+            window = text[p:window_end]
+            try:
+                parsed, rel = _JSON_DECODER.raw_decode(window, 0)
+                charge = rel
+                if isinstance(parsed, dict):
+                    got = parsed
+                    end = p + rel
+                else:                       # 非对象：不表态，起点前进一格
+                    end = p + 1
+            except (ValueError, RecursionError) as exc:
+                # **修法第 2 条**：失败按**窗口长度**记账（含真实实扫量）。
+                charge = window_end - p
+                # **修法第 4 条**：窗口是绑定约束**且**边界切断了本次解析
+                # ⇒ 显式降级（否则是"切片失败即静默丢"的新 fail-open）。
+                if window_end < limit and _window_cut_the_parse(exc, window):
+                    hit_rescan_len = True
+        if work + charge > MAX_SCAN_WORK:
             hit_work_cap = True
             break
-        work += end - p
-        if isinstance(got, dict):
+        work += charge
+        if got is not None:
             out.append(text[p:end])
         i = end if end > p else p + 1
     flags = {
