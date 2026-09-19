@@ -15,3 +15,13 @@
 - Issue #1 需求已达成：设计 + 可运行实现（`state-secretary/`）+ 验收证据齐备 → 关闭
 - 归档文档：`docs/design/state-secretary-closeout.md`（交付物终态 / US-1..4 结论 / 验证基线 / 结转项）
 - 结转项载体：Issue #4、#5、#6、#8–#13（P2 边界与小项）、#14（LoopGuard）、#16（DSH 新版适配）
+
+## 新版 dsh 生态适配（2026-09-18 · Issue #16）
+
+- 旧版：平台内置 `npc:go` 执行器 + 评论 `[触发:<角色>]` 文本命中路由
+- 新版：接入 `cnpc/dsh` 镜像（`docker.cnb.cool/xqitw/docker/npc-dsh:latest`），
+  角色路由升级为平台原生「顶层 key = 角色名」
+- 落点：`.cnb/npc.yml`（新增，7 角色 × issue/PR 事件）、`.cnb.yml`（精简为 include）、
+  `AGENTS.md`（新增，项目级指令）、`docs/dsh-ecosystem-adaptation.md`（适配说明）
+- 触发：`@dongdongxiaozu/zhuanyemishutuan(<角色名>)`，未带角色名走 `$` 段兜底（秘书·接待）
+- 关键约束：`stage timeout: 10h` 必配（镜像无进程级超时兜底）
