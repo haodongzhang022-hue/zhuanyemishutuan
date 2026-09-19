@@ -1,0 +1,83 @@
+"""review: 评审版本仲裁 + 审查范围分级
+
+- 版本仲裁（`review_arbiter`）：只在开启评审时记录版本 + 防同写锁 + 延迟重试 + 单冲突收口
+- 范围分级（`scope`）：**日常只审变化，全量只在大版本**（防止无效构建与测试）
+"""
+from .rules import classify, is_same_side, is_transition_state
+from .review_arbiter import (
+    DEFAULT_PERSISTENT_GRACE_SEC,
+    DEFAULT_RETRY_DELAY_SEC,
+    NO_BASELINE,
+    NO_CONFLICT,
+    STALE_BASE,
+    VERSION_REGRESS,
+    ArbiterDecision,
+    ConflictCard,
+    ReviewArbiter,
+    ReviewBaseline,
+)
+from .fingerprint import (
+    ALL_CATEGORIES,
+    ALL_SEVERITIES,
+    CAT_BUG,
+    CAT_MAINTAINABILITY,
+    CAT_NIT,
+    CAT_OTHER,
+    CAT_PERF,
+    CAT_SECURITY,
+    CAT_STYLE,
+    DEFAULT_EXCLUDED_CATEGORIES,
+    DedupResult,
+    LedgerEntry,
+    ReviewFingerprint,
+    ReviewFingerprintLedger,
+    SEV_CRITICAL,
+    SEV_INFO,
+    SEV_WARNING,
+    filter_code_files,
+    fingerprint,
+    is_code_file,
+)
+from .scope import FULL, SCAN, ScanContext, decide_scan, scan_commands
+
+__all__ = [
+    "DEFAULT_RETRY_DELAY_SEC",
+    "DEFAULT_PERSISTENT_GRACE_SEC",
+    "ReviewArbiter",
+    "ReviewBaseline",
+    "ConflictCard",
+    "ArbiterDecision",
+    "NO_CONFLICT",
+    "STALE_BASE",
+    "VERSION_REGRESS",
+    "NO_BASELINE",
+    "classify",
+    "is_same_side",
+    "is_transition_state",
+    "ScanContext",
+    "decide_scan",
+    "scan_commands",
+    "SCAN",
+    "FULL",
+    # 评审项指纹（同一问题不报第二遍）
+    "ReviewFingerprint",
+    "ReviewFingerprintLedger",
+    "DedupResult",
+    "LedgerEntry",
+    "fingerprint",
+    "filter_code_files",
+    "is_code_file",
+    "ALL_CATEGORIES",
+    "ALL_SEVERITIES",
+    "DEFAULT_EXCLUDED_CATEGORIES",
+    "CAT_SECURITY",
+    "CAT_BUG",
+    "CAT_PERF",
+    "CAT_MAINTAINABILITY",
+    "CAT_STYLE",
+    "CAT_NIT",
+    "CAT_OTHER",
+    "SEV_CRITICAL",
+    "SEV_WARNING",
+    "SEV_INFO",
+]

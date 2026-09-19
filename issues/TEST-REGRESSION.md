@@ -8,11 +8,12 @@
 
 - 上游需求：ISSUE-001 状态管理秘书机制（Issue #1）
 - 当前代码载体：PR #3 `SecretarySession` 会话门面（源分支 `auto/session-facade-9b95`）
-- 测试基线：全量 pytest **295 项全部通过**（门面 **148 项** = 90 + 24 复评第 5 轮判别性
-  回归 + 5 🟡 收口回归 + 29 M-1/M-2/🟡1–🟡5 补收口，独立探针 65 项；底层模块回归
-  8 + 15 + 19 + 20 + 12 + 8）。
+- 测试基线：全量 pytest **445 项全部通过**（门面 **148 项** = 90 + 24 复评第 5 轮判别性
+  回归 + 5 🟡 收口回归 + 29 M-1/M-2/🟡1–🟡5 补收口，独立探针 65 项，Issue #4 验收矩阵 13 项，
+  **Issue #14 循环熔断 62 项** + **Issue #14 评审仲裁/审查范围 75 项**；底层模块回归 8 + 15 + 19 + 20 + 12 + 8）。
   历史口径：`28ca7f6` 228（门面 88）/ `60e32ec` 230（门面 90）/ `bca4193` 237（门面 90）
-  / `e3195ea` 261（门面 114）/ `63345ec` 266（门面 119）→ 本轮 **295**（门面 148）。
+  / `e3195ea` 261（门面 114）/ `63345ec` 266（门面 119）→ `2a430e1` **308**（含验收矩阵 13）
+  → `60499d8` **370**（新增 Issue #14 循环熔断 62）→ **本轮 445**（新增评审仲裁/审查范围 75）。
 
 ---
 
@@ -957,17 +958,1098 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   （新增验收矩阵 **13** 项；连跑 3 次稳定）。
 - `compileall src tests` OK；`pyflakes`（新增文件）0 告警。
 
+---
+
+## 十五、Issue #14 循环熔断（轮次预算 + 非必要修复最多 1 次 + 静默交接）
+
+> 需求（Issue #14）：避免评审/修复无限循环——(a) 最大轮次；(b) **无必要修复的内容最多修 1 次**；
+> (c) 熔断后交接给下一个 agent 时**不进行额外唤醒**。
+
+### 15.1 新增门禁文件
+
+- `state-secretary/tests/test_loop_guard_issue14.py`（**62 项**）
+
+| 组 | 用例数 | 判据 |
+|---|---|---|
+| ① 门禁轮次上界 | 6 | 预算内 `fix`+唤醒；耗尽 `fuse`+不唤醒；熔断后恒熔断（`fused_now` 仅首爆）；`preview` 纯函数；`clear` 不耗预算；熔断终态不得降级为 `clear` |
+| ② 非必要最多 1 次 | 3 | 首报 🟡 → `fix_last`（唯一一次唤醒）；再报 → `fuse`；门禁轮**重置**配额（反向对照：🟡→🔴→🟡 仍可修 1 次）；零容忍档 |
+| ③ 修复总轮次硬上界 | 3 | 🔴/🟡 交替：**门禁预算仍在**却由 `total_left==0` 熔断（判别「挡住的是总上界」）；显式压上界；`clear` 不计入总预算 |
+| ④ 静默交接 | 7 | `wake=False` 落盘跨实例保真（新 bus 读回仍 False）；熔断会话拒绝 `wake=True`（`RuntimeError`）+ 反向对照未熔断可唤醒；`wake="false"` 抛 `TypeError`；旧卡缺 `wake` 默认 True；未知字段忽略 |
+| ⑤ 跨 agent 不复活 | 6 | 熔断态跨实例持久化；`inherit_silent_handoff(payload)` 继承轮次计数（4 轮 → `round_no=4`/`blocking_rounds=3`）并拒绝复活；**4 组反向对照**（`wake=true` 载荷 / 空串 / 坏 JSON / 数组 → 不熔断） |
+| ⑤b 停滞感知 | 9 | 同一指纹第 2 次即熔断且**预算充足**（判别停滞而非轮次）；不同指纹不熔断；签名可选；`clear` 不推进停滞；阈值可配；阈值 0 拒绝；`resume` 清指纹 |
+| ⑥ 人工解锁 | 4 | 空/匿名 `by` 抛 `ValueError`（禁止匿名复活）；解锁**重置预算**并恢复一轮修复能力；未熔断 `resume` 返回 False；显式 `fuse` 幂等 |
+| ⑦ 持久化健壮性与生命周期 | 12 | 状态文件位置/`reload`；4 组损坏状态退化（`[]`/`"str"`/坏 JSON/`123`）；字段类型不符降级；5 组非法 `session_id` 拒绝；4 组非法预算拒绝；4 组非法计数拒绝；`delete_session` 清理熔断状态 + 复建不带陈旧熔断；默认状态目录在数据根下 |
+| ⑧ 门面集成 | 3 | `summarize_for_upstream` 携带 `wake_allowed`/`loop` 快照；`preview_round` 不耗预算；门面 `fuse_loop`/`resume_loop` |
+
+### 15.2 判别力（反向对照/边界佐证，防恒真断言）
+
+| 断言 | 反向对照 / 佐证 |
+|---|---|
+| 总轮次上界拦住循环 | 同轮 `budget_left>=1`（门禁未耗尽）→ 放默认总上界时该轮为 `fix` |
+| 停滞熔断（同指纹） | `advisory_left>=1` 且 `budget_left>=1`；不同指纹连续 4 轮**不**熔断 |
+| 静默交接继承熔断 | 4 组非静默载荷（`wake=true`/空/坏 JSON/数组）均**不**熔断 |
+| 门禁轮重置 🟡 配额 | 🟡→🔴→🟡 仍 `fix_last`（若改「全局只 1 次」则失败） |
+| `wake` 严格 bool | `wake="false"` 抛 `TypeError` 且**不落卡**（`list_pending()==[]`） |
+| 熔断不唤醒 | 熔断会话 `create_handoff(wake=True)` 抛错、`silent_handoff()` 仍可用 |
+
+### 15.3 自测
+
+- 全量 **370 passed** = 8 + 15 + 65 + 148 + 13 + **62** + 19 + 20 + 12 + 8（连跑 3 次稳定）。
+- `python3 -m pytest tests/ -q` → 370 passed。
+- `pyflakes`（新增/改动文件）0 告警；`compileall` OK。
 
 ---
 
-## 十五、Issue #14 增量跑测门禁（只跑有效增量 · 反全量冗余 · 计数权责一致）
+## 十六、Issue #14 补全机制：评审版本仲裁 + 审查范围分级
+
+> 需求（Issue #14 补充）：只在开启评审时记录版本；无法追踪变化就以新的；正在编辑给防同写锁
+> 并延迟重试；**先完成该做的**、**只额外处理一个**解决冲突；**日常只审变化**，**全量只在大版本**。
+
+### 16.1 新增门禁文件
+
+- `state-secretary/tests/test_review_arbiter_issue14.py`（**75 项**）
+
+| 组 | 用例数 | 判据 |
+|---|---|---|
+| ① 只在开启评审时记版本 | 5 | 开发期 `recorded()=False`；`begin_review` 记当前版本；**幂等不推前**（反向：`force=True` 才重立）；卡不存在拒绝；未开启即写 → REBASE |
+| ② 先完成该做的 | 4 | 冲突时 `applied=True` 且**磁盘版本 +1**（反向：延迟窗 `applied=False` 且版本不变）；有效推进不冲突；非推进不误判 |
+| ②b 推进判据参照物=基线 | 6 | 正常并发推进**不冲突**（回归护栏）；反向对照（同样输入无进展则冲突）；快照缺失宽进；坏快照不炸；轨迹 ≤2 条 |
+| ③ 防同写锁 + 延迟 | 5 | 他人租约 → `should_retry` 且不落盘；窗内继续等；放租约后重试成功；**自己租约不延迟自己**；同向写入可重试不算冲突 |
+| ④ 单冲突收口 | 6 | 连续 3 次冲突**仍 1 张卡**且 `merged_conflicts=3`；卡 ID 稳定；收口重立基线；空 resolution 拒绝；未知票据 False；重试成功作废旧卡 |
+| ⑤ 以新为准 | 4 | 无基线 REBASE；版本退化 REBASE；无共同祖先不冲突；写者不明不冲突 |
+| ⑥ 健壮性与生命周期 | 8 | 坏基线/坏卡退化；非法 session_id/延迟/reviewer；路径穿越票据拒绝；生命周期回收；默认目录 |
+| ⑦ 审查范围分级 | 13 | 默认 `scan`（4 组参数化）；大版本 `full`（5 组）；显式"只要变化"**压过**大版本标签；`scan` 执行口径**不含全量**；门面接入 |
+| ⑧ 规则与数据模型 | 8 | 同侧判定 6 组参数化；`ReviewBaseline`/`ConflictCard` 容错 |
+| ⑨ 与循环熔断联动 | 4 | 冲突**不占**轮次预算；跨轮冲突卡恒 1 张；收口后走增量；熔断后评审仍落盘 |
+
+### 16.2 判别力（反向对照 / 边界佐证）
+
+| 断言 | 反向对照 / 佐证 |
+|---|---|
+| 开发过程不记版本 | 开启评审后 `recorded()` 为 True 且版本=启动时磁盘版本 |
+| 幂等不推前 | 评审中追加提交后 `begin_review()` 版本不变；`force=True` 才变 |
+| 冲突不阻塞落盘 | 冲突场景 `applied=True` **且**磁盘版本 +1；延迟场景 `applied=False` **且**版本不变 |
+| 单冲突收口 | 3 次冲突后待处理卡**仍有且仅有 1 张**，`merged_conflicts==3` |
+| 推进判据参照物 | 同样输入下"有新增任务 → 不冲突 / 无新增任务 → 冲突"，锁住参照物必须是基线快照 |
+| 日常不全量 | 默认/常规文本 → `scan`；大版本标签 → `full`；"只审变化"文本 → `scan`（压过标签） |
+| 冲突不占轮次 | 冲突前后 `blocking_rounds` 不变 |
+
+### 16.3 实缺陷修复留痕（本轮）
+
+判定"对方是否有效推进"的参照物原为 `disk_before`（**开始写回时**的最新卡）——它已含
+对方并发写入，与写回后相比（写回只把版本 +1、任务集不变）→ **恒为"无进展" → 每次并发
+都误判冲突、每次都开冲突卡**（恰是要治的循环）。改为以 `ReviewBaseline.history` 的
+**基线快照**为参照；回归护栏见用例组 `TestProgressReferenceIsBaseline`。
+
+### 16.4 自测
+
+- 全量 **445 passed** = 8 + 15 + 65 + 148 + 13 + 62 + **75** + 19 + 20 + 12 + 8（连跑 3 次稳定）。
+- `python3 -m pytest tests/ -q` → 445 passed。
+- `pyflakes`（新增/改动文件）0 告警；`compileall src tests` OK。
+
+---
+
+## 十七、Issue #14 追问：检查点探测（非轮询探测点，最多 6 次）
+
+> 需求（Issue #14 追问）：最多 6 次；**非轮询**而是**形成检查点 + webhook 触发再跑**；
+> **等他的锁**；**判断检查点**；类似**边缘计算的探测器**；平台有无最佳实践。
+
+### 17.1 新增门禁文件
+
+- `state-secretary/tests/test_checkpoint_probe_issue14.py`（**38 项**）
+
+| 组 | 用例数 | 判据 |
+|---|---|---|
+| ① 最多 6 次预算 | 5 | 默认上界 = 阶梯档位数 = 6；计划 = 6 次 + 1 条交回人工；**反向：第 1..5 次不判用尽**；用尽后再探不唤醒；**重建不清零预算** |
+| ② 非轮询落点 | 7 | 短等待挂 `cnb:await`（零占用）；长等待交 `crontab`（平台代跑）；**反向：cron 间隔不低于平台 5 分钟下限**；第 6 次 = 10min/**/10**；落点无 `local_loop`；等待中给的是**平台指令**；非法落点入口拒绝 |
+| ③ 等锁 + 判断检查点 | 9 | 锁在→`wait`、锁释放→`proceed`；**反向：锁表不可见→`unknown`，不得当"已释放"**；我方不需要→`release`（反队头阻塞）；确认型缺事实→`unknown`；版本变化→`proceed`（反向：未变→`wait`）；事件信号；**自述不采信**；`unknown` 处置 = 继续等 |
+| ④ 平台实践 + 计费 | 6 | 落点均为平台原生；crontab 下限来自平台文档；一行探测计划；`proceed` 触发**真正干活**（`cnb:apply api_trigger_probe_resume`）而非再等一轮；用尽不唤醒；等待零占用（反向：本地空转 10min ≈ 1.33 核时） |
+| ⑤ 观测与生命周期 | 7 | `checkpoints_overview` 给出剩余次数/下一次等待/避开清单；已决检查点退出未决清单；**`delete_session` 连带清理**；非法 session_id 拒绝；坏文件容错；预算与阶梯同源 |
+
+### 17.2 判别力（反向对照 / 边界佐证）
+
+| 断言 | 反向对照 / 佐证 |
+|---|---|
+| 最多 6 次 | 第 1..5 次 `resume_required=False`；第 6 次才 True 且 `checks_left=0` |
+| 幂等不重置预算 | 重建后 `checks_used` 保持 1（重置即把"6 次"变成无限次） |
+| 非轮询 | 计划里 `local_cpu` 全为 0；`local_loop`/`local_sleep` 都不在落点集里 |
+| cron 不低于下限 | 逐行解析 `*/N` 并断言 `N*60 ≥ 300` |
+| 等锁判定 | 锁表可见且持有→`wait`；不可见→`unknown`（**不得**判 `proceed`） |
+| 版本快照参照物 | 同样形状输入必须被区分：`1→2` 判 `proceed`，`1→1` 判 `wait` |
+| 下一次等待 | 第 N 次后的下一次取**下一档**（防回落重复档） |
+| 自述不入判定 | 传 `agent_says_done` 不进 `facts`、不改判定 |
+| 唤醒闸门 | `proceed` 才 `wake_allowed=True`；等待中/用尽恒 False |
+
+### 17.3 实缺陷修复留痕（本轮）
+
+1. **版本判别恒为"未变"**：原实现先把本次采集结果写进 `last_facts` 再比较，
+   `prev == cur` 恒成立 → "版本变了"永远判不出。改为判定使用**探测前快照**
+   （`prev_facts` 在采集前取），并加护栏用例 `test_version_reference_is_pre_probe_snapshot`
+   （同样输入 `1→2` 与 `1→1` 必须判出不同结果）。
+2. **下一次等待回落一档**：第 N 次探测后取 `ladder[N-1]`，等于把"刚等过的档"当下一次
+   （看起来像降级/重复）。改为取 `ladder[N]`，护栏用例 `test_next_wait_uses_next_ladder_step`
+   断言 `[30,60,180,360,600]` 且单调不减。
+
+### 17.4 平台依据（已查证官方文档）
+
+- `cnb:await` / `cnb:resolve`：**零占用挂起**，由状态变化唤醒（同一事件内配对）
+  —— `/zh/build/internal-steps/cnb/await-resolve.md`
+- `crontab`：最小间隔 **5 分钟**，执行身份 = 最后修改该配置的用户 —— `/zh/build/crontab.md`
+- `cnb:apply` / `cnb:trigger` / OPENAPI `StartBuild`：触发 `api_trigger` 流水线（外部 webhook 再跑）
+  —— `/zh/build/internal-steps/cnb/trigger.md`、`/zh/build/trigger-rule.md`
+- 计费：只有 CPU 核时（实际运行时长）+ AI Credits（Token），**无"等待"项**
+  —— `/zh/pricing.md`、`/zh/build/timeout.md`
+
+### 17.5 自测
+
+- 全量 **547 passed** = 445 + 62 + 35 + 29 分项（连跑 3 次稳定）；本轮新增 **38** 项。
+- `python3 -m pytest tests/ -q` → 547 passed。
+- `pyflakes`（新增/改动文件）0 告警；`compileall src tests` OK。
+- `.cnb.yml`：YAML 语法 ✅ / 语义 ✅（Schema 告警为 HEAD 既有，未新增）。
+
+
+---
+
+## 十八、Issue #14 追问 · 只跑增量 / 同口径不重复（PR #15 分支）
+
+> 触发：用户「平时不需要跑全量，而且尤其是不适合连跑三次…同一个口径几乎不会产生分歧…
+> 我们已经把这一套只跑增量、不跑全量的建立过了呀，但可能在其他仓库没有形成，组织下通用的…
+> 现在为什么没事按那个规则呀，是规则不健全吗？还是配置有问题？检查一下这个吧。」
+
+### 18.1 问题定位：**四个缺口叠加**（规则不全 + 机制缺失 + 配置漏登记 + 流水线没接）
+
+| # | 缺口 | 证据 | 修法 |
+|---|---|---|---|
+| 1 | 规则**只到"范围"没到"重复"** | `scan` 段只有 `major_version_tags` / `*_keywords`，无任何"同一口径别重复跑"的参数 | 规则包补 `default_mode` / `max_identical_repeats` / `repeat_keys` / `allow_stability_repeats` / `stability_via`（组织级 + 仓库级都补） |
+| 2 | 规则是**口径不是机制** | `decide_scan` 只返回 `scan`/`full` 字符串；没有任何代码**拦**重复执行 | 新增 `collab/run_guard.py`（`RunScopeGuard`）：`skip_duplicate` / `blocked_stability` |
+| 3 | 配置**白名单漏登记** | `_OVERRIDABLE_FIELDS` 是硬编码元组；实测仓库级写 `max_identical_repeats: 3` → 合并结果**仍是 1**（静默丢弃） | 补齐白名单（含漏掉的 `crontab_interval_minutes`）+ 自检 `_audit_overridable_fields()` |
+| 4 | 流水线**没有测试阶段** | `.cnb.yml` 只有 `echo` + `node -v`；"只跑增量"**无处落地** | 新增 `scripts/ci-incremental-test.sh`，接入 `main.push` |
+
+> 第 3 条正是用户问的"规则不健全还是配置有问题"：**两者都有**——
+> 规则缺"重复"这一维，且新增字段被**静默丢弃**（写了不生效），
+> 再叠加"没人真正执行它"。三层都不拦住，才会"没事就不按那个规则"。
+
+### 18.2 本轮修掉的真缺陷（都配反向对照护栏）
+
+| # | 缺陷 | 后果 | 护栏 |
+|---|---|---|---|
+| 1 | "上一轮不绿"用 `not _is_green(...)` 判 | **未知/空也算红** → 台账里只要没结论，同口径**无限重跑**，判重形同虚设 | `test_no_verdict_does_not_license_rerun` / `test_unknown_verdict_does_not_license_rerun`（反向）+ `test_explicit_red_verdict_licenses_one_rerun`（正向） |
+| 2 | `window_repeats>1` 原按"上轮绿"才拒 | 上轮红时可"连跑三次" → 例外被当默认路径 | `test_window_repeats_three_blocked_even_when_red` |
+| 3 | 仓库级覆写漏登记（见 18.1 #3） | "规则写了不生效" | `test_audit_is_discriminative`（故意移除字段 → 自检必须报出） |
+| 4 | CI 受影响面读**工作区**而非 revision | 同一 revision 算出不同 impact → 每次当"新口径" → 判重失效（实测：同命令连跑 3 次全部放行） | 改 `git diff <base>...<REVISION>`；`test_impact_order_irrelevant` / `test_impact_duplicates_collapse` |
+
+### 18.3 判定表（`RunScopeGuard.decide`）
+
+口径指纹 = `mode + revision + impact + command`（**只有口径字段**进指纹）。
+
+| 情形 | 判定 |
+|---|---|
+| `window_repeats > 1`（想连跑 N 次） | `blocked_stability`（**红/绿都拒**）+ 替代口径 |
+| 缺版本 / 缺命令 | `run`（判不出就不拦） |
+| 同口径次数 < 上界（1） | `run` |
+| 达上界 + 上一轮**明确红** | `run` |
+| 达上界 + 其余（含**没给结论**） | `skip_duplicate` |
+
+### 18.4 端到端实测（`scripts/ci-incremental-test.sh`）
+
+| 调用 | 结果 |
+|---|---|
+| 第 1 次（同口径） | `run` → 533 passed（增量目标，非全量） |
+| 第 2 次（同口径） | `skip_duplicate` → `[ci] 本次跳过（不消耗构建/测试）` |
+| 第 3 次（同口径） | `skip_duplicate` → 跳过 |
+| `CNB_WINDOW_REPEATS=3` | `blocked_stability` + `targeted_probe/mutation_probe/independent_scenario` → 跳过 |
+| 换基线（受影响面变） | `run` → 420 passed（新口径，正常放行） |
+
+### 18.5 自测
+
+- `pytest -q`：**616 passed**（基线 577 + 新增 `test_run_scope_issue14.py` **39** 项）。
+- `pyflakes`（改动文件）0 告警；`compileall src tests` OK。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- **本轮不连跑三次**：按新口径，同一口径第 2 次即跳过（自证口径生效）。
+
+---
+
+## 十九、PR #15 评审第 3 轮定点修复（🔴A–🔴D + 🟡1–🟡6）
+
+> 触发：架构·评审 复评「4 项 🔴 未清零 → `fix_bug`，不转测试」。
+> 评审基线：`2be6a3d`；修复提交见本 PR 最新 commit。
+
+### 19.1 四项 🔴（独立探针复现 → 定点修 → 判别性回归）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归护栏（含反向对照） |
+|---|---|---|---|
+| **🔴A** 预算不跨容器/不跨棒 → 「最多 3 轮 / 6 次」永不触发 | ① 8 次接力各自新数据根 → 序列恒为 `fix×8`，**从不 fuse**；② 7 次平台探测 → `checks_used` **恒为 1**；③ `probe(checks_used=5)` 入参预算**不被消费** | 预算**随载荷走**：`LoopGuard.budget_payload()/budget_trail()/adopt_budget()`、`probe(key, external_checks=…)`/`adopt_checks_budget()`，`max()` 合并（只增不减）；`from_handoff` **不论 wake 真假都先合并轮次**；`ProbeEvent.budget_trail` 随评论/交接卡/事件持久传递；`.cnb.yml` 的 `probe_task` 明列"取留痕 → 合并 → 写回评论"三步 | `test_eight_relays_in_new_containers_eventually_fuse`（序列**必须出现 fuse**，且第 4 次即拦）/ `test_seven_probes_in_new_containers_reach_the_ceiling`（`checks_used`→6 且 `resume_required`）/ **反向**：`test_without_payload_budget_resets_per_container`（不传载荷确实归零 → 证明前者有判别力）/ 三种载荷形态 / 单调性 / 端到端静默交接 → 新容器继承 |
+| **🔴B** 静默交接 `is not False` → `"false"/0/"no"` 被判「可唤醒」 | 三组非 bool 实测 `is_fused()=False`（未熔断），与 `create_handoff` 严格 bool **写出侧严、读入侧松**自相矛盾 | 新增 `parse_wake()` 三态（只认严格 bool）；**判不出 → 保守按静默**并留痕；无 `wake` 键的普通 context 仍走常规接力（不误熔断） | `test_non_bool_wake_is_conservatively_silent`（7 组参数化）/ **反向**：`test_strict_true_still_awake` / `test_missing_wake_key_is_not_unknown` / `test_write_side_and_read_side_same_bar` |
+| **🔴C** `Checkpoint`/`ProbeEvent` 缺字段级容错 → 合法 JSON 类型不符即裸抛并逃逸 | `{"checks_used":"NaN"}` 使 `load/list_open/overview/create` 与门面四入口、`dispatch_shared` **全部抛 `ValueError`** | 两个 `from_dict` **逐字段守卫**（`_as_int/_as_float/_as_str/_as_bool/_as_dict/_as_list`，与 `LoopGuard`/`LockRegistry` 同族）；`dispatch_shared` 包守卫 → `unknown`（继续等，绝不误放行） | `test_read_paths_do_not_raise` / `test_facade_does_not_raise` / `test_dispatch_shared_tolerates_bad_types` / **反向**：`test_bad_fields_degrade_to_defaults`（确实退化默认，不是被静默当有效值）/ `test_dispatch_shared_survives_garbage` / `test_same_bar_as_loop_guard_family` |
+| **🔴D** 规则包数值"被读但不生效" / 同一份规则出两套动作 | D-1 `locks.retry_delay_sec` 被读但**不生效**（`effective_delay` 取 `backoff.delay_for(0)`）；D-2 跨仓 `dispatch_shared` **不读** `crontab_interval_minutes`（硬编码 5）→ 本地 `*/15` / 跨仓 `*/5` | D-1：锁窗口/评审延迟窗改取 `rules.lock_retry_delay_sec`（默认 10s = 阶梯第一档）；D-2：`dispatch_shared` 缺省从 `rules` 取 cron 间隔（`crontab_minutes_from_rules`），并统一 `_driver_for_delay` 的默认值来源；`collab_status()["locks"]` 增 `rules_retry_delay_sec` / `explicit_override` | `test_lock_retry_delay_override_takes_effect`（30 → 生效值 30 且快照同步）/ `test_crontab_interval_local_and_cross_repo_agree`（本地与跨仓**同为 `*/15`**）/ **反向**：`test_explicit_param_still_wins` / `test_crontab_floor_still_clamped` / `test_split_threshold_from_rules_applies_cross_repo` |
+
+### 19.2 🟡1–🟡6 + 🟢
+
+| 项 | 修法 |
+|---|---|
+| 🟡1 恒真断言 | `assert got.probe_drivers[0] == "platform_await" or True` → 可失败断言（逐字段比对 + 长度 >1）；并加"源码里不得再有 `or True`"的护栏（**只扫代码行**，跳过注释） |
+| 🟡2 `dispatch_shared` 有 IO 副作用 | `CheckpointProbe(mkdir=False)` 惰性建目录：落点计算不再在 cwd 造 `data/probe/`（`_save` 前才 `_ensure_dir()`）；回归 `test_y2_dispatch_shared_has_no_io_side_effect` |
+| 🟡3 `.await_lock_task` 锚点无引用 | 新增 `api_trigger_probe_wait` 事件承载 `*await_lock_task`（await 行不带 cron，与 crontab 行**互斥不混用**）；回归 `test_y3_await_anchor_is_referenced` |
+| 🟡4 文档「延迟 1 分钟」口径冲突 | 三份文档 + 两份规则包 + 角色提示词统一为「**延迟首档 10s**（阶梯第一档，可达 1 分钟）」；回归 `test_y4_docs_single_lock_delay_claim` |
+| 🟡5 无 PyYAML 兜底解析读不全 | `_mini_yaml` 重写：支持**多行 inline list**（括号配平）、**折叠/字面块标量**（`>-`/`\|`）、块序列里的**嵌套映射兄弟键**、空值自动判 list/dict；回归用**真实规则包**验证（`waiting_note != ">-"`、drivers 5 项） |
+| 🟡6 死代码 | 删除 `probe._SAFE_ID`（未使用）与 `_cron_every` 别名；回归 `test_y6_dead_code_removed` |
+| 🟢 `checkpoint_plan(**kwargs)` 静默忽略 | 改具名形参 `checks=` 并**真透传**（未知关键字直接 `TypeError`）；回归 `test_checkpoint_plan_kwargs_now_named_and_real` |
+| 🟢 嵌套映射丢字段 | 见 🟡5（`test_y5_nested_map_inside_sequence_item`） |
+| 附带加固 | `dispatch_core` **按本地规则重算落点**（不轻信事件自带 `driver`，否则跨仓写 `driver=platform_await` 就能把 10 分钟等待挂成单 await = 死等）；`LoopGuard.from_dict` 的 `fused` 改严格 bool（**此改动在第 4 轮被判定为方向反了 → 已改为保守读取，见 §二十 🔴4**） |
+
+### 19.3 自测
+
+- `pytest -q`：**789 passed**（rebase 到 `89d48bd` 后：上游新增 127 项 + 本轮新增
+  `test_collab_round3_fixes_issue14.py` **46** 项），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- 独立探针（**非复用作者测试**）复现 → 修复后复测：🔴A 序列 `fix,fix,fix,fuse,...`、
+  `checks_used`→6 且 `resume_required=True`；🔴B `"false"/0/"no"` 全熔断；🔴C 全路径不抛；
+  🔴D 覆写 30 → 生效 30、cron 本地/跨仓同为 `*/15`。
+
+---
+
+## 二十、PR #15 复评第 4 轮定点修复（🔴1–🔴4 + 🟡1–🟡5）
+
+> ⚠️ **本节 🔴1 / 🔴2 两行结论已被实测推翻，请看 §22.5 的更正**（复评第 4 轮实测）：
+> 🔴1 的 ①「有 `rounds` 就提前 return」**仍在**（`trail(3)+card(6)` → `round_no=3`）；
+> 🔴2 当时是「首个含 `wake` 者胜」（**卡+卡顺序决定结论**，一个方向 fail-open）。
+> 两行原文的「已清零」只表示当轮做了修复动作，**不等于判据成立**。
+
+> 触发：架构·评审 复评第 3 轮（基线 `ed62088`）判 `fix_bug`——**🔴 未清零，不转测试**。
+> 本轮只动 `89d48bd..ed62088` 的**新增/改动行**，修复提交见本 PR 最新 commit。
+
+### 20.1 四项 🔴（独立探针复现 → 定点修 → 判别性回归）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归护栏（含反向对照） |
+|---|---|---|---|
+| **🔴1** 预算通道只取**第一条**留痕 → 评论正文多留痕叠加时轮次**回退**，「最多 3 轮 / 6 次」永不触发 | `BUDGET_TRAIL_RE.search()` / `PROBE_BUDGET_TRAIL_RE.search()` 只取第一条（= 最旧轮次）→ 8 棒正文累积形态恒 `fix×8`；探测 `checks_used` 卡在 1 | 两处都改**取全部留痕、逐字段 `max()` 合并**（`_merge_budget_dicts` / `_coerce_checks_used` 收集全部匹配）；交接卡 `context` 内嵌的 `budget_trail` **递归展开后合并**（不是替换）；`probe` 侧同样展开 `budget_trail` 字段 | `test_comment_body_with_many_trails_still_fuses`（8 棒必须出现 fuse 且第 4 次即拦）/ `test_order_of_trails_does_not_matter`（留痕在前/在后 → 轮次一致）/ `test_probe_budget_from_comment_body_with_many_trails`（`checks_used`→6）/ `test_handoff_context_embedded_trail_merges` / **反向**：`test_last_only_payload_agrees`、`test_probe_without_payload_stays_at_one` |
+| **🔴2** `extract_json_object` 只取**第一个**对象 → 留痕在前时静默交接 `wake=False` 读不到 → `should_wake_next()=True`（熔断语义从新入口漏出，方向是**放行**） | `text.find("{")` 起只解析第一个配平对象；门面 `inherit_silent_handoff(trail + context)` 同结论 | 新增 `extract_json_objects()`（全部顶层对象）+ `pick_wake_object()`（**优先取含 `wake` 的对象**）；`from_handoff` 用它解析；找不到 `wake` 仍按"非静默"（普通 context 不误熔断），带 `wake` 但非严格 bool 仍走**保守静默** | `test_both_orders_inherit_silence`（参数化两种顺序）/ `test_facade_inherit_silent_handoff_both_orders` / `test_probe_trail_first_reads_event` / `test_pick_wake_object_skips_trailless_objects` / **反向**：`test_wake_true_payload_is_not_silent` |
+| **🔴3** 新 `_mini_yaml` 值行含引号即跳过注释剥离 → 带引号注释的**覆写**被读成字符串 → 静默落回默认（生产无 PyYAML 路径；旧实现正确；本 PR 真实规则包 :77/:79 已命中） | `if '"' not in line and "'" not in line:` 才剥注释 → `retry_delay_sec: 30  # 覆写"锁窗口"为 30s` 整行当值 → 生效 10（文件写 30） | 新增 `_strip_inline_comment()`：**按 YAML 语义**（引号配对后再找 `#`，`#` 须在行首或前有空白）剥行内注释；`_mini_yaml` 三处调用点统一换用（主行 / 多行 inline list / 空值探测行） | `test_override_with_quoted_comments_takes_effect`（`locks/loop/probe/scan` **四域**都读到生效值）/ `test_parsed_values_are_typed_not_strings` / `test_real_rule_package_bools_are_bools`（真实规则包 :77/:79 读成 **bool**）/ **反向**：`test_unquoted_comments_still_stripped`、`test_hash_inside_quotes_is_not_a_comment` |
+| **🔴4** `LoopState.from_dict` 的 `fused` 改严格 bool → 安全旗标 fail-open（`fused=1` 的坏卡把熔断**清掉** → 循环复活） | 本轮新增 `_bool("fused")`：非 bool → `False`（= 未熔断），与同 PR 判据"读入侧放宽等于把熔断语义漏出去"冲突 | `fused` 改**保守读取**：严格 `False` → 未熔断；**其余任何形态**（`1`/`"yes"`/`"true"`/`0`/`None`/缺失/坏值）→ 一律按**已熔断**（`data.get("fused") is not False`） | `test_non_bool_fused_means_fused`（8 组参数化：`is_fused()=True`、`should_wake_next()=False`、后续轮恒 `fuse`）/ `test_explicit_fuse_survives_bad_card` / **反向**：`test_strict_false_is_not_fused` |
+
+### 20.2 🟡1–🟡5（同轮清掉）
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 🟡1 `adopt_budget` 嵌套递归无上界 → 深嵌套（~3000 层）`RecursionError` 逃逸到门面 | 新增 `MAX_COERCE_DEPTH = 8` 深度上界（`loop_guard` / `probe` 两处），超界按"判不出"（`None` / 不合并）处理；`json.loads` 的 `RecursionError` 一并兜住 | `TestCoercionDepthBound`（`adopt_budget` / 门面 `inherit_budget` / `dispatch_shared` / `_coerce_checks_used` 全不抛）/ **反向**：浅载荷仍被读到 |
+| 🟡2 `api_trigger_probe_wait` 只有引用、**代码从不产出** | `dispatch_core` 的 await 分支补 `trigger["event"] = "api_trigger_probe_wait"`（crontab 分支仍是 `api_trigger_probe_check`）→ `.cnb.yml` 的口径与代码产出**同名同源** | `TestAwaitEventWired`（await 落点产出该事件名；**反向**：crontab 落点仍是 check 事件且带 `*/5`） |
+| 🟡3 `Checkpoint.from_dict({"key": 5})` → `key=""`（坏 key 退化成**空标识**，互相覆盖） | 坏 `key`（非 str / 空白）→ 返回 `None`（**视为不存在**） | `TestBadCheckpointKey`（6 组坏 key → `None`；`load()` 不把坏卡当合法检查点）/ **反向**：合法 key 正常解析 |
+| 🟡4 `ProbeEvent.from_dict` 的 `wake_allowed` 默认方向偏宽（`"yes"` → `True`） | 读入侧非严格 bool → **`False`**（保守：不得据此唤醒）；数据类默认值同改 | `TestWakeAllowedConservative`（8 组坏值 → `False`；默认构造亦 `False`）/ **反向**：严格 bool 原样读取 |
+| 🟡5 `checkpoint_plan(checks=7)` 产出重复行（`[1..7, 7]`） | `keep = min(checks, len(rows) - 1)` 先夹到实际档位数再拼"用尽行" | `TestCheckpointPlanNoDuplicateRows`（`checks=7` → `[1..7]` 无重复；`checks=2` → 3 行）/ **反向**：非法 `checks` 仍 `ValueError`、未知关键字仍 `TypeError` |
+
+### 20.3 附带收口
+
+- `.cnb.yml` / `.cnb/settings.yml` / `docs/secretary-collab-rules.md` 写回口径补全：
+  **追加写回同一条评论**（保留旧留痕，解析侧按 `max()` 合并 → 评论数不膨胀）；
+  并明写"取全部留痕的 max()，不是第一条"、"留痕在前/在后两种顺序都认"。
+- `tests/test_collab_confirm_issue14.py` 的 `import json`（`89d48bd` 起未使用，
+  但它在本 PR 改动清单内）顺手清零 → 本轮改动文件 `pyflakes` **0 告警**（口径不含糊）。
+
+### 20.4 自测
+
+- `pytest -q`：**853 passed**（基线 `ed62088` 789 + 本轮新增
+  `test_collab_round4_fixes_issue14.py` **64** 项），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 + 语义 ✅。
+- 独立探针（**非复用作者测试**）复现 → 修复后复测：
+  🔴1 8 棒正文累积序列 `fix,fix,fix,fuse,…`、`checks_used`→6；
+  🔴2 两种拼接顺序都 `fused=True / wake=False`；
+  🔴3 带引号注释覆写四域生效（30 / 7 / 15 / true）；
+  🔴4 `fused=1/"yes"/0/None` 一律 `is_fused()=True`；
+  🟡 深嵌套不抛、await 事件名同源、坏 key→None、`wake_allowed` 保守、plan 无重复行。
+- 兜底解析器 vs PyYAML **逐字段比对**（两份真实规则包）：差异 **0**。
+
+---
+
+## 21. 复评第 5 轮定点修复（PR #15 · 基线 `a7847f9`）
+
+> 触发：架构·评审 复评第 4 轮 —— 本轮 🔴1–🔴4 已认可清零，但**第 3 轮同时提出的
+> 🔴E–🔴H 本轮未处理、在 `a7847f9` 上逐项实测仍成立** → 处置标签 `fix_bug`。
+> 本节只记该 4 项 🔴 与 5 项 🟡（+ 2 项 🟢）的修法与判别性回归。
+
+### 21.1 🔴 四项（未清零项）
+
+| 项 | 缺陷（评审实测） | 修法 | 回归 |
+|---|---|---|---|
+| 🔴E | 等锁判定把「台账**查不到这把锁**」当「锁已释放」→ 放行。未登记 / 已释放**不可区分且都取放行方向**；显式 `lock_held=True` 也被 `_collect_lock_facts(cp) or facts` 覆盖成放行 | `_collect_lock_facts` 改**三态返回**（`True` / `False` / `None`=没查到）；台账 `overview()` 增**全量锁键** `keys`（含已释放/已回收）作为"查到过"的判据；判定改为**显式事实优先**（`if "lock_held" in facts` 先判），缺席推断**永不覆盖**显式事实 | `TestLockFactsAreThreeState`（未登记 → `unknown`；曾登记已释放 → `proceed`；**两者可区分**；显式 `lock_held=True` + 台账查不到 → `wait`；手搓视图不给 `keys` → 保守 `unknown`）/ **反向**：整体未接台账仍 `unknown` |
+| 🔴F | 判重台账落 `<tmp>/run-scope`、无留痕回写、CI 不落 verdict → 平台每次 push = **新容器** → 判重**永不触发**（实测 r1/r2/r3 全 `run`）；`record_repeat(...)` 不传 `verdict` → "修完同一文件集的新提交仍 `skip_duplicate`" | 与 🔴A **同一载体方案**：`RunScopeGuard.trail()/trails()` = `<!-- run-scope: {…} -->`，`adopt_trails()` 恢复（`max()` + 按 `session_id` 归属过滤）；门面 `run_scope_trail()` / `inherit_run_scope()`；CI 脚本接 `CNB_RUN_SCOPE_TRAIL`、跑完 `record_repeat(..., verdict=<rc 回填>)` 并打印写回留痕；**红后（同一受审内容）允许复跑**（`decide_repeat` 从台账取真实结论） | `TestRunScopeCarrierAcrossContainers`（跨容器第 2 次 → `skip_duplicate`；红后同一文件集 → 可复跑；绿仍跳过；归属过滤；只增不减；门面载体入口；CI 接线断言）/ **反向**：不带留痕每容器仍从 0 开始 |
+| 🔴G | 门面 `create_checkpoint` / `register_platform_wait` 形参**没有**两侧事件名 → 落点四档恒 `platform_crontab`，"≤5min 挂 `cnb:await`"这条**首选落点在生产路径不可达**（照角色提示词用门面调用永远走不到） | 门面两处补 `waiter_event` / `resolver_event`（+ `stage`）并透传；未显式给出时按**当前事件**（`CNB_EVENT` / `CNB_PIPELINE_EVENT` / `CNB_TRIGGER_EVENT`）自动登记 | `TestFacadeCarriesEvents`（同事件 → 计划与登记两处都 `platform_await`；显式事件生效；环境事件回落生效）/ **反向**：两侧不同 / 事件不可判定 → 仍降级 `crontab` |
+| 🔴H | `main.push` 新增的增量测试阶段 `image: node:20` 且**零安装步骤**（该镜像不含 python3）→ `python3 -m pytest` 在干净镜像里**必失败**（`set -euo pipefail`），且 `main` 此前无测试阶段 → 本 PR 新引入 | `.cnb.yml` 的 `main.push` 改 `image: python:3.11` + `pip install pytest`（+ 运行时自检）；删掉 `python3 --version || true`（`|| true` 把"没有运行时"静默吞掉） | `TestCiDeclaresRuntime`（镜像声明 Python 运行时；装 pytest；无 `|| true` 吞错；CI 脚本按真实 rc 失败） |
+
+### 21.2 🟡 五项
+
+| 项 | 缺陷 | 修法 | 回归 |
+|---|---|---|---|
+| 🟡1 | 多留痕 `max()` **未按归属过滤**：把 A 检查点的 `checks_used=6` / 别的会话的 `rounds.total=5` 合并进来 → **误判"预算用尽"/"已熔断"** | `loop_guard._merge_budget_dicts` / `_coerce_budget_payload` 按 `session_id` 过滤；`probe._coerce_checks_used` 按 `checkpoint_key` 过滤（`adopt_checks_budget` 传 `cp.key`）；留痕**不带该字段时不表态**（保留） | `TestTrailAttribution`（跨会话不吸收、跨检查点不吸收、本会话/本检查点照常合并、无归属字段保留）/ **反向**：A 用尽 6 次不再让 B 判 `resume_required` |
+| 🟡2 | `_is_red` **子串**匹配把 `"577 passed, 0 failed"` 判红 → "允许重跑一次"的例外**恒真激活** | 匹配前先把 `0 failed` / `0 errors` 这类**零个失败**整段抹掉（`_ZERO_ISSUE_RE`） | `TestRedVerdictIgnoresZeroCounts`（6 组"零失败"→ 非红；7 组真失败 → 红；端到端：上轮 `"577 passed, 0 failed"` → 仍 `skip_duplicate`）/ **反向**：`2 failed` 仍允许重跑一次 |
+| 🟡3 | `checkpoint_plan(checks=3)` 返回 4 行但 docstring 未说明"含末尾用尽行" | docstring 明写"返回行数 = 档位数 + 1，末尾恒有「预算用尽」行" | `TestCheckpointPlanDocstring`（docstring 含"预算用尽"/"档位数 + 1"；`checks=3` → `[1,2,3,7]` 末行 `handoff_resume`） |
+| 🟡4 | `ReviewArbiter` **独立构造**默认硬编码 60s，与规则包 / 会话路径的 10s 不一致 | `retry_delay_sec` 改 `Optional[float]`：不传 → 取规则包 `locks.retry_delay_sec`（与会话同一取值路径）；规则包缺失才回落 `DEFAULT_RETRY_DELAY_SEC` | `TestReviewArbiterDefaultDelay`（独立构造 = 规则包值；会话与独立构造一致）/ **反向**：显式传入仍以调用方为准 |
+| 🟡5 | 预算用尽分支**不落盘**：外部 `checks_used=6` 时磁盘 / `overview` 仍显示 0，而事件留痕显示 6 → **观测面与判定不一致** | 用尽分支补 `_save(cp)` + `history` 留痕（`action="budget_exhausted"`）+ 置 `resume_required` | `TestExhaustedBudgetPersists`（磁盘/总览显示 6、`resume_required=True`、留痕可见）/ **反向**：正常探测路径照常落盘 |
+
+### 21.3 🟢 两项
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 留痕收集/归属过滤抽公共实现 | 新增 `secretary/trail.py`（`trail_re` / `collect_marked` / `attributed` / `MAX_TRAIL_DEPTH`）；`loop_guard.BUDGET_TRAIL_RE` 与 `probe.PROBE_BUDGET_TRAIL_RE` 均改为 `trail_re(...)`，两处不再各写一份同形正则 | `TestTrailAttribution::test_shared_trail_impl_is_single_source`（两处正则来自同一实现；`collect_marked` 收集**全部**留痕） |
+| 锁采集三态返回 | 见 🔴E（`_collect_lock_facts` 从"缺席即推断"改为"缺席即 `unknown`"） | 见 🔴E 回归 |
+
+### 21.4 自测
+
+- `pytest -q`：**909 passed**（基线 `a7847f9` 853 + 本轮新增
+  `test_collab_round5_fixes_issue14.py` **55** 项 + 上一轮改判的
+  `test_full_gate_issue14.py` 净 +1），连跑 3 次稳定。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）语法 ✅。
+- **独立探针**（非复用作者测试）复现 → 修复后复测：
+  🔴E 未登记 → `unknown`（旧 `proceed`）、已释放 → `proceed`、两者可区分；
+  🔴F 跨容器序列 `run → skip_duplicate`（旧恒 `run`）、红后同内容可复跑；
+  🔴G 门面同事件落点 = `platform_await`（旧恒 `platform_crontab`）；
+  🔴H `.cnb.yml` 声明 `python:3.11` + 装 pytest；
+  🟡1 跨检查点 `checks_used` 不再污染（`coerce(body, cp_key="cpB")=0`）；
+  🟡2 `_is_red("577 passed, 0 failed")=False`；
+  🟡5 用尽后磁盘 `checks_used=6`。
+- CI 脚本**端到端模拟**（同一受审内容连跑 3 个"新容器"）：容器 1 `run` +
+  留痕 → 容器 2/3 `skip_duplicate`（旧实现三个容器全 `run`）。
+
+---
+
+## 22. PR #15 复评第 4 轮定点修复（🔴1 / 🔴2 / 🔴5 · 基线 `a7847f9`）
+
+> 触发：架构·评审 复评第 4 轮（对象 `a7847f9`）判 `fix_bug`——🔴3/🔴4 认可清零，
+> **🔴1 / 🔴2 有可达残留**，并新增 **🔴5 性能回归**。本轮只动这三项 + 5 项 🟡 收口。
+> 复评口径（评审指定）：`inherit_budget(trail+card)` → `6/True/False`、
+> `_coerce_checks_used(trail2+载荷5)` → `5`、卡+卡两序同结论、`"{"×20000` 耗时。
+
+### 22.1 🔴 三项
+
+| 项 | 缺陷（评审实测） | 修法 | 判别性回归（+ 反向对照） |
+|---|---|---|---|
+| **🔴1a** 留痕 ↔ 载荷**不合并**：`_coerce_budget_payload` ① 读到 `rounds` 就 `return merged` → ②③④ 全跳过；「留痕段 + 不带内嵌留痕的卡」形态下**卡的轮次读不到**（实测 `trail(3)+card(6)` → `round_no=3`，**比"只给卡"的 6 还差**） | `loop_guard.py`：① 的 early return 删除，`merged` 只作**初始值**参与合并；④ 不再以"`got` 有没有 `rounds`"为条件，两通道一律 `_merge_budget_dicts([got, merged])`（`fused`/`budget`/`reason` 同） | `TestBudgetTrailMergesWithPayload`（`inherit_budget` → `6/True/False`；`from_handoff` 同结论；**两序一致**）/ **反向**：只给留痕 → 3、只给卡 → 6（加留痕不得更差） |
+| **🔴1b** `_coerce_checks_used` dict 分支**首个键命中即 return** → `trail(2)+{"checks_used":5}` 读成 2；`{"checks_used":2,"budget_trail":trail(5)}` 读成 2（新增的 `budget_trail` 展开在真实路径上是**死代码**：`ProbeEvent.to_dict()` 必带 `checks_used`） | `probe.py`：三条键 + `rounds` + 内嵌 `budget_trail` **各自取值后统一 `max()`**；**正文串分支**同样合并（原先只扫留痕 → `trail(2)+{"checks_used":5}` 丢载荷），散落对象走 `trail.json_objects_in()`（与 `loop_guard` 同一份扫描） | `TestChecksUsedMergesAllChannels`（3 组 → 5；`ProbeEvent.to_dict()` 形态 → 4；`probe(external=trail2+载荷5)` → **6**）/ **反向**：只给留痕 → 2 |
+| **🔴2** `pick_wake_object` 取**第一个**含 `wake` 的对象 → **卡+卡顺序决定结论**：`[True,False]` → 放行（fail-open）、`[False,True]` → 熔断；基线 `ed62088` 同结论 → docstring/文档宣称的"顺序无关"被证伪 | `loop_guard.py`：口径改**保守 + 确定**——**任一对象的 `wake` 非严格 `True` → 判静默**（与 `parse_wake` 的"判不出 → 保守静默"同向）；需要具体对象时取**追加顺序里最后一张卡**（正文是追加写的 → 后者更晚，即显式定义的"最新"判据） | `TestPickWakeObjectIsConservative`（卡+卡两序**同结论**＝熔断；坏值 `"false"` + `True` 两序也同结论；多静默卡取最后一张）/ **反向**：单张 `wake=True` 不熔断、多张 `True` 不熔断、不带 `wake` → `None` |
+| **🔴5** `extract_json_objects` 在未闭合 `{` 上 **O(n²)**（`_balanced_object_end` 从每个 `{` 重扫文末）：`"{"×20000` → 15.8 s、`×40000` → 63.3 s、`"if (x) {"×3000` → 3.0 s；**基线 `ed62088` 同路径 3 ms**（本轮引入的回归，4 个数量级）；该函数在 `from_handoff` / `adopt_budget` / `_coerce_checks_used` **主路径**上，评论正文是不可信输入 | 扫描实现收敛到 `secretary/trail.py`（**单一实现**）：`scan_json_spans()` = **一次线性主扫描（栈配对 + 字符串状态）** + **有界修复**（对"字符串区间"重扫以补齐旧实现能捞到的起点；区间数与字符量各有上界，超界收摊）。未配平的起点**不产片段、也不重扫**（平方来源），但**不影响其后**能配平的起点 | `TestScanIsLinear`（`"{"×20000 / ×40000`、`"if (x) {"×3000` 均 **< 1 s**；×10 规模不平方）/ **反向**：未闭合前缀**不得**把其后的静默卡整段丢掉（fail-open 方向），正常正文（对象 + 留痕 + 括号字符串）逐字不变 |
+
+### 22.2 🟡 五项收口
+
+| 项 | 修法 | 回归 |
+|---|---|---|
+| 🟡1 `DEEP` 用例**无判别力**（非法 JSON → 走 `ValueError` 分支，基线同样"判不出"；合法 3000 层 JSON 两边都 `RecursionError`） | 用例换成**合法**深嵌套（内层 3000 层 dict，基线 `RecursionError` **逃逸到门面** → 本轮按判不出）+ **真正递归**形态（内嵌 `budget_trail` 链逐层解析） | `TestCoercionDepthBound::test_legal_deep_json_does_not_escape`（先断言 `json.loads` 真抛 `RecursionError`，再断言门面/`adopt_budget` 不抛）/ `test_nested_trail_chain_parses_layer_by_layer`（深度 ≤ 上界时逐层合并到 `round_no=9`）/ **反向**：浅载荷仍被读到 |
+| 🟡2 `MAX_COERCE_DEPTH` **两处各写一份**（`loop_guard` / `probe`），`loop` 包导出了、`probe` 的没导出 | 上界**唯一定义处** = `secretary.trail.MAX_TRAIL_DEPTH`；两处只保留**指向它**的兼容别名（`MAX_COERCE_DEPTH = MAX_TRAIL_DEPTH`，不再 `as` 改名）；`collab` 包补齐导出 | `TestDepthBoundSingleSource`（`is` 同一对象；两个包都能取到同一个） |
+| 🟡3 `_merge_budget_dicts` 的 `reason` / `budget` 是"**首个非空胜**" → 顺序相关；`budget` 取首个会把 `max_rounds` **盖小**（`[3,9]` → 3）而 `rounds` 已 `max()`（两字段互相矛盾） | `reason` 取**已熔断载荷里最长**的一条（并列取字典序最小 → 完全顺序无关）；`budget` **逐字段 `max()`**（新增 `_merge_budget_values`） | `TestReasonAndBudgetMergeAreOrderIndependent`（两序 `reason` 同、`budget.max_rounds` → 9、`rounds.total` 仍 `max`） |
+| 🟡4 await 落点**只带 `key`、无 `env`**：`.cnb.yml` 的 await 片读 `$CHECKPOINT_AWAIT_KEY`，而落点产出的 key（`probe:<k>:r<n>`）**没人注入**那个变量 → "接线"停在事件名层面 | 落点 `trigger.env` 显式给出**键名映射**：`CHECKPOINT_AWAIT_KEY`（= 本次轮次 key，与 `.cnb.yml` **同名同源**）、`CHECKPOINT_KEY`、`PROBE_VERDICT`；另加 `trigger.key_env` 标注变量名 | `TestAwaitKeyIsWiredToPipeline`（`env.CHECKPOINT_AWAIT_KEY == trigger.key` 且以 `probe:c2:r` 开头；`.cnb.yml` 确实读该变量）/ **反向**：crontab 落点**不带** await 片的环境注入（落点互斥不混用） |
+| 🟢 `extract_json_object` 无调用方（仅 re-export） | **保留并写明原因**：对外稳定 API（`secretary.loop.__all__` 导出），语义 = "取第一个顶层对象"，与 `extract_json_objects()[0]` **同源实现**（不另写一份扫描）；内部判定一律走"取全部 + `pick_wake_object`" | `TestExtractJsonObjectRetention`（与 `extract_json_objects()[0]` 同值；空/非串 → `None`） |
+
+### 22.3 与旧实现的**差分对照**（防"修一个坏一个"）
+
+> ⚠️ **本节已原位更正（第 6 次 `blocked` 上报后 · 见 §25）**：原"4518 组 → 差异 0"
+> 的结论**不成立**——实测该结论建立在"含引号区间"的正文上被旧"两段式"路径
+> **丢卡**（且方向是 fail-open）。下面的行文保留更正后的口径，**不得**再引用
+> "差异 0"作为"已对齐旧语义"的依据。
+
+- ~~`scan_json_spans` vs `a7847f9` 的 `extract_json_objects`：**4518 组**用例
+  逐组比对对象清单 → **差异 0**。~~ → **不成立**（见上方更正；§24.5 / §25.3）。
+- `scan_json_spans` vs **基线 `ed62088`** 的 `extract_json_object`（按旧口径
+  "从左到右反复取第一个"复现）：差异仅出现在**未配平起点自身**（旧实现从
+  `start+1` 重扫，新实现不重扫）——正是平方复杂度来源；真实正文形态（对象 +
+  留痕 + 差量片段）**逐字节一致**。
+- **本轮（Issue #21）重做后的差分口径**：`LOST=0` **且** `REV=0`
+  （**实测** 12 seed × 3 500 组 = **42 000 组**差分 fuzz / 6 seed × 2 000 组 =
+  **12 000 组**放行方向对照；口径 = `seed 数 × 循环次数`，复跑命令见 §25.3）。
+  **边界明示（与实现同源 · 总师裁定 R1）**：`LOST=0` 的口径**必须带前提**——
+  "**在 `degraded=False` 时**，长度 ≤ `MAX_RESCAN_LEN` 的对象全捞到"；
+  **降级（`degraded=True`）下允许丢段**（已批准语义，反例见 §25.5）。
+  ① 的语义判据是「候选 `p` 到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`」，
+  **不是**"长度超上界的合法对象会被跳过"（反例：含内层 `}` 的 5.2 MB 对象未被跳过）。
+
+### 22.4 自测
+
+- `pytest -q`：**944 passed**（基线 `a7847f9` 909 + 本轮新增
+  `test_collab_round6_fixes_issue14.py` **33** 项 + 第 4 轮文件改判净 +2），连跑 3 次稳定。
+- **判别力验证**（把本轮新测试放到**上一轮 `d22f6d7`** 上跑）：**19 failed / 12 passed**
+  —— 19 项失败正是本轮要修的 🔴1a/🔴1b/🔴2/🔴5 + 🟡 各项（不是恒真断言）。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件）**0 告警**。
+- 四个 YAML（`.cnb.yml` / `.cnb/settings.yml` / `shared/collab/*.yaml`）：
+  PyYAML 语法 ✅ + 仓库兜底解析器（`_mini_yaml`）✅。
+- **性能对照**（评审表格口径，同一容器）：
+
+  | 输入 | `ed62088`（基线） | `a7847f9`（回归） | 本轮 |
+  |---|---|---|---|
+  | `"{" × 20000` | — | 15.8 s | **1.4 ms** |
+  | `"{" × 40000` | 3 ms | 63.3 s | **2.6 ms** |
+  | `"if (x) {" × 3000`（24 KB） | — | 3.0 s | **1.6 ms** |
+  | `"{" × 200000` | — | — | **14.9 ms** |
+  | 引号密集（`'"'×20000` / `'"{'×50000` / 2 MB 正文） | — | — | **29–81 ms** |
+
+- 复评口径四项（评审指定，独立探针）：
+  `inherit_budget(trail+card)` → `6 / True / False`；
+  `_coerce_checks_used(trail2+载荷5)` → `5`；
+  卡+卡两序 → `fused=True / should_wake_next=False`（两序同结论）；
+  `"{"×20000` → 1.4 ms（基线 3 ms 量级）。
+
+### 22.5 台账更正（按实测）
+
+- §20 的 🔴1 行：**"已清零"不成立**——本轮实测其 ① early return 仍在，
+  「留痕 + 不带内嵌留痕的卡」形态下轮次**回退**（`trail(3)+card(6)` → 3）。
+  已在 §22.1 🔴1a 记录并修复；🔴1 的"trail↔trail 通道"部分（第 3 轮）确实已修好。
+- §20 的 🔴2 行：**"已清零"不成立**——`pick_wake_object` 当时是"首个含 `wake` 者胜"，
+  卡+卡顺序决定结论（且一个方向 fail-open）。已在 §22.1 🔴2 记录并改为保守口径。
+- §21（第 5 轮）未涉及本三项；本轮为**第 3 次打回后的定点修**（§19 `2be6a3d`、
+  §20 `ed62088`、§21 `a7847f9`、本轮）——按协作纪律，若下轮仍有 🔴 残留，
+  由评审按 `blocked` 上报总师裁定。
+
+## 23. PR #15 复评第 5 轮回转卡定点修复（🔴-1…🔴-4 · 基线 `11614ae`）
+
+> 触发：架构·评审 第 5 轮复评（对象 `a7847f9..d22f6d7`）→ `fix_bug`，
+> **🔴 未清零、达打回上界（标 blocked）**。回转卡列 4 项 🔴，均为**局部定点改动**。
+> 本轮为**同一被打回方第 3 次打回**后的返工；🟡4 / 🟢-1 / 红后复跑上界三项按卡要求
+> 给口径（见 §23.3）。
+
+### 23.1 🔴 四项（独立探针复现 → 修复后复测）
+
+| 项 | 缺陷（评审实测） | 修法 | 独立复测 |
+|---|---|---|---|
+| 🔴-1 | `_lock_key_known(known, scope)` 拿 **scope** 去比 **keys**（keys 只含锁键）→ 生产形态（`ReviewArbiter` 键 `S:review` / `scope="评审读锁（…）"`、`OwnershipManager` `scope="状态卡写入"`）"已释放"**恒判不出** → 等他的锁**永不放行**（原 🔴E 同族，从"误放行"翻成"永不放行"） | `_collect_lock_facts` 命中看 `key` **或** `scope`，判据就必须**同口径**：新增 `_lock_scope_known()`；`overview()` 补**全量 `scopes`**（与 `keys` 同源）；`_lock_key_known` 另认 `{scope: key}` 映射形态 | 持有 → `wait`；**已释放 → `proceed`**（基线 `a7847f9`/`11614ae` 同场景 `unknown`）；**未登记 scope 仍 `unknown`**（不得放宽成放行） |
+| 🔴-2 | `_coerce_checks_used` 的 **dict 分支无归属过滤**（字符串留痕分支有）→ 别人的 `ProbeEvent.to_dict()`（必带 `checkpoint_key`）被整份吸收 → 本检查点直接 `resume_required`（误判用尽） | dict 分支补 `attributed(value, "checkpoint_key", cp_key)`（与字符串分支**同一实现**）；不带归属的载荷仍保留（"不表态 ≠ 属于别人"） | 别人 cpA 事件载荷(6) → 本 cpB **`None`**（旧 `6`）；自己的 → `2`；不带归属 → `6`；**两分支结论一致** |
+| 🔴-3 | `CNB_SESSION_ID` / `CNB_RUN_SCOPE_TRAIL` **全库无生产者**（只有读），`main.push` 段无 `env`/`imports` → 载体停在提示词；`trails(session_id="")` 把评论里**所有会话**归属重写成 `""` → 别的会话台账被继承（**漏跑**）/ 红后复跑被堵死 | ① `trails()/trail()` **保留原归属**（`_owner_of`：显式 → 记录自带 → **不带该字段**，绝不用空串冒充）；② 新增 `collab/carrier.py`（`fetch`/`writeback` + `session_id_for` 推导）+ `scripts/collab-carrier.sh`，并**接进 `.cnb.yml` 的 `main.push`**；③ CI 侧归属为空**不写回**（告警） | CI 往返后 A/B 归属**原样保留**、`"session_id": ""` 不出现；第三会话 `merged=0` 且判定 `run`（旧 `skip_duplicate` = 漏跑）；A 红 + B 绿 → **`run`**（旧被堵死）；`.cnb.yml` 真有 fetch/writeback 生产者 |
+| 🔴-4 | `_ZERO_ISSUE_RE` 只匹配**数字 0 开头** → `"577 passed, no errors"` / `"errors: 0"` / `"1 xfailed"` / `"no failures"` 仍判红 → "允许重跑一次"的例外**恒真激活** | 零计数口径扩为四类：前置零计数 / 后置零计数 / 显式否定（`no`/`without`/`zero`）/ 预期失败（`xfail(ed/s)`） | 四类变体全 **`False`**（旧全 `True`）；**真失败仍红**（`2 failed` / `errors: 1` / `3 xfailed, 1 failed` / `0 errors, 3 failed`）；端到端 `"577 passed, no errors"` → 重跑仍 `skip_duplicate` |
+
+### 23.2 结转三项口径（回转卡要求"回一句口径"）
+
+| 项 | 口径 | 落地 |
+|---|---|---|
+| 🟡4 显式规则包路径不同源 | **结转**（本轮不修） | 已复现：`ReviewArbiter` **无 `rules_path` 形参**（只有 `retry_delay_sec`），故"显式规则包 → 独立构造"这条路径本轮不接；与会话路径同源只对"从数据根向上找得到规则包"成立。**登记待收口**（补形参属接口扩张，宜与总师口径一并定） |
+| 🟢-1 死形参 `max_depth` | **回退（删除）** | `collect_marked(text, marker)` 删除 `max_depth`——形参存在却不生效正是本仓库反复治的形态；"补个假用"会造出第二份语义源，与单一语义源冲突。深度边界仍在消费侧（`MAX_TRAIL_DEPTH`）+ `json.loads` 的 `RecursionError` 兜底 |
+| 🔴F 红后复跑无上界 | **落上界** | 新增规则 `scan.max_rerun_on_failure`（默认 **1** = 文档"复跑一次"口径），组织级 + 仓库级两份规则包同步；`decide()` 与 `decide_repeat()` **同一口径**。实测连续"修了仍红"：旧全 `run`（5 轮）→ 现 `run, run, skip×3`；上界设 0 → 不绿也不复跑（判别性对照） |
+
+### 23.3 自测
+
+- `pytest -q`：**994 passed**（基线 `11614ae` 944 + 本轮新增
+  `test_collab_round7_fixes_issue14.py` **50** 项）。
+- **判别力验证**（把本轮新测试放到**基线 `11614ae`** 上跑）：**25 failed / 25 passed**
+  —— 失败项正是本轮要修的 🔴-1/🔴-2/🔴-3/🔴-4 + 结转两项（不是恒真断言）。
+- `compileall src` OK；`pyflakes`（本轮改动文件 + 新文件）**0 告警**。
+- YAML：`.cnb.yml` / `shared/collab/collab-rules.yaml` / `shared/collab/organization.yaml` 语法 ✅。
+- **CI 端到端**（脚本实跑，非模拟）：容器1 `run` + 落留痕文件 → 容器2（新目录 = 新容器）
+  `skip_duplicate`（`merged=1` 从载体恢复）；会话号推导 `org/repo#15`。
+- **平台事实核对**（查证官方文档，非凭印象）：
+  `imports` / `env` 的优先级与用法（`/zh/build/env.md`）、`volumes: copy-on-write`
+  （`/zh/build/pipeline/grammar.md`）、PR 评论 API（`PATCH /{repo}/-/pulls/{n}/comments/{id}`，
+  `repo-notes:rw`）——载体写回按"**追加到同一条评论**"实现（PATCH，不新建评论）。
+
+---
+
+## 24. PR #15 **最终收口轮**（改实现路径 · N1/N2/N3 + 🟡a/🟡b · 基线 `ba09a52`）
+
+> 触发：架构·评审 **blocked 上报**（本轮为第 4 次打回 > 纪律上限 3）→ 架构·总师裁定
+> **改实现路径 + 本 PR 内收口 + 范围冻结（最终收口轮）**。
+> 范围**仅** N1 / N2 / N3 + 🟡a 反向对照 + 🟡b 删除采纳路径；**禁止**引入新机制或重构。
+>
+> ⚠️ 本轮**同时更正 §22.3**（见 §24.5）："4518 组差异 0"与实测不符。
+
+### 24.1 改实现路径（总师裁定 ①）
+
+**旧路径已废弃**：`scan_json_spans` 的"一次线性主扫描（栈配对）+ 有界修复"——
+其正确性**依赖预算兜底**（"预算够就捞到"），本轮在兜底路径上实测长出两条
+**单向 fail-open**。**不再打补丁**。
+
+**新路径（构造性"不漏"）**：`trail.py` 的扫描改为
+
+| 要素 | 实现 |
+|---|---|
+| 候选起算 | 每个候选 `{` 调 `json.JSONDecoder().raw_decode` **独立起算**（不共享前一个候选的字符串状态）——等价旧实现"每个起点按括号配平重扫 + `json.loads`"的语义，解析在 C 里做，未闭合/非法即 fail-fast |
+| O(1) 预检 | ① 候选之后**必须还有** `}`（`rfind`，一次 O(n) 定全局上界）；② `{` 后跳过空白**必须**是 `"` 或 `}`（JSON 对象的唯一两种起头）→ `"{"×n` / `if (x) {` 类输入**不进** `raw_decode` |
+| **不变量 = 超集召回** | `a7847f9` 能捞到的对象，新实现**必须全捞到**（差分 fuzz `LOST=0`，见 §24.4） |
+| **上界只降级、不丢段** | `MAX_SCAN_WORK`（工作量，记账 ≥ 真实扫描量）触顶或 `DEFAULT_SCAN_BUDGET` 截断 → **保留已取到的片段**，剩余区间判为"不表态"，且**显式标记**（`scan_json_spans_report` / `json_objects_in_report` / `extract_json_objects_report` 的第二个返回值） |
+| 降级的**保守方向** | 判定侧（`from_handoff`）在降级时把安全旗标取**保守方向**：无卡 → 按"判不出"（保守静默）；找到 `wake=True` 卡 → **仍**按"判不出"（后面那一段可能还有静默卡）。**禁止**"静默收摊"（上一轮 `MAX_REPAIR_CHARS` 触顶即整段丢卡 = N1/N2 来源） |
+
+**删除**：`_stack_scan` / `MAX_REPAIR_REGIONS` / `MAX_REPAIR_CHARS` / `MAX_REPAIR_DEPTH`
+（"两段式 + 预算兜底"整条路径；扫描入口仍是 `trail` **单一实现**，两处共用）。
+
+### 24.2 N1 / N2 / N3 定点修
+
+| 项 | 缺陷（总师/评审独立复跑） | 修法 | 独立复测 |
+|---|---|---|---|
+| **N1** | 引号区间前缀 + 卡（88 B）：卡被整段丢 → `fused=False` / `wake=True`（**单向 fail-open**） | 候选独立起算（见 §24.1） | `objs` 含卡；`fused=True / wake=False`；前缀长度 `1/3/7/15/31` 参数化全过；两序一致 |
+| **N2** | `issues/TEST-REGRESSION.md`(79 KB) + 卡：卡被丢（`n_objs` 3→1），机制 = 修复段上界触顶**整段收摊** | 同上（**无上界敏感**：台账 ×1/×2/×3 均稳定可见、不降级） | 卡恢复；`n_objs` ≥ 基线；超集召回成立 |
+| **N3** | `_merge_budget_values` 的 `None` **参与比较**（`max(9, None, key=repr)`：`'None' > '9'`）→ `[{"x":None},{"x":9}]` 与 `[{"x":9},{"x":None}]` **结论不同** | `None` = **缺席**，不参与比较；其余按"数字 `max()` / 字符串字典序 / 混类型 `(类型名, repr)` 全序"确定性取大 | 两序同结论；全 `None` → 字段不出现；随机 4000 组两序一致；数字仍取 `max()`（反向对照） |
+
+**N3 判据（总师指定）**：`None` 视为缺席、不参与比较，**真顺序无关**。
+
+### 24.3 🟡a / 🟡b
+
+| 项 | 口径 | 落地 |
+|---|---|---|
+| **🟡a** 反向对照 | 两组**判别性**用例：引号区间前缀 + 卡（N1）/ >60 KB 长正文 + 卡（N2） | 两组都测"**基线能捞到的对象新实现全捞到**"（`_baseline_objects()` 内联复刻基线实现，故回归**不依赖**旧提交可检出）+ 卡可见 + `fused=True`；配反向对照（`wake=True` 卡**不得**误判静默、正常正文不降级） |
+| **🟡b** 删除采纳路径 | `merged["budget"]` **只作观测**，**无对外采纳路径** | 载荷 `budget.max_rounds=99` **不改** `self.max_rounds` / `max_total_rounds`（判别性）；`rounds` 仍被采纳（反向对照）；`budget` 段仍可观测（顺序无关合并）；**源码护栏**：`adopt_budget` 体内不得出现 `data.get("budget")` |
+
+**🟡b 不接 `max_rounds` 的理由（采纳总师口径）**：把外部载荷的 `max_rounds` 采纳进来是
+`max()` **抬高上界 = 削弱熔断**（方向与 N1/N2 同属 fail-open）；且归属字段可缺省
+（"不表态"即被合并），不可信正文可借此放大预算。
+
+### 24.4 自测
+
+- `pytest -q`：**1039 passed**（基线 `ba09a52` 994 + 本轮新增
+  `test_collab_round8_fixes_issue14.py` **45** 项），连跑 3 次稳定。
+- **判别力验证**（把本轮新测试放到**基线 `ba09a52`** 上跑）：**25 failed / 20 passed**
+  —— 失败项正是 N1（5 项：卡不可见 + 两序 + 超集 + 前缀参数化）/ N2（4 项）/
+  N3（7 项）/ 降级标记与保守方向（6 项）/ fuzz 不变量（4 项）；
+  放在**更早基线 `a7847f9`** 上：**15 failed / 20 passed**（同样非恒真断言）。
+- 差分 fuzz（**非复用作者测试**）：`scan_json_spans` vs 基线
+  `a7847f9::extract_json_objects`，40 000 组（随机花括号/引号/转义 + 片段 +
+  引号密集 + JSON 形态，四族轮换，含卡）→ **`LOST=0` / `EXTRA=6889`**
+  （`EXTRA` = 失败候选**内部**的对象，超集方向，不丢卡）。
+- 性能（同容器，`extract_json_objects` 单次）：`"{"×20000` / `×40000` / `×200000`
+  **< 0.01 ms**；`if (x) {"×3000` **< 0.01 ms**；`'"'×20000` / `'"{'×50000`
+  **< 0.01 ms**；`'{"a":'×20000` **< 0.01 ms**；台账 79 KB + 卡 **0.9 ms**；
+  台账 ×4（317 KB）+ 卡 **8 ms**；2 MB 正文 **1.8 ms**。
+  ⚠️ 残余风险（总师点名保留）：**长度上界兜底保留**（`DEFAULT_SCAN_BUDGET` +
+  `MAX_SCAN_WORK`），未省略。
+- `compileall src tests` OK；`pyflakes`（本轮改动文件 + 新文件）**0 告警**。
+- 降级路径实测：超 `DEFAULT_SCAN_BUDGET` → `degraded=True` + 安全旗标保守
+  （`fused=True`）；工作量触顶 → `degraded=True` 但**已取到的片段仍在**
+  （`{"keep":1}` 保留）；正常正文**不降级**（反向对照）。
+
+### 24.5 台账更正（按实测）
+
+- **§22.3 的"4518 组差异 0"不成立**（总师独立复核指出，本轮实测复现）：
+  差异集中在**含引号区间的正文**——旧"两段式"在引号区间前缀 + 卡（88 B）、
+  >60 KB 长正文 + 卡两组判别性用例上**丢卡**，且方向是**单向 fail-open**
+  （`fused=False` / `wake=True`）。该结论**不得**再作为"已对齐旧语义"的依据。
+- **§22.1 🔴5 行的修法描述已过期**："一次线性主扫描 + 有界修复"这条实现路径
+  **已被本轮废弃**（§24.1）；性能结论仍成立（候选独立起算 + O(1) 预检更快）。
+- **§22.2 🟡3 行的 `budget` 口径部分更正**：`budget` 段的"逐字段 `max()`"
+  仍成立，但**仅作观测**——**无采纳路径**（§24.3 🟡b）；且 `None` 不再参与比较（N3）。
+
+---
+
+## 25. Issue #21 · `scan_json_spans` 重做（CP1 落地 · G1–G7 · 基线 `9382552`）
+
+> 触发：架构·评审 **第 6 次 `blocked` 上报** → 架构·总师裁定（PR #15 @ `9382552`）：
+> ① 确认 `9382552` 属**超范围提交**（scan 重做移出本 PR，由 **Issue #21** 承载）；
+> ② 批准收敛路径 = **`9382552` 的语义 + 两条上界 + `reason` + 三处接线**；
+> **不批准纯回退**（`a7847f9` 语义 320 KB → 384 s，O(n²)）；**CP1 已由总师 spike 验证**。
+>
+> 本轮为 **Issue #21 的 CP1 落地**；范围**仅**：`trail.py` 两条上界 + 记账口径 +
+> 三态 `reason`、消费侧 **3 处**接线、G6/G7 判别性用例、§22.3 原位更正。
+> **不引入新机制**。
+
+### 25.1 根因与修法（CP1）
+
+| 项 | 根因（总师/评审独立实测） | 修法（CP1） |
+|---|---|---|
+| **🔴-1 O(n²)** | 只给**总**上界、不给**每候选**上界 ⇒ 总上界被**单个候选**吃掉：`'{"k":1, '×40000 + '}'`（320 KB）→ **2.26 s**、1 MB → **21.7 s**，`degraded` 恒 `False` | 新增 **`MAX_RESCAN_LEN`**（每候选上界，默认 `262_144`）：候选只在窗口 `[p, p+L)` 内找 `}`；窗口内无 `}` → 跳过该候选 + `reason="rescan_len"`。**⚠️ 归因更正（总师裁定 `A⊕B` · B）：该常量在本轮记账口径下为「冗余兜底」，**不是**"缺一不可" —— 承载上界是 ②（消融：cap→1e9 仍 0.0062 s / work→1e18 才 2.8619 s，见 §25.2）** |
+| **🔴-1 归因** | 失败分支记账取 `pos - p`（恒 8）⇒ 总记账 800 k ≪ `MAX_SCAN_WORK` 20 M ⇒ **永不触顶** | 失败记账改取**错误位置 `pos`**（整段前缀）——异常消息构造代价随 `pos` 线性（实测 `pos=8 → 1.7 µs`、`pos=799 992 → 274 µs`） |
+| **🔴-3 降级 `reason`** | `*_report()` 只返 `(list, bool)`；scan 区段 `reason` 出现 **0 次** | 新增 `scan_json_spans_diag` / `json_objects_in_diag` / `extract_json_objects_diag`：`(…, degraded, reason)`，**三态** `truncated` / `work_cap` / `rescan_len`（多因并存取**最外层**，确定性） |
+| **🔴-4 消费侧接线 1/3** | `from_handoff` ✅ / `adopt_budget` ❌（降级正文 → `merged=False`、`round_no=0`，**卡静默丢**）/ `probe._coerce_checks_used` ❌（→ `None`，基线 5 次） | 3 处**全部**走 `*_diag`：`from_handoff` 降级 → 保守静默（原因写进 `fused_reason`）；`adopt_budget` 降级 → **不得**当空操作；`probe` 降级 → 保守按 `max_checks` 继承 |
+| **[HIGH] 失真断言** | `trail.py:119` 宣称"记账 ≥ 真实扫描量，故本上界同时是**真实耗时**的上界"——实测**不成立** | 删掉该断言；改写为**可复跑**口径：记账须覆盖 ① 异常构造代价（`pos`）② **每候选固定开销**（`_SCAN_CANDIDATE_COST`）③ 一次基扫（`limit`）；折算比取**实测**上界 |
+
+### 25.2 两条上界（**归因：① = 冗余兜底 / ② = 承载上界** · 总师裁定 A⊕B）
+
+> **本节按总师裁定 `A⊕B`（2026-09-19T00:26:34Z）重写**：原"**缺一不可**"的归因
+> **未证**，现正式承认 ① `MAX_RESCAN_LEN` 在当前记账口径下为**冗余兜底**
+> （非"缺一不可"），② 为**承载上界**。**实现不动**（范围冻结），只改归因与数字。
+
+| # | 常量 | 默认值 | 语义 | 触界 `reason` | 归因 |
+|---|---|---|---|---|---|
+| ① | `MAX_RESCAN_LEN` | `262_144` | **每候选**：窗口 `[p, p+L)` 内无 `}` → 该候选不表态 | `rescan_len` | **冗余兜底**（非正确性前提） |
+| ② | `MAX_SCAN_WORK` | `200_000_000` | **总量**（折算单位）：候选区间 + 每候选固定开销 + `raw_decode` 实扫量 + 基扫 | `work_cap` | **承载上界** |
+
+- **归因消融（可复跑）**：
+
+  | 输入 | both | ①`MAX_RESCAN_LEN→1e9` | ②`MAX_SCAN_WORK→1e18` |
+  |---|---|---|---|
+  | `adv320 = '{"k":1, '×40000 + '}'` | **0.0034 s** | **0.0062 s**（仍被 ② 拦住） | **2.8619 s**（失控） |
+  | `micro = "{}"×500 000` | **0.3950 s** | **0.3839 s** | **1.0078 s** |
+
+  ⇒ 去掉 ① 无实质变化（adv320 0.0034→0.0062 s，同量级）；去掉 ② 才失控。
+  **承载上界是 ②**，① 是**冗余兜底**（多一层保险 + 可观测的 `rescan_len` 原因）。
+- **① 的语义判据（与实现同源）**：**「候选 `p` 到窗口内首个 `}` 的距离 >
+  `MAX_RESCAN_LEN`」**。**不是**"长度超上界的合法对象会被跳过"——后者有反例
+  （可复跑）：含内层 `}` 的 **5.2 MB** 合法对象
+  （`'{"a":"}"' + ',"b":"' + "x"×(5 MiB) + '"}'`）→ `n=1`、**未被跳过**。
+- **① 的取值依据（实测，非拍脑袋）**：全仓语料（`issues/*.md`、`docs/**/*.md`、
+  `state-secretary/src/**/*.py`、`state-secretary/tests/*.py`）里"候选 → 最近 `}`
+  距离"的最大值 = **5 289**（`state-secretary/src/secretary/loop/loop_guard.py`；
+  台账 ×6 = **5 273**）⇒ 本上界 **≈49.6×** 余量。
+- **② 的记账口径（G7）**：`work += 候选扫描区间长度 + _SCAN_CANDIDATE_COST +
+  raw_decode 实扫量（成功 end-p / 失败 **pos** / 无 pos 取剩余长度）`。
+  含基扫 `limit`。**为什么必须含每候选固定开销**：扫描循环每次迭代
+  （`find` + 空白跳过 + 形态预检）实测 **0.4–0.9 µs/候选**、与长度**无关**；
+  只按字符量记账时 `"{}"×500 000`（字符量 1 M、耗时 0.57 s）会记成很小的量
+  ⇒ **记账不覆盖真实耗时**（上界失真）。
+- **② 的取值须同时满足两侧**（**裁定明示余量 ≥ 5×**）：
+  * 上侧：⚠️ **原"最坏折算比 = 2.0 ns/单位（实测上界）"已被证伪**（2026-09-19）——
+    `raw_decode` 拿到**整段 `text`**，未闭合字符串分支 `pos` 停在开引号 ⇒ 记账 ≈ 常数
+    而**实扫随正文线性增长**，折算比实测 **3.3 / 32.7 / 130.9 ns/单位**
+    （5 / 50 / 200 MB），最坏 **≥ 272 ns/单位、无界**。⇒ `MAX_SCAN_WORK`
+    **当前不是耗时上界**（待修法落地后重测，见 §25.7）；
+  * 下侧（不误降级）：台账 ×5（**491 655 字符 ≥ 417 480**）实测折算
+    **39 493 168** ⇒ 本上界留 **5.06×** 余量（判据
+    `test_reverse_calibration_has_margin_beyond_417k`）。
+    ⚠️ **口径边界（如实标注）**：该余量**只在台账样本上成立** —— 按同一枚举口径把
+    **每个真实文件**重复到 417 480 字符后，**84 个文件里 19 个余量 < 5×**，
+    最差 **1.00×**（`tests/test_collab_round6_fixes_issue14.py`，`work=199 844 416`）。
+  * 该余量把"真实正文不误降级"的规模上限抬到 ≈ **927 K 字符**（台账 ×10）。
+    **实测 ×11 起即 `truncated`** —— 但那是 `DEFAULT_SCAN_BUDGET`（1e6 字符）
+    截断所致，**不是本上界**（口径不同，不得混算）。
+- **只降级、不丢段**：两条上界都**只**让"未扫到的区间"不表态，**已取到的片段
+  一个不丢**（`test_g3_earlier_spans_survive_the_cap` / `test_g4_already_parsed_spans_are_never_dropped`）。
+
+### 25.3 自测（G1–G7）
+
+- **G1 语义 = 超集召回（前提 `degraded=False`）**：差分 fuzz **42 000 组**
+  （**12 seed × 3 500**；四族轮换：随机/片段/引号密集/JSON 形态，含卡）→
+  **`LOST=0`**；放行方向对照 **12 000 组**（**6 seed × 2 000**）→ **`REV=0`**。
+  被比较方 = `_baseline_objects()`（**内联复刻**基线 `a7847f9` 实现，故回归
+  **不依赖**旧提交可检出）。**数字口径 = 实测**（复跑命令：
+  `python -m pytest state-secretary/tests/test_issue21_scan_rework.py -q -k g1`；
+  计数 = `seed 数 × 循环次数`）。
+  ⚠️ **本条 fuzz 覆盖不到降级区间**（实测：42 000 组里 body 最大 **962 B**、
+  `degraded` 计数 **0**）—— 降级区间的判据见 **§25.5（R4 降级 fuzz）**。
+- **G2 ① `MAX_RESCAN_LEN` 显式**：常量存在、**与总上界不同源**（`< MAX_SCAN_WORK`）、
+  触界 → `reason="rescan_len"`；**反向对照**：上界内不降级；**边界明示（同源写法）**：
+  判据是**「候选 `p` 到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`」**，**不是**
+  "长度超上界的合法对象会被跳过"（反例：含内层 `}` 的 5.2 MB 对象未被跳过）；
+  取值余量判据（语料最大 5 289）。
+- **G3 ② `MAX_SCAN_WORK` 显式 + 记账覆盖真实量**：源码护栏（失败分支不得出现
+  `pos - p`；`_SCAN_CANDIDATE_COST` 必须存在且计入）；触顶 → `reason="work_cap"`；
+  触顶前片段保留；`RecursionError` 按剩余长度计；**反向对照**：台账 ×4（334 KB）**不降级**。
+- **G4 降级契约三态**：`truncated` / `work_cap` / `rescan_len` 各一条 + **反向对照**
+  （正常正文 `degraded=False`、`reason=""`）；截断 + `wake=True` 卡 → **仍保守**；
+  `reason` 确定性（与出现顺序无关）。
+- **G5 消费侧接线 3 处**：`from_handoff`（降级 → 保守 + `fused_reason` 带原因，
+  源码护栏走 `extract_json_objects_diag`）/ `adopt_budget`（降级正文 `merged=True`，
+  **不再静默丢卡**）/ `probe._coerce_checks_used_diag`（降级 → 按 `max_checks` 继承
+  → `resume_required=True`）；**三处各配反向对照**（正常载荷口径不变）。
+- **G6 含 `}` 对抗输入 < 1 s**：`'{"k":1, '×40000 + '}'`（320 KB）**0.0027 s**
+  （旧 **2.26 s**）；1.6 MB 形态 **0.000031 s** —— ⚠️ **该数字来自
+  `DEFAULT_SCAN_BUDGET`（1e6 字符）截断**，**不是**本上界的性能结论；
+  同一输入 `budget=len(text)` 时 **0.0026 s**（口径必须标注，不得混用）；
+  端到端 `from_handoff`（320 KB 正文 + 卡）**0.0036 s**（总师实测旧 4.54 s）；
+  规模 ×3 判据（不得平方）；**`degraded=True` + 可读 `reason`**（旧恒 `False`）。
+- **G7 记账机制**：单入口（`loop_guard` 不再自带扫描）；三态取值互不相同；
+  **最坏对抗输入耗时 < 2 s**（实测最坏 **0.3950 s** = `"{}"×500 000` 微对象密集；
+  ⚠️ 折算比**无上界**，见 §25.7 —— 该"< 2 s"仅在**记账与实扫一致**的形态上成立）；
+  每候选限长**真的**生效（`'{"a": ' + x×3L + '}'` → `rescan_len`）；
+  docstring 断言与实现同源（`MAX_RESCAN_LEN` / `SCAN_REASON_RESCAN_LEN` /
+  "错误位置 pos"必须出现）。
+- **判别力验证**（把本文件放到**基线 `9382552`** 上跑）：**30 failed / 30 passed**
+  —— 失败项正是 G2（常量缺失）/ G3（记账口径）/ G4（三态）/ G5（三处接线）/
+  G6（2.26 s + `degraded` 恒 `False`）/ G7（0.3950 s vs 2.25 s）/ G1-REV（1–3 次翻转）。
+  **不是**恒真断言。
+- **全量**：`pytest -q` → **1099 passed**（基线 `9382552` **1039** + 本文件 **60**），
+  连跑 3 次稳定；`compileall src tests` OK；`pyflakes`（改动文件 + 新文件）**0 告警**。
+
+### 25.4 台账更正（原位）
+
+- **§22.3 原位更正**：原"4518 组 → **差异 0**"**不成立**（更正行已写在 §22.3 原位，
+  不再只留在 §24.5）。本轮重做后的差分口径 = **`LOST=0` 且 `REV=0`**，
+  且 `LOST=0` 的口径**明示**为"长度 ≤ `MAX_RESCAN_LEN` 的对象全捞到"。
+- **§24.1 的"上界只降级"补注**：当时只有**一条**上界（`MAX_SCAN_WORK`），
+  实测**失效**（2.26 s / 21.7 s、`degraded` 恒 `False`）；现为**两条**上界
+  （每候选 + 总量），且 `reason` 三态可观测。
+- **性能表（§24.4）更正**：其中 `"{"×20000` / `if (x) {"×3000` 等**无 `}`** 的
+  输入**绕开**了 `raw_decode` 路径（O(1) 预检短路），故当时"毫秒级"结论
+  **不构成**对 O(n²) 路径的验证；本轮 G6 用**含 `}`** 的输入重测。
+
+### 25.5 R4 降级 fuzz（**本轮核心缺口收口** · 总师裁定 `A⊕B`）
+
+> **缺口（总师独立复现，我复跑一致）**：G1 的 42 000 组差分 fuzz **零降级覆盖** ——
+> 实测 body 最大 **962 B**、`degraded` 计数 **0**。故 `LOST=0` 这条不变量
+> **不能**支撑降级区间的任何结论（它压根没走到那里）。
+
+**新增 `TestR4DegradedFuzz`**（`state-secretary/tests/test_issue21_scan_rework.py`）：
+
+| 态 | 构造方式 | 覆盖组数（**实测**） | 判据 |
+|---|---|---|---|
+| `truncated` | 正文 > `DEFAULT_SCAN_BUDGET`（1e6 字符） | **7 200**（6 seed × 1 200） | **方向保守** |
+| `work_cap` | 微对象密集串顶过 `MAX_SCAN_WORK` | **3 000**（3 seed × 1 000） | **方向保守** + **允许丢段** |
+| `rescan_len` | 候选到窗口内首个 `}` 距离 > `MAX_RESCAN_LEN` | **3 000**（3 seed × 1 000） | **方向保守** |
+
+- **判据 = 「消费侧方向保守」**（`fused=True` / `wake=False`），**不是**"不丢卡"
+  —— 降级下丢段是**已批准语义**（总师裁定 R4 原文）。
+- `work_cap` 组把 `MAX_SCAN_WORK` **在测试内**缩小到 1.5 M 以把墙钟压到可跑范围
+  （**代码路径不变**，只是更快触顶）；另有 `test_r4_work_cap_at_production_cap`
+  用**生产取值**（200 M）单独钉住可达性与方向。
+- 覆盖度自证：`test_r4_three_states_all_covered_by_thousands` 断言三态**各 ≥ 1 200**；
+  缺口复现：`test_r4_g1_fuzz_covers_no_degradation_reproduced` 断言 G1 形态
+  **零降级**且 body < 5 000 B（把"为什么要补 R4"钉死）。
+
+### 25.6 R1–R5 收口留痕（总师裁定 `A⊕B` · 2026-09-19T00:26:34Z）
+
+> **范围冻结**：只改文档/断言/数字与实现同源 + 补降级区间 fuzz；
+> **未改** `_scan_diag` 逻辑、**未改**常量取值、**未改**消费侧接线。
+
+| # | 项 | 落地 | 可复跑判据 |
+|---|---|---|---|
+| **R1** | 断言同源 | ① 改为「候选 `p` 到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`」；② 加前提「仅在 `degraded=False` 时成立」+ 明示降级允许丢段 | `TestR1AssertionsMatchImplementation`（源码护栏 ×2 + **反例** ×2 + 正向 ×1） |
+| **R2** | 归因 B | 删「缺一不可」；写明 ① = **冗余兜底** / ② = **承载上界**（`trail.py` 常量注释 + `_scan_diag` docstring + `docs/secretary-collab-rules.md` + 本台账 §25.2） | `TestR2AttributionIsRedundantFallback`（源码护栏 + **消融** ×2） |
+| **R3** | 数字可复跑 | 语料最大候选距离 **4 842 → 5 289**（`state-secretary/src/secretary/loop/loop_guard.py`；台账 ×6 = 5 273；余量 54× → **≈49.6×**）；fuzz **60 000/30 000 → 42 000/12 000**（12×3 500 / 6×2 000）；1 MB `0.0001 s` → 标注**来自 `DEFAULT_SCAN_BUDGET` 截断**（`budget=len` 时 0.0026 s）；折算比 **1.1/1.2/5.6 → 统一 2.0 ns/单位**（测量形态 `"{}"×500 000`，`dt/work`）；删「×12 恰在上界附近」→ **×11 起即 `truncated`**（`DEFAULT_SCAN_BUDGET` 口径） | 数字均可在本台账/源码/用例内复跑；`pytest -k "R1 or R2 or R3 or R5"` |
+| **R4** | 降级 fuzz | 见 **§25.5**（三态 13 200 组） | `TestR4DegradedFuzz` |
+| **R5** | 判别力 | `test_g7_accounting_covers_measured_worst_case` 改造为**消融敏感**（绑 `_SCAN_CANDIDATE_COST` 的**记账量差 > 10×**，确定性、不受机器速度影响）；另加 cap→1e9 消融**恒真对照** | `TestR5DiscriminatingPower` |
+
+**全量自测（`0dec921` + R1–R5）**：`pytest -q` → **1145 passed**（基线 `0dec921` **1119** + 新增 **26**）。
+
+**判别力自证（把新用例放回 `0dec921` 的实现/文档上跑）**：`-k "R1 or R2 or R5"`
+→ **3 failed / 8 passed** —— 失败项 = R1 源码护栏 ①、R1 `degraded=False` 前提护栏、
+R2「缺一不可」护栏。⇒ **非恒真断言**。
+
+**归因消融（复跑）**：
+
+| 输入 | both | ①`MAX_RESCAN_LEN→1e9` | ②`MAX_SCAN_WORK→1e18` |
+|---|---|---|---|
+| `adv320 = '{"k":1, '×40000 + '}'` | **0.0034 s** | **0.0062 s** | **2.8619 s** |
+| `micro = "{}"×500 000` | **0.3950 s** | **0.3839 s** | **1.0078 s** |
+
+⇒ ① 去掉无实质变化（同量级）⇒ **① = 冗余兜底**；② 去掉才失控 ⇒ **② = 承载上界**。
+
+**R1 两条反例（复跑）**：
+
+- ① 含内层 `}` 的 **5.2 MB** 合法对象（`'{"a":"}"' + ',"b":"' + "x"×(5 MiB) + '"}'`）
+  → `json_objects_in_diag` **`n=1`**（**未被跳过**；`degraded=True` 只因
+  `DEFAULT_SCAN_BUDGET` 截断，`reason="truncated"`）。
+- ② **14 B** 的 `{"wake":false}` 接在 400 000 个 `{}` 之后 → `reason="work_cap"`、
+  **卡被丢**，而基线 `_baseline_objects()` **捞得到**（`LOST>0`）。
+
+### 25.7 复评第 8 轮：R1–R5 之后的**实现级** 🔴（评审自我更正）
+
+> **评审自我更正（2026-09-19）**：我在 §25.6 判 `proceed` 并已投「架构·测试」接力卡，
+> **该结论错误、已撤回**。原因：R1–R5 的"同源"是**二阶**的——它建立在
+> 「记账口径 / 上界语义与实现同源」之上，而**这一层本身未成立**。
+> R1–R5 落地 **≠** 门禁通过。**未收到 `awakened` 回执，未造成误放行。**
+
+| # | 缺陷（我独立复跑，非采信） | 实测 |
+|---|---|---|
+| **🔴-1** | `charge = pos` **未覆盖** `raw_decode` 实扫量；`limit` **不是**扫描边界（`_scan_diag` 把**整段 `text`** 交给 `raw_decode`） | `'{"a": "}' + "x"×N`：N=5/50/200 MB → 记账恒 **1 001 039**（0.501% cap）、实扫 ≈ N、折算比 **3.3 / 32.7 / 130.9 ns/单位**；`scan_json_spans_diag('{"a": "}"}', 8)` → 片段 **10 字符 > budget=8** |
+| **🔴-2** | `MAX_RESCAN_LEN` **不约束被解析对象长度**（窗口只用于"找 `}`"，命中即对整段 `raw_decode`） | 扁平 `json.dumps({"pad":"z"×(L+10)})` → `0 片段 + rescan_len` ✅；串内含 `}` 的 `'{"a": "}' + "y"×(L*3) + '"}'` → 片段 **786 442 > L=262 144**、`degraded=False` ❌ |
+| **🔴-3** | 「余量 ≥5×」**只在台账样本成立** | 台账 ×5（491 655 字符）work = **39 493 168** ⇒ **5.06×**；把**每个真实文件**重复到 417 480 字符后，**84 个文件里 19 个 < 5×**，最差 **1.00×**（`tests/test_collab_round6_fixes_issue14.py`，work=199 844 416） |
+| **🔴-4（我自己）** | §25.6 把"3 个构造里测得的最坏值"写成「**实测上界 2.0 ns/单位**」——与总师点名要治的"把测得值写成必然上界"**同族** | 真实最坏 **≥ 272 ns/单位且无界** |
+
+**处置**：撤回 `proceed`；接力卡（评论 `2101121136137707520`）**作废**；**不转「架构·测试」**。
+**需总师裁定**（**必须动实现**，超出本轮冻结范围，已上报）：① 批准 `raw_decode` 窗口化
+（`[p, min(limit, p + MAX_RESCAN_LEN))`）+ 失败按窗口长度记账 + `budget` 兼作返回边界
+（**同时闭合** 🔴-1/🔴-2）；② 修后 `MAX_SCAN_WORK` 两侧重标定 + 「真实正文」口径（台账 vs
+本仓最密真实文件）落文；③ 是否接受"只修 🔴-1/🔴-2 + 重标定，不动已通过的 G1/G4/G5/G6/G8"；
+④ 🔴-4 由评审同批自纠（已改：只写实测值 + 测量形态 + 明确"不是上界"）。
+
+---
+
+## 26. Issue #21 · G8 与「≥ 417 K 真实正文」反误降级对照（承接 CP1 `0b129dc`）
+
+> 触发：架构·总师裁定（PR #15 @ `9382552` · 2026-09-18T22:00:44Z）——**新增验收项 G8**
+> （`budget <= 0` 不得绕过降级规则，与 **G4 同批**落地，**不得单独**）+ 本轮**重申**的两条
+> 口径修正：**禁止纯回退**、**`G3/G4/G5 必须同批`**（只修记账 = 新 fail-open，触发于
+> **417 K 非对抗正文**）。
+>
+> 本段为 **CP1（`0b129dc`）之上的增量**：G1–G7 已在 §25 留痕，本轮只补 **G8** 与
+> **≥ 417 K 反误降级对照**。**不引入新机制**。
+
+### 26.1 G8：`budget <= 0` 与截断是**同一条规则**
+
+| 项 | 缺陷（总师独立复现） | 修法 | 判别性判据 |
+|---|---|---|---|
+| **G8** | `scan_json_spans_diag` 的 `if limit <= 0: return out, False` 位于 `degraded = limit < len(text)` **之前**提前返回 ⇒ 非空正文被「整段截断」却**不标记**（实测 `([], False)`） | **删掉该提前返回**：`limit` 一律交给 `_scan_diag` 的**唯一那条规则**（`limit < len(text)` ⇒ `truncated`；`limit = 0` 时该式自然成立）⇒ 降级**只有一个判定处**（单一语义源） | `scan_json_spans_report(text, 0)` / `json_objects_in_report(text, -5)`（`text` 非空）→ `degraded=True` + `reason="truncated"`；**源码护栏**：该函数体内不得出现 `limit <= 0` / `limit < 1` 的早退；**反向对照**：**空正文**任何 `budget` 都**不**降级 |
+
+- **口径归属**（总师明示）：G8 与 **G4（降级契约）同批**，**不是**新语义——
+  `limit=0 < len(text)` 本应为 `True`，属"提前返回绕过已定规则"。
+- **同批理由（重申）**：`cost = pos`（G3）单独落地时，台账 ×5（417 480 字符）
+  即触上界、卡被吞，且落在**非对抗正文**上 ⇒ 单修记账会把 CP1 变成**新的 fail-open
+  通道**。故 G3/G4/G5/G8 **必须同批**（本轮一并校验）。
+
+### 26.2 ≥ 417 K 真实正文**反误降级**对照（[HIGH]）
+
+| 判据 | 实测 |
+|---|---|
+| 台账 ×1…×8（92 K → 742 K） | **不降级**（`degraded=False` / `reason=""`），静默卡**始终可见** |
+| **台账 ×5 = 463 550 字符（≥ 417 480）** | `degraded=False`；端到端 `from_handoff` → `fused=True` / `wake=False`；`adopt_budget` → `degraded=False`、`round_no=4`（**卡不丢**） |
+| 台账 ×16（~1.5 MB > `DEFAULT_SCAN_BUDGET`） | **允许**保守降级（`truncated`）—— 判据是**方向保守**（`fused=True` / `wake=False`），不是"永不降级"（后者 = 无上界 = O(n²) 回归） |
+| 余量 | 台账 ×5 的记账量 **32.3 M** ≪ `MAX_SCAN_WORK` **200 M**（**6.2× ≥ 5× 硬要求**，裁定明示） |
+| **同批另一半** | 含 `}` 对抗输入仍被上界拦住（`degraded=True` + `work_cap` / `rescan_len`） |
+
+⇒ "真实正文不误降级"与"对抗输入被上界拦住"**必须同时成立**：只满足其一都是失真
+（前者缺 = 上界过小（新丢卡）；后者缺 = 上界失效（O(n²) 回归））。
+
+### 26.3 自测
+
+- `pytest -q`：**1118 passed**（CP1 基线 `0b129dc` **1099** + 本轮 **19** 项），
+  连跑稳定；`compileall src tests` OK；`pyflakes`（改动 + 新文件）**0 告警**。
+- **判别力验证（两级基线，均非恒真断言）**：
+  - 放到 **`9382552`**（scan 重做前）上跑 G8 + 反误降级两组 → **9 failed / 10 passed**
+    （**实测命令**：把本文件拷入 `9382552` worktree 后 `pytest -k "g8 or ReverseControl"`）。
+    失败项 = G8（`budget<=0` 未标记：4 项）+ ≥ 417 K 对照（`degraded` 外露缺失 /
+    `_scan_diag` 缺失 / 对抗输入未降级 / 静默收摊 / 记账余量：5 项）。
+  - 放到 **CP1 `0b129dc`**（本轮的直接前驱）上跑同两组 → **3 failed / 16 passed**，
+    失败项恰好对应本轮新增的三件事：
+    ① `test_g8_same_rule_as_truncation_is_the_shared_source`（**源码护栏**：
+    CP1 里 `limit <= 0` 的**提前返回**仍在 ⇒ 降级有两个判定处，违反"单一语义源"；
+    G8 的"取值"用例在 CP1 上**通过**正是因为那个提前返回**碰巧**给出了 `True`）；
+    ② `test_g8_end_to_end_conservative_on_zero_budget`（CP1 未从包出口导出
+    `extract_json_objects_diag`）；③ `test_reverse_ledger_x5_adopt_budget_not_degraded`
+    （CP1 的 `adopt_budget` 返回值**未外露** `degraded`，≥ 417 K 的观测面缺失）。
+- **G8 判别性口径**（总师原文）：`scan_json_spans_report(text, 0)` 与
+  `json_objects_in_report(text, -5)`（`text` 非空）→ `degraded=True`；
+  **空正文** → `False`（反向对照）。
+
+### 26.4 风险与边界（主动暴露，不吞）
+
+- **`[MEDIUM]` 超 `MAX_RESCAN_LEN` 的合法长对象被跳过** —— 但**显式降级**
+  （`degraded=True` + `reason="rescan_len"`），消费侧取保守方向，**不是静默丢卡**。
+  取值有实测依据（全仓语料最大 5 289，≈49.6× 余量）+ 反向对照。
+  语义判据（**同源**）：「候选 `p` 到窗口内首个 `}` 的距离 > `MAX_RESCAN_LEN`」。
+- **`[LOW]` 上界附近的规模是"允许保守降级"区间**：**实测 ×11 起即 `truncated`**
+  （台账 ×11 ≈ 1.02 MB > `DEFAULT_SCAN_BUDGET` 1e6 字符）。
+  **判据是方向保守**（`fused=True` / `wake=False`），不是"永不降级"
+  ——后者等于无上界 = O(n²) 回归（`test_reverse_beyond_margin_degrades_conservatively` 钉住）。
+- **`[INFO]` 预存 flaky 用例（**非本轮引入**）**：`tests/test_state_manager.py::
+  test_session_id_path_traversal_guard` 断言"父目录（`/tmp`）下不得有名字含 `evil` 的条目"
+  —— 该断言依赖**环境**：`/tmp` 里任何名字含 `evil` 的条目（含**其他进程**的临时目录）
+  都会让它失败（本机实测触发一次，概率量级 ~1e-6/次）。**属 `main` @ `de5eae8` 既有代码**，
+  本轮 diff **未触碰**该文件（`git diff 0b129dc 9382552 -- …test_state_manager.py` 为空）。
+  **不吞**：登记为待收口项（修法是"只检查本次会话应有的文件"，而不是扫父目录全量）；
+  **本轮不动**（范围冻结：Issue #21 只承载 scan + 降级契约 + 消费侧接线）。
+
+---
+
+## 27. Issue #21 · 🔴-1/🔴-2 定点修复（**总师裁定四条同批** · PR #15 源分支 · 2026-09-19）
+
+> 触发：架构·总师裁定（PR #15 · 承接 §25.7 的 4 项上报）——**批准修**，附 **3 项前置条件**
+> + 1 项范围修正：① 修法必须**闭合降级方向**（不能只闭合记账）；② 口径单源（`≥5×` 绑定
+> **台账代理**）；③ **G3/G7/R1 耦合断言必须同批改**（"不动已通过的 G3/G7"技术上不可实现）；
+> ④ `trail.py` 同类失真句一并改、修后折算比**必须重测**。
+
+### 27.1 修法（四条同批 · `state-secretary/src/secretary/trail.py`）
+
+| # | 条款 | 落地 |
+|---|---|---|
+| 1 | **两级切片**（不得恒切片） | 候选 `p` 先在 `[p, close+1]`（`close` = 窗口内首个 `}`）上 `json.loads`（快乐路径）；失败再对**窗口** `[p, min(limit, p + MAX_RESCAN_LEN))` 起算 `raw_decode`。解析**只喂窗口** ⇒ 实扫有界 |
+| 2 | **失败按窗口长度记账** | `charge = window_end - p`（含真实实扫量）。旧口径 `pos` 会漏掉 C 解析器"扫到错误位置"之前的实扫量 —— 正是"记账脱钩"来源 |
+| 3 | **`budget` 兼作返回边界** | 任何返回片段都落在 `text[:limit]` 内；`MAX_RESCAN_LEN` **真的**约束被解析对象长度 |
+| 4 | **窗口绑定失败 ⇒ 置 `rescan_len`** | 仅当 `we < limit` **且** `_window_cut_the_parse(exc, window)` 判"边界切断"（`RecursionError` / 字符串未闭合 / 错误位置落在窗口末字符 / 后缀是"被截断的字面量前缀"） |
+
+**为什么第 4 条必须带"边界切断"这一层**（总师点名 `[HIGH]`）：只按 `we < limit` 置位，
+会把正文里**本来就不是 JSON 对象**的候选（`{"id":…`）全判降级 —— 实测台账 ×5
+**误降级 62 次**（真值 0），台账 ×4…×16 全部翻成 `degraded=True`，
+直接违反"≥ 417 K 真实正文不误降级"。
+
+### 27.2 定点复现（修前 → 修后 · 均可复跑）
+
+| 缺陷 | 修前 | 修后 |
+|---|---|---|
+| **🔴-1a** `budget` 非扫描边界 | `scan_json_spans('{"a": "}"}', 8)` → **10 字符 > 8** | `[]`（`degraded=True` / `truncated`） |
+| **🔴-1b** 记账脱钩 / 耗时无界 | `'{"a": "}' + "x"×N`，N=5/50/200 MB → 记账恒 **1 001 039**、dt **0.0054 / 0.0525 / 0.2055 s** | 记账恒 **1 263 177**、dt 恒 **0.0003 s**（折算比 0.23–0.28 ns/单位**恒定**） |
+| **🔴-2** 上界不约束对象长度 | 串内含 `}` 的 **786 442** 字符合法对象 → `n=1`、`degraded=False` | `n=0` + `reason="rescan_len"` |
+| **降级方向（新 fail-open）** | 字面修法 → 窗口切片失败即 `n=0` **且** `degraded=False` | `we < limit` **且**边界切断 ⇒ `rescan_len`（显式） |
+
+### 27.3 口径单源（总师裁定 ②）与修后重标定
+
+- **口径 = 真实交接正文的代理 = 台账（本文件）**：
+  台账 ×5（**500 340 字符 ≥ 417 480**）修后 `work = **31 551 802**` ⇒ **6.34×**（≥5× 达标）。
+  台账 ×8 = 3.40× **仍不降级**；×16 = 1.52× 因**超 `DEFAULT_SCAN_BUDGET`** 判 `truncated`（非 `work_cap`），方向保守。
+- **最密真实文件登记为"允许保守降级区间"**：把每个真实文件重复到 417 480 字符后，
+  **84 个文件里 15 个余量 < 5×**，最差 **1.16×**（`tests/test_collab_round6_fixes_issue14.py`，
+  `work = 171 704 178`，**未降级**）。**不**作"不得降级"硬门槛；**不批准**抬 cap 到 ~1 G
+  去凑最密口径（实测 cap=1 G 时微对象密集 ≈1.5 s，侵蚀 G6(<1 s)/G7(<2 s) 时间预算）。
+- **消融复测（修后）**：`adv320` both **0.0027 s** / cap→1e9 **0.0124 s** / work→1e18 **0.6366 s**；
+  `micro` 0.5736 / 0.5639 / 1.4719 s ⇒ 归因不变（① 冗余兜底 / ② 承载上界）。
+
+### 27.4 G3/G7/R1 耦合断言**同批**改（总师裁定 ③ · 附判别力自证）
+
+| 断言 | 修前 | 修后（同批改） |
+|---|---|---|
+| `test_g3_failure_charge_is_*` | 断言 `charge = pos if` 存在 | 断言 `charge = window_end - p` 存在 + `pos if` 不得出现（口径随修法改） |
+| `test_g7_docstring_assertion_matches_implementation` | 断言 src 含"错误位置"/"pos" | 断言 src 含"只喂窗口"/"窗口长度"/`_SCAN_CANDIDATE_COST`/"记账脱钩" |
+| `test_r1a_long_object_with_inner_close_brace_is_not_skipped` | 断言 >L 对象 **`n=1` 未跳过**（= 🔴-2 缺陷行为） | 拆为 4 项：超界 → 拒绝 + `rescan_len`；窗口绑定失败 → 显式降级（非静默）；`budget` 是扫描边界；记账不脱钩 |
+| `test_reverse_calibration_has_margin_beyond_417k` | `xfail(strict=True)`（修前 4.50× < 5×） | **转真断言**（修后 6.34× ≥ 5×）+ 新增最密文件"登记区间"用例 |
+
+**判别力自证（把新断言放回旧实现 `f6205c6` 的 `trail.py` 上跑）**：
+`pytest -k "r1a or r1b or g3 or g7 or reverse_calibration or densest"` →
+**8 failed / 14 passed**。失败项 = 新 G3 源码护栏、新 G7 同源护栏、
+R1a 四项（超界返回 / 静默丢 / `budget` 非边界 / 记账脱钩）、
+反向对照两项（余量 4.50× < 5×、最密形态触顶）⇒ **非恒真断言**。
+
+### 27.5 自测
+
+- `pytest -q`：**1149 passed**（修前 `f6205c6` **1144 passed + 1 xfailed**；xfail 转真断言、
+  新增 4 项 ⇒ 1149）。
+- **真实语料 0 误降级**：84 个文件（`issues/*.md` / `docs/**/*.md` / `src/**/*.py` /
+  `tests/*.py`）逐一扫描 → `degraded` 全为 `False`。
+- **穷举验证"边界切断"判据**：对随机合法 JSON 值的**全部前缀截断**（12 176 例）
+  命中率 **100 %**（0 漏）⇒ 窗口切片失败**不会**静默丢。
+- **对抗输入仍 < 1 s**：`micro = "{}"×500 000` **0.59 s**、`adv320` **0.0027 s**、
+  `"{"×999 000 + "}"` **0.087 s**、`if (x) {`×50 000 **0.022 s**（G6/G7 钉住）。
+
+---
+
+## 28. Issue #22 · 精化口径补落（CP3 · 2026-09-19）
+
+**触发**：架构·评审在 PR #15 `5f3cb96` 上**撤回 `proceed`、改判 `[回转] 退回:架构·开发`**
+（评论 `2101142603969703936`），要求按**总师精化裁定**（`2101139351265976320`，
+2026-09-19T02:40:33Z）**同批**补齐 6 项。承接：CodeBuddy（原「架构·开发」流水线
+`cnb-teg-1k2sj1s9b` 在 34 分钟后自我回滚、未留痕，已停止并由本棒承接）。
+
+**交付分支/PR**：`auto/loop-guard-e356`（**同分支同 PR**，PR #15 维持 blocked、不合并）。
+
+### 28.1 六项落地对照
+
+1. **扩窗条件收紧**（§二-②）
+   - 落地：`_decoder_exhausted_input(exc, short_len)` —— `RecursionError` /
+     `Unterminated string` / **错误位置越过短切片末尾**；否则只按**短切片长度**记账。
+   - 判据：`TestCP3RefinedRulingBehaviours::test_6_*`
+     （1 103 个失败候选里扩窗 **202**，收紧前 100 %）。
+2. **记账 = 该次实际喂入解码器的字符数**（§二-③）
+   - 落地：短切片成功 `close - p`；短切片失败 `max(close - p, 实际喂入)`；
+     整窗失败 `window_end - p`。
+   - 判据：`test_g3_failure_charge_is_window_length_not_pos_minus_p`（源码护栏随口径改）。
+3. **`MAX_SCAN_WORK = 240_000_000`** + 两档口径写进常量注释（§三）
+   - 落地：常量已改；注释写明**承诺档**（输入域正文/台账）与**压力档**
+     （全仓任意文本 @417 480）各自余量。
+   - 判据：`test_7_commitment_tier_margin_at_least_5x` /
+     `test_8_pressure_tier_is_logged_conservative`。
+4. **上侧重测**，删「折算比不再随正文线性增长」类声明（§三）
+   - 落地：注释改为**实测 dt + 测量形态**（深嵌套 d=3000 → `dt 0.1955 s`、
+     `work 28 127 077`；d=6000 → `dt 0.4921 s`；折算比 0.38–18.91 ns/单位，
+     **因形态而异**）。
+   - 判据：`test_9_worst_case_dt_is_remeasured_and_bounded`。
+5. **行为级回归 ①–⑤** —— `TestCP3RefinedRulingBehaviours` 16 项，见 §28.3。
+6. **精化版上重跑 fuzz**（判据：`degraded=False` 时 `LOST=0`）
+   - G1 差分 fuzz **42 000 组**（12 seed × 3 500）重跑 ⇒ **`LOST=0`**（逐 seed 打印 0）。
+
+### 28.2 修后实测（可复跑）
+
+- 压力档最密文件 @417 480 记账：**171 704 178 → 168 464 154**
+  （扩窗收紧：1 103 个失败候选里 927 个普通语法错改为只按短切片记账）。
+  ⚠️ **本轮（§29）订正**：上述"927 个普通语法错"与 `168 464 154` 均为**失真读数**
+  —— 实测 **A_true 202 / A_false 901**，且旧实现 A_false **仍重取窗口**（记账取
+  `max`）⇒ 该收紧对记账**零影响**。修后实测 **29 946 906**（见 §29.2）。
+- 压力档最密 @ cap=240 M 余量：1.40× → **1.42×**（< 5×，**登记为保守区间**）。
+  ⚠️ **本轮（§29）订正**：余量 **8.01×**（≥5×）——旧 1.42× 是失真读数。
+- 承诺档（台账 ×5）：31 562 764 → **33 939 522** ⇒ **7.07×** ✅
+  （≥5× 达标）。
+  ⚠️ **本轮（§29）订正**：实测 **8 959 428** ⇒ **26.79×**（≥5×）。
+- 未闭合巨尾 5/50/200 MB：记账恒 1 263 177、dt 恒 0.0003 s（不变；
+  另新增"记账 ≥ 实扫"行为级断言）。
+- `MAX_SCAN_WORK`：200 000 000 → **240 000 000**。
+- `adv320` / `micro`：0.0027 / 0.39 s → **0.0027 / 0.36 s**。
+- 深嵌套最深形态触发顶时最坏 dt：**≈0.49 s**（d=6000 为 0.4921 s，< 2 s）。
+  ⚠️ **本轮（§29）订正**：该说法**随解释器翻转**（3.11 d=8000 未触顶 dt 0.6865 s；
+  3.13 d=12000 未触顶 dt 2.21 s、d=14000 3.65 s）⇒ 判据已改**形态无关**（§29.4）。
+
+**消融复测（修后，`adv320`）**：both **0.0027 s** / ①→1e9 **0.0195 s**（仍被 ② 拦住）/
+②→1e18 **0.5420 s**（失控）⇒ 归因不变（① 冗余兜底 / ② 承载上界）。
+
+### 28.3 行为级回归 ①–⑤（16 项，**非**源码护栏）
+
+- **①** 未闭合串 + 巨尾（含 `budget=1000`）记账 ≥ 实扫：
+  `test_1_unterminated_string_with_giant_tail_accounts_ge_real_scan`、
+  `test_1_budget_1000_*`。
+- **②** 串内含 `}` 的 >L 对象 → `rescan_len`：
+  `test_2_long_object_with_inner_close_brace_flags_rescan_len`
+  （+ 反向对照：含内层 `}` 的小对象**必须**返回）。
+- **③** 台账 ×1…×8 `deg=False`：`test_3_ledger_x1_to_x8_not_degraded`
+  （7 档；防朴素版回归）。
+- **④** G6 1 MB 臂改 `budget=len(text)`：`test_4_g6_1mb_arm_uses_full_budget`
+  （满 budget → `work_cap`；默认 budget → `truncated` 干扰）。
+- **⑤** 数字口径修正：`test_5_accounting_numbers_match_implementation`
+  （记账 < 摊派下界）。
+- **判别力**：`test_6_widening_tightening_is_discriminating`（扩窗比例 ≤25 %）。
+- **两档口径余量**：`test_7_*`（承诺档 ≥5×）、`test_8_*`
+  （压力档登记为 1.42× 保守区间、但不得触顶）。
+- **上侧重测**：`test_9_*`（最坏 dt < 2 s，cap 钉在 240 M）。
+
+### 28.4 实现在途修正（**如实登记**，两处）
+
+两处都是本棒落地时**先挖出来的坑**，修好后才有 §28.2 的数字：
+
+1. **短切片失败的起点推进**：把 `i` 推到 `exc.pos` 或 `close`，都会**跨过真实对象
+   起点**（实测 `'{"{' + CARD`：`pos=5`、真身起点 `3`）⇒ G1 fuzz **164 组丢卡**。
+   最终口径：短切片失败仍按**旧语义在窗口上重取 `raw_decode`**（保证超集召回），
+   A 组判据**只决定记账多少**（`max(短切片长度, 实际喂入)`），不决定"喂给谁"。
+2. **A 组判据只看异常类型会漏嵌套对象**：`{"fused": …, "rounds": {"total": 4}, …}`
+   的短切片被**内层 `}`**定位得过早（`pos=38 ≥ short_len-1=37`），而整串
+   `raw_decode` **成功**（`end=75`）⇒ 只看 `Unterminated string` / `RecursionError`
+   会让 `CARD_OBJ` **直接消失**。故加第三条命中：**错误位置越过短切片末尾**。
+
+### 28.5 自测
+
+- `pytest -q`：**1164 passed**（基线 `5f3cb96` = **1148 passed**；本轮新增 16 项）。
+- **G1 差分 fuzz**：42 000 组（12 seed × 3 500）**`LOST=0`**（逐 seed 复跑）。
+- **`MAX_SCAN_WORK`**：240 000 000（裁定值）；**`MAX_RESCAN_LEN`**：262 144（不变）。
+- ⚠️ **环境态失败（与本改动无关）**：
+  `tests/test_state_manager.py::test_session_id_path_traversal_guard` 在**未改动的
+  基线**上同样失败（临时目录名里含 `evil` 字样，属环境命名产物），非本分支引入，
+  登记备查。
+
+## 29. Issue #22 · 复评第 3 轮 3 项 🔴 定点修（2026-09-19 · PR #15）
+
+**触发**：架构·评审在 PR #15 `6265513` 上 `[回转] 退回:架构·开发`，裁定"六项行为级
+主体已落地，但新增/改动行里发现 3 项 🔴（记账口径与声明不同源 / 新判据空转 +
+失真声明 / 上侧数字失真 + 新用例随解释器翻转）"，按门禁 **🔴 未清零不放行**。
+范围收紧：**只做 3 项定点修 + 1 条用例阈值**，不跑全量。
+
+**交付分支/PR**：`auto/loop-guard-e356`（**同分支同 PR**，不新建）。
+
+### 29.1 定点修对照
+
+| # | 评审事实 | 修法 | 修后实测（CPython 3.11.16 / 2 核） |
+|---|---|---|---|
+| 🔴-1 | 未命中分支仍重取窗口，记账取 `max` ⇒ **漏记短切片那次喂入**：实喂 **189 146 458** vs 记账 **168 464 154**（少记 **20 682 304 / 10.93 %**，fail-open） | `fed = short_fed + window_fed`（**各次喂入相加**）；短切片未命中 ⇒ `fed = short_fed`（不喂窗口）。常量注释写明该式 | 最密 @417 480：记账 **29 946 906**、`work ≥ 实喂`（实喂 27 609 550）；余量 **8.01×** |
+| 🔴-2 | A 组判据"读了不生效"（消融 delta 全 0）+ 注释写"0 个耗尽输入 / 927 个普通语法错"（实测 A_true **202** / A_false **901**） | ① 未命中**不扩窗**（既不喂窗口也不记窗口量）⇒ 判据真生效；② 删失真声明、改实测 A_true/A_false；③ 补**判别性用例**（消融后记账必须变） | 消融（强制 `→True`）记账：最密 **29 946 906 → 191 483 814**（**6.39×**）；台账 ×5 **8 959 428 → 35 828 982**（**4.00×**）。旧实现 delta **恒 0** |
+| 🔴-3 | "d=12000 触顶 dt 0.3817 s""最坏 ≈0.49 s"不成立；`test_9`（断言 < 2 s）**3.11 通过 / 3.13 失败** ⇒ 结论随解释器翻转 | ① 注释改**实测 dt + 测量形态 + 解释器**（3.11 与 3.13 两档）；② `test_9` 改**形态无关**判据（未触顶档记账**单调** + 触顶档**必降级**），删硬 2 s | 3.11：d=6000 未触顶 dt 0.6164 s、d≥8000 触顶 dt 0.15–0.41 s；3.13（总师）：d=12000 2.21 s / d=14000 3.65 s |
+
+**🔴-2 的结构性论据（为什么不扩窗不丢对象）**：窗口以短切片为**前缀**，`close` 是窗口内
+**首个** `}`；若窗口 `raw_decode` 能解出对象（长度 `rel`），则 `rel >= short_fed`，且
+`rel == short_fed` 与"短切片失败"矛盾 ⇒ `rel > short_fed` ⇒ 失败点必在 `close`
+（`Unterminated string` 或 `pos >= short_fed - 1`）⇒ A 组**必命中**。实测复核：最密
+@417 480 的 **901** 个 A_false 里窗口成功 **0** 次；G1 fuzz 语料 A_false **105 203** 个、
+窗口成功 **0** 次。
+
+### 29.2 修后重标定（数字订正）
+
+| 口径 | 旧读数（失真） | 本轮实测 | 余量 |
+|---|---|---|---|
+| 压力档最密 @417 480（截断） | 168 464 154（1.42×） | **29 946 906** | **8.01×** ✅ |
+| 承诺档 台账 ×5（538 146 字符） | 33 939 522（7.07×） | **8 959 428** | **26.79×** ✅ |
+| 台账 ×8（860 988） | — | **16 649 412** | **14.41×** ✅ |
+| 最密文件重复形态（422 604，`test_reverse_densest_*`） | 171 704 178 | **30 481 050** | **7.87×** ✅ |
+
+### 29.3 🟡 顺手（同批）
+
+1. `trail.py:151` 的"余量 7.63×"→ 已删，改 26.79×（并标注口径）。
+2. `:484` 与 `:139` 两处失真数字 → 已订正为 A_true **202** / A_false **901**。
+3. 两个近重复分支（`:499–516` / `:517–533`）→ **合并**为"先取窗口量、再按 A 组决定
+   记账"（单一 `fed = short_fed + window_fed`）。
+4. `test_issue21_scan_rework.py` 死变量 `dec` → 已删（`pyflakes` 零告警）。
+5. `test_8` 硬断言 `margin < 5.0`（修好 🔴-1 后**反向失败**）→ 改"**登记 + 不触顶**"
+   （断言实测值写进常量注释 + `work < cap` + `deg=False`）。
+
+### 29.4 🟢 口径标注
+
+docstring 引用的数字统一标注**口径**（语料 / 是否截断 / 解释器）；"44.6 M"保留为
+**裁定原始出处**，并**显式声明本实现上从未出现**（实测最小 4.72 M）。
+
+### 29.5 自测（只跑该文件，按人类要求不跑全量）
+
+- `pytest tests/test_issue21_scan_rework.py -q`：**126 passed**（87.6 s）。
+- 独立 fuzz（额外加跑，非台账基线）：**90 000 组**差分（60 seed × 1 500），
+  `degraded=False` 时 **LOST=0**。
+- 相邻扫描相关文件回归：`round3/4/5/6/7/8 + ho_ref + session + loop_guard`
+  **570 passed**。
+- `pyflakes tests/test_issue21_scan_rework.py`：**零告警**。
+
+<!-- 以下为 main 分支已合并的台账段（原 §15/§16/§29，因与本 PR #15 段编号冲突，合并后顺延为 §30/§31/§32） -->
+
+
+---
+
+## 30. Issue #14 增量跑测门禁（只跑有效增量 · 反全量冗余 · 计数权责一致）
 
 > 触发：用户 Issue #14 口径——「只跑增量；可以漏，但不得大量重复冗余；
 > 跑多少写多少，不要写全量；全量须标记已跑过项；过程可视化」。
 > 交付：`secretary.gate`（新增模块）+ `poc/incremental_gate.py`（CLI）+
 > `tests/test_incremental_gate_issue14.py`（72 项）+ 契约文档。
 
-### 15.1 三态口径（唯一语义源）
+### 30.1 三态口径（唯一语义源）
 
 | 状态 | 含义 | 处理 |
 |---|---|---|
@@ -977,7 +2059,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 
 关键纠偏：**"改动" ≠ "不用跑"**。改动属消解，与"已跑过的既有项"分流处理。
 
-### 15.2 不变量
+### 30.2 不变量
 
 1. **计划跑测数 == 报告实跑数**（真实 pytest 汇总口径）；
 2. 任何"全量"表述必须**同时给出「已跑过」数**，否则拒绝落账；
@@ -987,7 +2069,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 6. 指纹缺失（浅克隆/diff 截断）→ 保守回退文件级消解（宁多跑，不漏跑）；
 7. **空计划 / 无法解析标的 → fail-fast**，绝不裸跑 pytest（防退化为全量）。
 
-### 15.3 计数口径（权责一致）
+### 30.3 计数口径（权责一致）
 
 - `assert_counter()` 拒绝：文本未含实跑数 / 「全量」措辞未标记已跑过项 /
   未给已跑过数 / 出现未声明计数；
@@ -998,7 +2080,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   `跑 69 个测试（全量 377 例中 308 例已跑过、默认不重复；本轮实跑 69 例）`；
 - `assert_ledger_counts()` 拦截台账漂移（历史曾 228/229 → 237 漂移）。
 
-### 15.4 全量告警视图
+### 30.4 全量告警视图
 
 ```
 == 全量跑测告警（已跑过项须标记）==
@@ -1012,7 +2094,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 逐项 `previously_run` 标记见 `full_sweep_view().to_dict()["items"]`。
 **首轮全量**（无历史基线）放行。
 
-### 15.5 判别力（防恒真 · 复评第 2 轮实测）
+### 30.5 判别力（防恒真 · 复评第 2 轮实测）
 
 | 变异体 | 结果 |
 |---|---|
@@ -1029,7 +2111,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 | M12 全量规模回退为 `planned+deferred+excluded` | **11 FAIL** |
 | M13 未核实计数仍放行落账 | **10 FAIL** |
 
-### 15.6 自测（复评第 2 轮）
+### 30.6 自测（复评第 2 轮）
 
 - 增量跑测（门禁自身）：`plan --base a455608` → 计划 **69 例**（新增 69），
   已跑过不重复 **308 例** → `run` 实跑 **69 例，通过 69，rc=0，🟢**。
@@ -1043,7 +2125,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   🔴-3 不变量 1 显式守卫 + 全量规模取实测收集数 + `cmd_full` 不冒充。
   🟡1–🟡7 全部落地（🟡2 明确**接线**：整文件重写判定已进门禁路径）。
 
-### 15.7 已知边界（不阻断，显式登记）
+### 30.7 已知边界（不阻断，显式登记）
 
 1. 用例主体文本哈希为失效粒度：同一用例 docstring 措辞改动也判消解 → 多跑，
    方向安全；
@@ -1054,13 +2136,13 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 
 ---
 
-## 十六、Issue #14 收口轮 · 全量复跑暴露的 🔴-C 修复（「查不到」≠「没有」）
+## 31. Issue #14 收口轮 · 全量复跑暴露的 🔴-C 修复（「查不到」≠「没有」）
 
 > 触发：用户指示"PR #19 已合并，尝试收尾"后**全量复跑**，实测 **2 项失败**。
 > 初判像"环境噪声"，追查确认是**两个真缺陷叠加**，且其中一个是本门禁
 > **最危险的失败模式（静默假绿）**。
 
-### 16.1 现象 → 根因
+### 31.1 现象 → 根因
 
 | 现象 | 根因 |
 |---|---|
@@ -1078,7 +2160,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 在留痕里与"本轮无需跑测"无从区分 → **假绿**。这正是用户反复强调要避免的
 "用低质量重复冒充安全"的镜像面（这里是用**空跑**冒充"已审"）。
 
-### 16.2 修复（🔴-C1 / 🔴-C2）
+### 31.2 修复（🔴-C1 / 🔴-C2）
 
 - **🔴-C1 沙箱封闭**：新增 `_hermetic_git_init()` —— `commit.gpgsign=false` +
   `tag.gpgsign=false` + `core.hooksPath=/dev/null`，**断言 commit 成功 + HEAD 存在**。
@@ -1093,7 +2175,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
     **绝不返回空计划**。
   - 与不变量 6（指纹缺失 → 保守回退文件级消解）**同源**：保守是本门禁的既定方向。
 
-### 16.3 判别性回归（`TestG14BaseUnresolvable`，5 项）
+### 31.3 判别性回归（`TestG14BaseUnresolvable`，5 项）
 
 | 用例 | 断言 | 变异判别力（实测） |
 |---|---|---|
@@ -1106,7 +2188,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 - **变异矩阵**：M17 / M18 / M19 分别触发 **2 / 1 / 5 FAIL**；本实现 **5/5 PASS** → 非恒真。
 - **跨版判别力**：本组用例移植到修复前 head → 确定性失败（无 `degraded` 能力）。
 
-### 16.4 自测（收口轮）
+### 31.4 自测（收口轮）
 
 - 本 PR 增量 = 门禁文件新增 5 例（72 → 77 项）+ 门禁文件自身在收口轮扩至 **89 项**。
 - **全量 pytest：397 passed**（连跑 3 次稳定）。
@@ -1118,12 +2200,12 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 
 ---
 
-## 29. Issue #24 · NPC 成本护栏（PR #26）
+## 32. Issue #24 · NPC 成本护栏（PR #26）
 
 > 交付物：`.cnb/npc.yml`（护栏配置）+ `state-secretary/tests/test_npc_cost_guard.py`（10 项）
 > + `docs/dsh-cost-guard.md`（取证与口径）
 
-### 29.1 缺陷（平台实测）
+### 32.1 缺陷（平台实测）
 
 | 项 | 实测 | 处置 |
 | --- | --- | --- |
@@ -1137,7 +2219,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
   ⇒ **加核不减时，只加钱**。
 - **最隐蔽项**：`DSH_MODEL` 写错**不报错**、静默升档，只能靠用量报表发现，故固化为断言。
 
-### 29.2 判别性回归（`TestNpcCostGuard`，10 项）
+### 32.2 判别性回归（`TestNpcCostGuard`，10 项）
 
 三层断言：值 / 值**来源**（`cpus` 只能有一处）/ 声明与实现同源（注释实测数字 == 常量）。
 
@@ -1147,7 +2229,7 @@ M2 移除台账存活守卫 → G5 失败；M3 跳过来源 2 → G3 失败。�
 | M2 `timeout: 2h` → `10h` | 2 |
 | M3 模型名去点 | 2 |
 
-### 29.3 台账期望值同步（G1/G8）
+### 32.3 台账期望值同步（G1/G8）
 
 新增测试文件使 `plan_sweep` 计划面由 1 个文件变 2 个，G1「小增量只落一个文件」与
 G8「中等增量对照 == 2」两处硬编码期望值需同步。
@@ -1157,14 +2239,14 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 共用会把"基线早于某文件"混成"门禁夹带"。已在注释写明这是**期望值需要维护**，
 不是门禁缺陷（门禁行为未变）。
 
-### 29.4 自测
+### 32.4 自测
 
 - `test_npc_cost_guard.py`：**10 passed**；变异 M1/M2/M3 各触发 **2 FAIL**。
 - 全量 pytest：**407 passed**（连跑 2 次稳定；基线 397 → 407）。
 - `.cnb/npc.yml` / `.cnb.yml` YAML 语法通过（语义/Schema 告警为既有，非本次引入）。
 - markdownlint：新文档仅 MD013 表格/命令行超长，与既有 docs 基线同类（全库 78 处）。
 
-### 29.5 预估收益
+### 32.5 预估收益
 
 | 项 | 前 | 后 | 降幅 |
 | --- | --- | --- | --- |
@@ -1173,7 +2255,7 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 | 模型档折算 | 365 毫度/请求 | 51 毫度/请求 | −86% |
 | 回合失控 | 无上限 | 72 回合 | 有界 |
 
-### 29.6 遗留（流程侧，本次未改）
+### 32.6 遗留（流程侧，本次未改）
 
 - **根组织 CPU 配额不足**：`cnb-1po` 失败根因是
   `Root Group'"'"'s events CPU core-hours are insufficient for pre-freezing`

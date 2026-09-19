@@ -82,6 +82,13 @@ class HandoffCard:
     state_card_id: Optional[str] = None  # 关联 M9 StateCard 会话ID（M9 接入主链路）
     created_at: Optional[str] = None
     id: Optional[str] = None  # 运行时生成的唯一ID
+    # 唤醒开关（Issue #14）：``True`` = 常规接力，接收方据此唤醒下一轮；
+    # ``False`` = **静默交接**（循环熔断后使用），接收方**只登记、不唤醒**，
+    # 不得据此再开一轮「修复 → 复评」。缺省 ``True`` 保持历史行为（旧卡反序列化兼容）。
+    wake: bool = True
+    # 静默交接的熔断留痕（Issue #14）：熔断原因/轮次预算快照，便于接收方与
+    # 审计侧判断"为何不得唤醒"。非静默卡为空串。
+    fuse_reason: str = ""
 
     def completeness_check(self) -> dict:
         """完整性校验（M5 × M9 跨单元标准字段）：

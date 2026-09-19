@@ -23,7 +23,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 from ..state import (
     StateManager, StateCard, TaskRecord,
@@ -34,6 +34,42 @@ from ..state.content_archive import ContentArchive
 from ..context.assembler import ContextAssembler
 from ..handoff.handoff import HandoffBus
 from ..handoff.models import HandoffCard
+from ..loop import LoopDecision, LoopGuard
+from ..collab import (
+    TWO_WAY_SPLIT_NOTE,
+    FullGateDecision,
+    SOURCE_AGENT_CLAIM,
+    await_eligible,
+    await_key_for,
+    capability_report,
+    impact_available,
+    platform_report,
+    resolve_driver,
+    decide_full,
+    full_run_eligible,
+    pipeline_change_allowed,
+    cron_expr_for,
+    CollabRules,
+    CheckpointProbe,
+    ProbeEvent,
+    ProbeOutcome,
+    StepBackoff,
+    WaitPolicy,
+    RunScopeGuard,
+    RunDecision,
+    load_rules,
+)
+from ..review import (
+    ArbiterDecision,
+    ConflictCard,
+    DedupResult,
+    ReviewArbiter,
+    ReviewFingerprintLedger,
+    ScanContext,
+    decide_scan,
+    scan_commands,
+)
+from ..state import LockRegistry, LegacyLockScanner
 
 # 扫描界递归时**候选**剪枝的重型/非数据目录名（防 data_dir 指向工作区根时全树
 # 遍历，亦防其内无关 JSON 被误判为交接卡引用 → 永久阻塞共享卡回收）。
@@ -77,8 +113,27 @@ class _StateCardProxy:
         return self._fold_engine.compact_context(self._card)
 
 
+def _current_event() -> str:
+    """**当前流水线事件名**（平台内置变量；判不出 → 空串 = 不可判定）。
+
+    用途（🔴G）：检查点/等待登记时按当前事件自动补两侧事件名，否则门面路径
+    永远"两侧事件不可判定" → 一律降级 `crontab`，"≤5min 挂 `cnb:await`"这条
+    首选落点在生产路径上**不可达**。
+    """
+    for name in ("CNB_EVENT", "CNB_PIPELINE_EVENT", "CNB_TRIGGER_EVENT"):
+        got = os.environ.get(name, "")
+        if isinstance(got, str) and got.strip():
+            return got.strip()
+    return ""
+
+
 class SecretarySession:
     """会话秘书门面：一个 L3 会话秘书的完整接口。
+
+    **循环熔断（Issue #14）**：每个会话秘书附带一只 ``LoopGuard``，以
+    「轮次预算 + 非必要修复最多 1 次 + 静默交接」三道闸控制评审/修复往返；
+    熔断后 ``create_handoff`` 拒绝唤醒式交接（须走 ``silent_handoff``），
+    且预算状态跨实例持久化——换 agent 不复活循环。
 
     用法：
         sec = SecretarySession("issue-42")
@@ -103,6 +158,21 @@ class SecretarySession:
         data_dir: Optional[str] = None,
         archive_root: Optional[str] = None,
         static_prefix: Optional[str] = None,
+        loop_dir: Optional[str] = None,
+        max_rounds: Optional[int] = None,
+        max_advisory_fix_rounds: Optional[int] = None,
+        max_total_rounds: Optional[int] = None,
+        max_stall_repeats: Optional[int] = None,
+        review_dir: Optional[str] = None,
+        retry_delay_sec: Optional[float] = None,
+        locks_dir: Optional[str] = None,
+        persistent_grace_sec: Optional[float] = None,
+        collab_rules: Optional[CollabRules] = None,
+        run_guard_dir: Optional[str] = None,
+        rules_path: Optional[str] = None,
+        probe_dir: Optional[str] = None,
+        max_checks: Optional[int] = None,
+        fingerprint_dir: Optional[str] = None,
     ):
         """初始化一个会话秘书。
 
@@ -116,6 +186,30 @@ class SecretarySession:
                 （state/ content/ handoffs/ handoff-refs/）。
             archive_root: 原文归档根目录（默认 <data_dir>/content）。
             static_prefix: 静态前缀（角色骨架，可传给 ContextAssembler）。
+            loop_dir: 循环熔断状态目录（默认 ``<数据根>/loop``）。
+            max_rounds: 门禁（🔴）修复轮次上界。不传取**跨仓库规则包**（默认 3）。
+            max_advisory_fix_rounds: 非必要（🟡）修复轮次上界。不传取规则包（默认 1）。
+            max_total_rounds: 修复总轮次硬上界。不传取规则包（默认 5）。
+            max_stall_repeats: 同一整改项指纹连续出现上界。不传取规则包（默认 2）。
+            review_dir: 评审仲裁数据目录（默认 ``<数据根>/review``）。
+            retry_delay_sec: **兼容参数**。不传时按跨仓库协同规则取阶梯首档
+                （默认 10s）；传入则固定用该值（旧语义，不做阶梯）。
+            locks_dir: 锁聚合台账目录（默认 ``<数据根>/locks``）。
+                **所有锁统一登记在此**：卡片写租约 / 评审读锁 / 延迟锁，
+                `locks_overview()` 一次看全"哪里要避开"。
+            persistent_grace_sec: **兼容参数**。不传时取规则包（默认 180s）。
+            collab_rules: **跨仓库协同规则包**（`CollabRules`）。不传时按
+                `rules_path` → 环境变量 `CNB_COLLAB_RULES` → 从 `data_dir`
+                向上查找 `shared/collab/collab-rules.yaml` 的顺序装载。
+                规则包承载"agent 协同时的全局规则"：等待阶梯（
+                10s→30s→60s→3min→6min→10min 到顶即停）、锁/熔断/审查范围/计费口径。
+            rules_path: 显式规则包路径（优先于自动查找）。
+            probe_dir: 检查点探测器数据目录（默认 ``<数据根>/probe``）。
+            max_checks: 检查点探测次数上界。不传取规则包（默认 6 = 阶梯档位数）；
+                **用尽即停止自动挂账**，交回人工/上游。
+            fingerprint_dir: 评审项指纹台账目录（默认 ``<数据根>/review-fp``）。
+                用于"**同一问题不报第二遍**"：重复项只结转、不回转
+                （对应官方 SCA "同一 CVE 不重复阻断 / 内容未变的改名不重复产生"）。
         """
         # 合法性预检
         if not re.match(r'^[A-Za-z0-9_-]+\Z', session_id):  # 🟡-4：尾锚 \Z 防尾换行
@@ -138,6 +232,35 @@ class SecretarySession:
             self._session_root, "content")
         ho_dir = os.path.join(self._session_root, "handoffs")
 
+        # 跨仓库协同规则（Issue #14 追问）：agent 协同的**全局参数**一处定义。
+        # 装载顺序：显式 rules_path → 环境变量 → 从会话数据根逐级向上找规则包
+        # → 内置默认。规则包决定等待阶梯 / 锁窗口 / 熔断预算 / 审查范围 / 计费口径。
+        self.collab_rules = (collab_rules if collab_rules is not None
+                             else load_rules(rules_path, search_from=self._session_root))
+        # 等待阶梯：显式传了 retry_delay_sec 就不走阶梯（旧语义，向后兼容）；
+        # 未传则用规则包阶梯——等待从少到多，到顶（10 分钟）即停。
+        self.backoff: Optional[StepBackoff] = (
+            None if retry_delay_sec is not None else self.collab_rules.backoff)
+        # 等待策略：把"等多久"翻译成"怎么等"——**等待交平台挂起，本地不做 CPU 轮询**
+        # （回答"长时间等待会不会占用构建 CPU 计费"）。显式固定窗口时也成立。
+        self.wait_policy = WaitPolicy(
+            backoff=self.backoff or self.collab_rules.backoff,
+            platform=self.collab_rules.platform,
+        )
+        # 锁窗口 / 评审延迟窗的**首档**（🔴D-1：规则包数值必须真被消费）。
+        # 取值优先级：显式传参 → 规则包 `locks.retry_delay_sec`（组织级/仓库级
+        # 覆写**即生效**）→ 内置默认。
+        # 注意：**不**再直接取 `backoff.delay_for(0)`——那样 `locks.retry_delay_sec`
+        # 就只是"被读不生效"的装饰性数值（组织级改它对这一域无效）。
+        self._explicit_retry_delay = retry_delay_sec is not None
+        if retry_delay_sec is not None:
+            effective_delay = float(retry_delay_sec)
+        else:
+            effective_delay = float(self.collab_rules.lock_retry_delay_sec)
+        effective_grace = (float(persistent_grace_sec)
+                           if persistent_grace_sec is not None
+                           else self.collab_rules.lock_persistent_grace_sec)
+
         # 初始化底层组件
         self.state_manager = StateManager(data_dir=state_dir)
         self.fold_engine = FoldEngine(
@@ -153,6 +276,75 @@ class SecretarySession:
             ) if static_prefix else None,
         )
         self.handoff_bus = HandoffBus(data_dir=ho_dir, state_root=self._session_root)
+        # 循环熔断守卫（Issue #14）：状态落 <数据根>/loop/<session_id>.json，
+        # 与会话数据同根，随 delete_session 一并回收。
+        self.loop_guard = LoopGuard(
+            session_id=session_id,
+            data_dir=loop_dir or os.path.join(self._session_root, "loop"),
+            max_rounds=(self.collab_rules.max_rounds if max_rounds is None
+                        else max_rounds),
+            max_advisory_fix_rounds=(
+                self.collab_rules.max_advisory_fix_rounds
+                if max_advisory_fix_rounds is None else max_advisory_fix_rounds),
+            max_total_rounds=(self.collab_rules.max_total_rounds
+                              if max_total_rounds is None
+                              else max_total_rounds),
+            max_stall_repeats=(self.collab_rules.max_stall_repeats
+                               if max_stall_repeats is None
+                               else max_stall_repeats),
+        )
+        # 评审版本仲裁（Issue #14 补全机制）：只在开启评审时记录版本 +
+        # 防同写锁 + 延迟重试 + 单冲突收口。状态落 <数据根>/review/，
+        # 随 delete_session 一并回收。
+        self.review_arbiter = ReviewArbiter(
+            session_id=session_id,
+            state_manager=self.state_manager,
+            reviewer=role_name,
+            data_dir=review_dir or os.path.join(self._session_root, "review"),
+            retry_delay_sec=effective_delay,
+            lock_registry=LockRegistry(
+                session_id=session_id,
+                data_dir=locks_dir or os.path.join(self._session_root, "locks"),
+                ttl_sec=effective_delay,
+                persistent_grace_sec=effective_grace,
+                backoff=self.backoff,
+            ),
+            persistent_grace_sec=effective_grace,
+            backoff=self.backoff,
+        )
+        # 锁聚合台账（同一本，供总览/清扫/外部模块登记；卡片写租约也镜像到此）
+        self.lock_registry = self.review_arbiter.lock_registry
+        # 检查点探测器（Issue #14 追问）：**非轮询**的"形成检查点 → 判断检查点 →
+        # 状态变化/到点再触发"。探测点一律落到**平台语义**（cnb:await / crontab /
+        # api_trigger），本地绝不 sleep；最多 6 次（= 等待阶梯档位数），用尽交回人工。
+        # 锁视图直接接**锁聚合台账**（探测只看可判定事实，不看 agent 自述）。
+        self.probe = CheckpointProbe(
+            session_id=session_id,
+            data_dir=probe_dir or os.path.join(self._session_root, "probe"),
+            backoff=self.backoff or self.collab_rules.backoff,
+            max_checks=(self.collab_rules.probe_max_checks
+                        if max_checks is None else max_checks),
+            lock_view=self.lock_registry.overview,
+            # 落点分工阈值 + 固定 cron 间隔都来自**规则包**（组织级共享同一份）：
+            # ≤ 此值挂 cnb:await，> 此值交平台 crontab（固定 */5 一档扫）。
+            await_max_sec=self.collab_rules.probe_await_max_sec,
+            rules=self.collab_rules,
+        )
+        # 同口径重复执行守卫（Issue #14 本次追问）：**让"只跑增量、不连跑"成为机制**。
+        # 日常默认 `scan`（增量）；同一口径（范围/版本/受影响面/命令）只跑一次，
+        # 第 2 次起 `skip_duplicate`——跑法固定，重复跑不产生判别力（只重复烧构建/测试）。
+        # 「连跑 N 次同一命令」当稳定性论证 → `blocked_stability` + 替代口径。
+        self.run_guard = RunScopeGuard(
+            rules=self.collab_rules,
+            data_dir=run_guard_dir or os.path.join(self._session_root, "run-scope"),
+        )
+        # 评审项指纹台账（Issue #14 本轮）：**同一问题不报第二遍**。
+        # 降噪口径照抄官方 AI 评审插件（`exclude_categories: style,nit`）——
+        # 官方已验证过的默认值，没必要另立一套。
+        self.review_fingerprints = ReviewFingerprintLedger(
+            data_dir=fingerprint_dir or os.path.join(
+                self._session_root, "review-fp"),
+        )
         # 记录本会话创建/认领过的交接卡 ID，供 delete_session 一并清理。
         # 跨实例归属以 data_dir 下的归属台账（handoffs/.session-<id>.owned）
         # 持久化记录为准，实例内存清单仅为会话内缓存镜像。
@@ -826,6 +1018,25 @@ class SecretarySession:
             self.archive.delete_session(self.session_id)
         except (OSError, ValueError):
             pass
+        # 6) 清理本会话循环熔断状态（Issue #14）：会话生命周期结束时不留
+        #    预算文件，避免同一 session_id 复用时带上陈旧熔断/轮次计数。
+        try:
+            self.loop_guard.delete_state()
+        except OSError:
+            pass
+        # 7) 清理本会话评审基线/冲突卡（Issue #14 补全机制）：同上，避免同
+        #    一 session_id 复用时带上陈旧基线与待处理冲突。
+        try:
+            self.review_arbiter.delete_state()
+            self.lock_registry.delete_state()
+        except OSError:
+            pass
+        # 8) 清理本会话检查点（Issue #14 追问）：同上，避免同一 session_id 复用时
+        #    带上陈旧检查点（"最多 6 次"的预算不得被上一轮继承）。
+        try:
+            self.probe.delete_state()
+        except OSError:
+            pass
         return ok
 
     # ------------------------------------------------------------------
@@ -1052,7 +1263,16 @@ class SecretarySession:
                 "task_count": 0,
                 "tasks": [],
             }
-        return card.summarize_for_upstream()
+        summary = card.summarize_for_upstream()
+        # 循环预算随汇总上行（Issue #14）：上级/审计据 ``wake_allowed`` 判定
+        # 「是否还可能被自动唤醒继续修」，无需回读会话本地状态。
+        summary["loop"] = self.loop_guard.status()
+        summary["wake_allowed"] = self.loop_guard.should_wake_next()
+        summary["locks"] = self.locks_overview()
+        # 协同规则随汇总上行（Issue #14 追问）：上级一眼知道"下一档等多久、
+        # 到没到顶、等待按不按 CPU 计费"，不必回读会话本地状态。
+        summary["collab"] = self.collab_status()
+        return summary
 
     def set_upstream(self, upstream_session: str) -> bool:
         """设置上级秘书引用"""
@@ -1074,6 +1294,7 @@ class SecretarySession:
         target_unit: str,
         intent: str,
         context: str = "",
+        wake: bool = True,
     ) -> HandoffCard:
         """创建一张交接卡（跨单元协作），自动关联本会话 StateCard。
 
@@ -1084,18 +1305,757 @@ class SecretarySession:
         上下文**静默丢弃**。这是"共享卡"设计的既定语义（避免同一交接任务在卡内
         重复堆积）；需要保留各自上下文的场景请使用不同 ``intent``（→ 不同卡），
         或把上下文写入自己的任务卡/原文归档。
+
+        **唤醒闸门（Issue #14）**：本会话已**熔断**时 ``wake=True`` 被拒绝
+        （``RuntimeError``）——熔断语义就是"不再唤醒下一轮"，自动/误写的唤醒式
+        交接会复活循环。熔断后须用 ``silent_handoff()``（``wake=False``）。
         """
+        if wake and self.loop_guard.is_fused():
+            raise RuntimeError(
+                f"会话 {self.session_id} 已熔断"
+                f"（{self.loop_guard.status()['fused_reason']}）："
+                "禁止唤醒式交接（wake=True），请改用 silent_handoff()。")
         hc = self.handoff_bus.create_handoff(
             source_unit=source_unit,
             target_unit=target_unit,
             intent=intent,
             context=context,
             auto_state_card=True,
+            wake=wake,
+            fuse_reason=(self.loop_guard.status()["fused_reason"] if not wake else ""),
         )
         if hc and hc.id:
             # 认领本交接卡 + 其关联 ho-* StateCard（落盘归属台账，跨实例可清）
             self._record_ownership(hc.id, hc.state_card_id)
         return hc
+
+    # ------------------------------------------------------------------
+    # 循环熔断（Issue #14：轮次预算 + 非必要修复最多 1 次 + 静默交接）
+    # ------------------------------------------------------------------
+
+    def review_round(self, blocking: int = 0, advisory: int = 0,
+                     note: str = "", signature: str = "",
+                     external_rounds: Any = None) -> LoopDecision:
+        """登记一轮评审/复评结果，返回本轮处置与是否允许唤醒下一轮。
+
+        Args:
+            blocking: 🔴/门禁必修项数
+            advisory: 🟡/非门禁（无必要）项数
+            note: 留痕说明（如打回方、修复摘要）
+            signature: 本轮整改项**指纹**（如打回项集合的稳定摘要）。与上一轮
+                相同且达 ``max_stall_repeats`` → 判**停滞循环**直接熔断
+                （"感知循环"：同一问题反复报，不必等轮次预算耗尽）
+            external_rounds: **外部轮次预算载荷**（🔴A 修复：预算跨容器/跨棒不归零）。
+                平台 `crontab` 代跑、跨仓接力、换 agent 都是**新容器、新工作区**，
+                本地磁盘上的 ``round_no`` 从 0 开始 → "最多 3 轮"永不触发。
+                传入上一棒的 ``budget_trail()``（评论留痕/交接卡 context/事件载荷）
+                即 ``max()`` 合并；不传则只用本地磁盘状态（同容器内有效）。
+
+        Returns:
+            ``LoopDecision``：``action`` ∈ ``clear``（无需修复、不唤醒）/
+            ``fix``（门禁，预算内）/ ``fix_last``（非必要，最多 1 次）/
+            ``fuse``（熔断，不唤醒）；``fused_now=True`` 表示本次刚熔断，
+            调用方据此只建**一次**静默交接卡；``budget_trail`` 为**可持久留痕**
+            （写进评论即完成跨容器继承，见 ``loop_budget_trail()``）。
+        """
+        return self.loop_guard.register_round(
+            blocking=blocking, advisory=advisory, note=note,
+            signature=signature, external_rounds=external_rounds)
+
+    def loop_budget_trail(self) -> str:
+        """轮次预算的**评论留痕**（``<!-- loop-budget: … -->``）。
+
+        容器会被回收、评论不会——把这一行写进 PR/Issue 评论，
+        下一棒（可能是新容器）用 ``inherit_budget(该段文本)`` 即恢复轮次。
+        """
+        return self.loop_guard.budget_trail()
+
+    def inherit_budget(self, payload: Any, source: str = "session") -> dict:
+        """**继承外部轮次预算**（🔴A：换容器/换棒不归零）。
+
+        ``payload`` 可以是 ``loop_budget_trail()`` 的输出、``budget_payload()``、
+        上一棒的 ``LoopDecision.budget_trail``、交接卡 ``context``，
+        或含 ``<!-- loop-budget: … -->`` 的评论正文（直接粘贴即可）。
+        """
+        return self.loop_guard.adopt_budget(payload, source=source)
+
+    @staticmethod
+    def review_signature(items) -> str:
+        """由整改项清单生成稳定指纹（供 ``review_round(signature=…)`` 使用）。
+
+        排序 + 归一化空白后哈希 → 同一批问题换顺序/换空白再报也判为**停滞**。
+        """
+        return LoopGuard.signature_of(items)
+
+    def preview_round(self, blocking: int = 0, advisory: int = 0,
+                      signature: str = "") -> LoopDecision:
+        """预览下一轮处置（**纯函数**：不消耗预算、不落盘）。"""
+        return self.loop_guard.preview(
+            blocking=blocking, advisory=advisory, signature=signature)
+
+    def loop_status(self) -> dict:
+        """循环预算与熔断态快照。"""
+        return self.loop_guard.status()
+
+    def should_wake_next(self) -> bool:
+        """当前是否允许唤醒下一轮（熔断后恒 False）。"""
+        return self.loop_guard.should_wake_next()
+
+    def fuse_loop(self, reason: str) -> bool:
+        """显式叫停循环（人工/上游直接熔断）。"""
+        return self.loop_guard.fuse(reason)
+
+    def resume_loop(self, by: str, reason: str = "") -> bool:
+        """人工解锁熔断（须留痕 ``by``；这是恢复修复预算的**唯一**途径）。"""
+        return self.loop_guard.resume(by=by, reason=reason)
+
+    def silent_handoff(
+        self,
+        source_unit: str,
+        target_unit: str,
+        intent: str,
+        context: str = "",
+        open_items: Optional[List[str]] = None,
+    ) -> HandoffCard:
+        """熔断后的**静默交接**：建 ``wake=False`` 交接卡，接收方只登记不唤醒。
+
+        与 ``create_handoff(..., wake=False)`` 等价，额外把熔断原因与轮次快照
+        一并写入卡面 ``context``（若调用方未提供 context），让下一 agent 一眼
+        看到"为何不得再开一轮"，不依赖它自行推理。
+        """
+        payload = self.loop_guard.silent_handoff_payload(
+            open_items=open_items, target_unit=target_unit)
+        # 🔴A：静默交接载荷**自带轮次预算**（跨容器继承的唯一载体）——
+        # 接收方在新容器里读不到本容器的磁盘状态，只能靠载荷恢复轮次。
+        # `budget_trail` 是**评论留痕**形态（`<!-- loop-budget: … -->`），
+        # 接收方用 `inherit_budget(context)` / `LoopGuard.from_handoff(context)`
+        # 即可在**新容器**里恢复轮次（否则"最多 3 轮"会被每棒归零稀释成无限轮）。
+        if not context:
+            # 预算留痕**内嵌**在载荷里（`budget_trail` 字段），不额外拼一段——
+            # 保持 `context` 是**合法 JSON**（既有调用方/审计直接 json.loads）。
+            payload["budget_trail"] = self.loop_guard.budget_trail()
+            context = json.dumps(payload, ensure_ascii=False, indent=2)
+        return self.create_handoff(
+            source_unit=source_unit,
+            target_unit=target_unit,
+            intent=intent,
+            context=context,
+            wake=False,
+        )
+
+    def inherit_silent_handoff(self, handoff_context: Any) -> bool:
+        """接收静默交接（``wake=False``）后**继承熔断态**：本会话起手即不唤醒。
+
+        返回 True 表示确实继承到熔断态（载荷为静默交接）；False 表示载荷并非
+        静默交接（常规接力，无变化）。载荷无法解析时不熔断（宽进不炸）。
+        """
+        fused = LoopGuard.from_handoff(
+            session_id=self.session_id,
+            data_dir=self.loop_guard.data_dir,
+            handoff_context=handoff_context,
+            max_rounds=self.loop_guard.max_rounds,
+            max_advisory_fix_rounds=self.loop_guard.max_advisory_fix_rounds,
+            max_total_rounds=self.loop_guard.max_total_rounds,
+            max_stall_repeats=self.loop_guard.max_stall_repeats,
+        )
+        self.loop_guard = fused
+        return fused.is_fused()
+
+    # ------------------------------------------------------------------
+    # 评审版本仲裁（Issue #14 补全机制）
+    # 只在开启评审时记录版本 + 防同写锁 + 延迟重试 + 单冲突收口
+    # ------------------------------------------------------------------
+
+    def begin_review(self, force: bool = False) -> Any:
+        """**开启评审**：把当前版本原子登记为评审基线（幂等）。
+
+        开发过程中**不**记录任何版本；只有开启评审时才登记。已登记且
+        ``force=False`` 时不改写基线（防止靠重新开启评审把基线偷偷推前）。
+        """
+        return self.review_arbiter.begin_review(force=force)
+
+    def review_baseline(self) -> Optional[dict]:
+        """当前评审基线（未开启评审 → ``None``）。"""
+        base = self.review_arbiter.get_baseline()
+        return base.to_dict() if base else None
+
+    def review_recorded(self) -> bool:
+        """是否已在开启评审时登记过版本。"""
+        return self.review_arbiter.recorded()
+
+    def rebase_review(self) -> dict:
+        """以当前版本为新基线（"无法追踪变化就以新的"）。"""
+        return self.review_arbiter.rebase().to_dict()
+
+    def apply_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """写回评审结果（**先完成该做的**），再单独判冲突。
+
+        Returns:
+            ``ArbiterDecision``：``applied`` 为 True 表示评审已落盘；
+            ``should_retry`` 为 True 表示卡正在被编辑，等 ``retry_delay_sec``
+            后调 ``retry_review()``；``conflict`` 为 True 时 ``card`` 是
+            **唯一**冲突卡（后续冲突合并进它）。
+        """
+        return self.review_arbiter.apply_save(mutate=mutate, note=note)
+
+    def retry_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """延迟窗到点后重试评审写回（窗未到则继续等待，不落盘）。"""
+        return self.review_arbiter.retry(mutate=mutate, note=note)
+
+    def pending_review_conflicts(self) -> List[ConflictCard]:
+        """待处理评审冲突卡（**至多一张**：单冲突收口）。"""
+        return self.review_arbiter.pending_conflicts()
+
+    def resolve_review_conflict(
+        self, ticket_id: str, resolution: str, by: str = "",
+    ) -> bool:
+        """收口那张冲突卡（**只额外处理一个**），收口后以当前版本重立基线。"""
+        return self.review_arbiter.resolve(ticket_id, resolution, by=by)
+
+    def complete_deferred_review(
+        self,
+        mutate: Optional[Callable[[StateCard], None]] = None,
+        note: str = "",
+    ) -> ArbiterDecision:
+        """「先做其他」做完后回来收尾：补做被延迟的那次评审，成功才打开锁。"""
+        return self.review_arbiter.complete_deferred(mutate=mutate, note=note)
+
+    def deferred_review_status(self) -> Optional[dict]:
+        """当前「先做其他，并挂锁」项：锁还剩多久、对方动没动、是否已升级持续锁。"""
+        return self.review_arbiter.deferred_status()
+
+    # ------------------------------------------------------------------
+    # 跨仓库协同规则（Issue #14 追问：agent 协同时的全局规则）
+    # ------------------------------------------------------------------
+
+    def collab_status(self) -> dict:
+        """跨仓库协同规则的**生效快照**："这套数值从哪来、现在是多少"。
+
+        一眼回答三个问题：
+        - 等待阶梯是什么（从少到多、到顶即停）；
+        - 锁/熔断/审查范围用的是哪套预算；
+        - **等待算不算 CPU 计费**（平台口径）。
+        """
+        rules = self.collab_rules
+        return {
+            "source": rules.source,
+            "waiting_plan": rules.waiting_plan(),
+            "waiting_ladder": rules.waiting_ladder(),
+            "waiting": (self.backoff.status(0).to_dict()
+                        if self.backoff is not None else None),
+            "locks": {
+                # **生效值**（= 规则包数值，除非显式传参覆写）：
+                # 组织级/仓库级改 `locks.retry_delay_sec` 必须在这里同步变化。
+                "retry_delay_sec": self.review_arbiter.retry_delay_sec,
+                "persistent_grace_sec": self.review_arbiter.persistent_grace_sec,
+                "registry_shared": rules.lock_registry_shared,
+                "rules_retry_delay_sec": rules.lock_retry_delay_sec,
+                "explicit_override": self._explicit_retry_delay,
+            },
+            "loop": {
+                "max_rounds": self.loop_guard.max_rounds,
+                "max_advisory_fix_rounds": self.loop_guard.max_advisory_fix_rounds,
+                "max_total_rounds": self.loop_guard.max_total_rounds,
+                "max_stall_repeats": self.loop_guard.max_stall_repeats,
+            },
+            "scan": {
+                "major_version_tags": list(rules.major_version_tags),
+            },
+            "platform_cost": rules.platform.to_dict(),
+        }
+
+    def waiting_plan(self) -> str:
+        """等待计划（一行）：``10s → 30s → … → 600s（到顶即停）``。"""
+        if self.backoff is None:      # 显式固定窗口（旧语义）
+            return f"固定延迟 {self.review_arbiter.retry_delay_sec:.0f}s（未启用阶梯）"
+        return self.backoff.human()
+
+    def waiting_status(self, retriggered: int = 0) -> Optional[dict]:
+        """当前位置的等待状态：第几档、等多久、是否到顶/已停。"""
+        return self.review_arbiter.waiting_status(retriggered)
+
+    def cost_note(self) -> dict:
+        """**等待是否占用 CPU 计费**：平台口径原话（供所有角色统一答复）。"""
+        return self.collab_rules.platform.to_dict()
+
+    def wait_decision(self, attempt: int = 0, *, editing: bool = True) -> dict:
+        """该"怎么等"（第 ``attempt`` 次检测）。
+
+        三选一，**永不选"本地空转"**：`platform_suspend`（挂平台等）/
+        `deferred_review`（先做其他）/ `resume_required`（到顶交回人工）。
+        """
+        return self.wait_policy.decide(attempt, editing=editing).to_dict()
+
+    def wait_plan(self, attempts: Optional[int] = None) -> List[dict]:
+        """整条等待计划（每次到点怎么等），可直接贴进讨论/文档。"""
+        return self.wait_policy.plan(attempts)
+
+    # ------------------------------------------------------------------
+    # 锁聚合管理（Issue #14：所有锁统一登记，触发即可查看，绝不遗留）
+    # ------------------------------------------------------------------
+
+    def locks_overview(self) -> dict:
+        """**所有锁**的聚合总览：「哪里要避开」一眼可见（不必靠测试才知道）。
+
+        汇总三处：
+        - 锁聚合台账（卡片写租约 / 评审读锁 / 延迟锁 / 序列化锁）；
+        - 历史遗留单锁文件（``<数据根>/state/*.owner.json``，只读上报）；
+        - 「先做其他，并挂锁」当前项（若有）。
+        `by_kind` 按类型计数，`where_to_avoid` 是给人看的避开清单。
+        """
+        view = self.lock_registry.overview()
+        legacy = LegacyLockScanner.scan(self.lock_registry.data_dir)
+        if not legacy:
+            legacy = LegacyLockScanner.scan(self.state_manager.data_dir)
+        view["legacy_locks"] = legacy
+        view["deferred"] = self.review_arbiter.deferred_status()
+        view["where_to_avoid"] = list(view.get("where_to_avoid", [])) + [
+            f"{l.get('session_id')}（legacy 写租约｜持有者 "
+            f"{l.get('holder') or '未标注'}｜{'已过期' if l.get('expired') else '仍有效'}）"
+            for l in legacy
+        ]
+        return view
+
+    def sweep_locks(self, by: str = "") -> List[dict]:
+        """清理**遗留锁**（过期且超宽限仍未处理）→ 置 stale + 留痕。
+
+        不误杀活跃锁与宽限内的持续锁；返回被回收的锁清单。
+        """
+        return self.review_arbiter.sweep_locks(by=by or self.role_name)
+
+    def release_review_locks(self, by: str = "", reason: str = "评审结束") -> int:
+        """释放本会话**评审相关**的锁（评审读锁 + 延迟锁），不动他人写租约。"""
+        return self.review_arbiter.release_locks(by=by, reason=reason)
+
+    def review_scope(
+        self,
+        tags: Any = None,
+        text: str = "",
+        major_version: bool = False,
+    ) -> ScanContext:
+        """审查范围分级：**日常开发只审变化，全量只在大版本**。
+
+        用于防止"每轮往返都触发全量构建 + 全量测试"的无效作业：非大版本一律
+        ``scan``（只审变更集与受影响面），仅大版本标签/显式标记才放 ``full``。
+        """
+        return decide_scan(tags=tags, text=text, major_version=major_version)
+
+    def review_scope_commands(self, **kwargs) -> Dict[str, str]:
+        """按范围档位给出构建/测试执行口径（``scan`` 档明确不跑全量）。"""
+        return scan_commands(self.review_scope(**kwargs))
+
+    # ------------------------------------------------------------------
+    # 全量门禁（Issue #14 本轮追问：**默认全量根本不跑**）
+    # ------------------------------------------------------------------
+
+    def full_decision(
+        self,
+        major_version: Optional[bool] = None,
+        tags: Any = None,
+        source: str = SOURCE_AGENT_CLAIM,
+        impact: Any = None,
+        command: str = "",
+        event: str = "",
+        tests_dir: str = "tests/",
+    ) -> FullGateDecision:
+        """**能不能跑全量**：只有大版本（且来源可采信、事件为代码推进类）才放行。
+
+        与 `run_decision()` 的**方向相反**，两者不可混用：
+
+        - `run_decision`（跳过重复）：判不出 → **保守放行**（宁可多跑，不可漏跑）；
+        - `full_decision`（全量门禁）：判不出 → **保守拦截**（宁可少跑全量，
+          不可空烧全量构建/测试）。
+
+        `major_version` 是**可判定事实**：`True`/`False`/`None`（不知道）。
+        **不要把 agent 的自述当事实**——自述走 `source="agent_claim"`，
+        门禁会直接拒（否则"谁喊一声大版本就能解锁全量"）。
+        拦截时会给出**可直接跑的增量命令**（`scan_command`），拦了但给路。
+        """
+        # 事件侧门禁在 `decide_full` 内部完成（三条件的一次性判定），
+        # 门面不再做二次改写——避免"两层各判一遍、口径可能不一致"。
+        return decide_full(
+            self.collab_rules, major_version=major_version, tags=tags,
+            source=source, impact=impact, command=command, event=event,
+            tests_dir=tests_dir)
+
+    def full_run_eligible(self, event: str = "") -> Dict[str, Any]:
+        """只回答"这个事件能不能跑全量"（不涉及大版本判定）。"""
+        return full_run_eligible(
+            event, blocked_events=self.collab_rules.blocked_events)
+
+    def pipeline_change_allowed(self, changed_paths: Any,
+                                allowlist: Any = None) -> Dict[str, Any]:
+        """流水线兜底变更的**路径白名单**校验（最小权限；兜底不是后门）。"""
+        return pipeline_change_allowed(
+            changed_paths,
+            allowlist=(allowlist if allowlist is not None
+                       else self.collab_rules.pipeline_allowlist))
+
+    def full_gate_note(self) -> str:
+        """一行口径（评论/文档/角色提示词共用）：**默认全量不跑，只有大版本才跑**。"""
+        r = self.collab_rules
+        return (f"日常一律增量（默认 {r.scan_default_mode}）；**全量只在大版本**，"
+                f"且须由可采信来源（大版本 action / 标签 / 人工指令）判定；"
+                f"评论/目录/定时/触发类事件**不得**跑全量；"
+                f"去升级口 {r.repeat_scope}（同一份受审内容跨版本只跑一次）")
+
+    def decide_repeat(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        last_verdict: str = "",
+        window_repeats: int = 1,
+        base: Optional[str] = None,
+        event: str = "",
+    ) -> RunDecision:
+        """**重复执行判定（去升级口径）**：同一份受审内容跨版本重跑 → 跳过。
+
+        与 `run_decision()` 的差别只在 `revision` 怎么算：`content` 档下
+        版本变化**不**构成新口径（修掉"每改一行代码就重跑一遍 600 多项"）。
+        """
+        return self.run_guard.decide_repeat(
+            mode=mode, revision=revision, impact=impact, command=command,
+            last_verdict=last_verdict, window_repeats=window_repeats,
+            base=base, event=event)
+
+    def record_repeat(self, mode: str = "", revision: str = "",
+                      impact: Any = None, command: str = "",
+                      verdict: str = "",
+                      session_id: str = ""):
+        """登记一次实际执行（同时更新"受审内容 → 历史版本数"台账）。
+
+        ``session_id``：归属（缺省用**本会话**）。留痕写出时据此归属——
+        🔴-3：旧实现让 CI 侧写回时归属恒空 → 评论里**所有会话**的归属被抹平。
+        """
+        return self.run_guard.record_repeat(
+            mode=mode, revision=revision, impact=impact, command=command,
+            verdict=verdict, session_id=session_id or self.session_id)
+
+    def content_repeats_of(self, mode: str = "", impact: Any = None,
+                           command: str = "") -> int:
+        """同一份**受审内容**已跑了几遍（跨版本累计）。"""
+        return self.run_guard.content_repeats_of(
+            mode=mode, impact=impact, command=command)
+
+    # ------------------------------------------------------------------
+    # 同口径重复执行守卫（Issue #14 本次追问：只跑增量、不连跑同一口径）
+    # ------------------------------------------------------------------
+
+    def run_decision(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        last_verdict: str = "",
+        window_repeats: int = 1,
+        base: Optional[str] = None,
+        event: str = "",
+    ) -> RunDecision:
+        """**跑不跑**：日常默认增量；同一口径（范围/版本/受影响面/命令）只跑一次。
+
+        - 同一口径第 2 次起 → ``skip_duplicate``（跑法固定，重复跑不产生判别力）；
+        - 想"连跑 N 次"当稳定性论证 → ``blocked_stability`` + 替代口径
+          （定点/变异探针、独立场景）；
+        - 例外：同口径已达上界但上一轮**不绿** → 允许重跑（红→修→再跑有新信息）；
+        - **能力降级**（Issue #14 本轮）：判不出"能不能算受影响面"时
+          **保守放行**并在判定里标明 `degraded`（漏跑比多跑危险）。
+        """
+        return self.run_guard.decide(
+            mode=mode, revision=revision, impact=impact, command=command,
+            last_verdict=last_verdict, window_repeats=window_repeats,
+            base=base, event=event)
+
+    def record_run(
+        self,
+        mode: str = "",
+        revision: str = "",
+        impact: Any = None,
+        command: str = "",
+        verdict: str = "",
+    ):
+        """登记一次**实际执行**（只记真的跑了的；被跳过的重复不计数）。"""
+        return self.run_guard.record(mode=mode, revision=revision, impact=impact,
+                                     command=command, verdict=verdict)
+
+    def run_repeats_of(self, mode: str = "", revision: str = "",
+                       impact: Any = None, command: str = "") -> int:
+        """某口径已执行几次（"连跑三次"这类行为会被一眼看见）。"""
+        return self.run_guard.repeats_of(mode=mode, revision=revision,
+                                         impact=impact, command=command)
+
+    def run_scope_overview(self) -> Dict[str, Any]:
+        """口径台账总览：跑了几次、有没有**超出同口径上界**的重复执行。"""
+        return self.run_guard.overview()
+
+    def run_scope_trail(self) -> str:
+        """判重台账的**可持久留痕**（`<!-- run-scope: … -->`），写回评论即完成继承。
+
+        🔴F：平台每次 push = **新容器、新工作区**，本地台账从空开始 → 判重永不
+        触发（与 🔴A 同族，但 A 有"写回评论"载体、F 连载体都没有）。故本方法给出
+        与 🔴A 同一方案的载体：把留痕**追加写回同一条 PR/Issue 评论**，
+        下一棒 `inherit_run_scope(该评论正文)` 即恢复。
+        """
+        return self.run_guard.trails(session_id=self.session_id)
+
+    def inherit_run_scope(self, payload: Any) -> Dict[str, Any]:
+        """从**可持久载体**（评论正文 / 交接卡 context）恢复判重台账（只增不减）。"""
+        return self.run_guard.adopt_trails(payload, session_id=self.session_id)
+
+    def run_scope_note(self) -> str:
+        """一行口径（评论/文档/角色提示词共用）：**只跑增量、同口径只跑一次**。"""
+        r = self.collab_rules
+        return (f"日常只跑增量（默认 {r.scan_default_mode}）；同一口径"
+                f"（范围/版本/受影响面/命令）最多跑 {r.max_identical_repeats} 次，"
+                f"第 2 次起跳过；稳定性论证请换口径"
+                f"（{'/'.join(r.stability_via)}），不连跑同一命令；"
+                f"全量（full）只在大版本")
+
+    # ------------------------------------------------------------------
+    # 检查点探测器（Issue #14 追问：非轮询 → 检查点 → 状态变化再触发）
+    # ------------------------------------------------------------------
+
+    def create_checkpoint(
+        self,
+        key: str,
+        kind: str = "lock",
+        holder: str = "",
+        scope: str = "",
+        await_key: str = "",
+        max_checks: Optional[int] = None,
+        note: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
+    ):
+        """建一个**检查点**：等什么（``kind``）、等谁（``holder``）、还能探几次。
+
+        **幂等**：同键已存在即原样返回（不重置预算）——否则"每次遇到都重建"
+        等于把"最多 6 次"变成无限次，正是要治的循环。
+
+        🔴G（复评第 5 轮）：**必须能透传两侧事件名**（``waiter_event`` /
+        ``resolver_event``）。旧门面签名没有这两个形参 → 检查点永远"两侧事件
+        不可判定" → `resolve_driver()` 一律降级 `crontab`，**"≤5min 挂
+        cnb:await"这条首选落点在门面生产路径上不可达**（照角色提示词用门面调用
+        永远走不到 await）。事件名未显式给出时，按**当前事件**自动登记
+        （`CNB_EVENT` / `CNB_PIPELINE_EVENT`）——两侧同事件才可能配上对。
+        """
+        we = waiter_event or _current_event()
+        re_ = resolver_event or we
+        return self.probe.create(key=key, kind=kind, holder=holder, scope=scope,
+                                 await_key=await_key, max_checks=max_checks,
+                                 note=note, waiter_event=we,
+                                 resolver_event=re_)
+
+    def checkpoint_plan(self, key: str = "",
+                        checks: Optional[int] = None) -> List[Dict[str, Any]]:
+        """六次探测**怎么等**：等待阶梯 + 平台落点（await / crontab），非轮询。
+
+        **返回行数 = 探测档位数 + 1**：末尾**恒有一行「预算用尽」**（`check`
+        = 档位数 + 1，`driver=handoff_resume`）——它是"停止自动挂账、交回人工"
+        这一步，不是第七次探测。故 `checks=3` → 4 行（`[1,2,3,用尽行]`），
+        不传 `checks` → 7 行（6 档 + 用尽行）。调用方按 `check` 列取值时不要把
+        末行当成"还能再探一次"。
+
+        Args:
+            key: 检查点键（空 → 用本会话默认预算档位数）。
+            checks: 显式档位数（覆盖检查点自带 ``max_checks``）；超出阶梯档位
+                时**夹到档位数**（不把同一档报两遍）。
+
+        🟢：原签名为 ``**kwargs`` 但**静默忽略**（传 ``max_checks=99`` 无效，
+        形参存在却不生效 = 另一种"读了不生效"）。现改为**具名形参**并真透传；
+        传未知关键字会直接 ``TypeError``（暴露误用，而不是悄悄丢弃）。
+        """
+        cp = self.probe.load(key) if key else None
+        if checks is None:
+            return self.probe.delay_plan(cp)
+        if not isinstance(checks, int) or isinstance(checks, bool) or checks < 1:
+            raise ValueError(f"非法 checks: {checks!r}（须为 >=1 的整数）。")
+        rows = self.probe.delay_plan(cp)
+        # 只保留前 `checks` 个探测档 + 末尾"预算用尽"行。
+        # 🟡5：`checks` 须**先夹到实际档位数**（`len(rows) - 1` = 阶梯档位数），
+        # 否则 `checks > 档位数` 时 `rows[:checks]` 已含末行，再拼 `rows[-1:]`
+        # 就出现**重复行**（`checks=7` → check id `[1..7, 7]` 共 8 行）。
+        # 请求超过阶梯档位时按阶梯档位截断（不是把同一档报两遍）。
+        keep = min(checks, max(0, len(rows) - 1))
+        return rows[:keep] + rows[-1:]
+
+    def register_platform_wait(self, key: str, await_key: str = "", sn: str = "",
+                               driver: str = "platform_await", note: str = "",
+                               waiter_event: str = "", resolver_event: str = "",
+                               stage: str = "stages"):
+        """登记"等待已挂到平台语义上"（``cnb:await``）→ 本地零占用，可被回收。
+
+        🔴G：同样**透传两侧事件名**（旧签名没有 → 挂 await 时永远过不了
+        "同一事件配对"这道官方硬约束，只能降级 crontab）。未显式给出时：
+        检查点登记时留痕的事件优先，其次按**当前事件**自动登记。
+        """
+        we = waiter_event
+        re_ = resolver_event
+        if not we or not re_:
+            cp = self.probe.load(key)
+            we = we or (cp.waiter_event if cp else "") or _current_event()
+            re_ = re_ or (cp.resolver_event if cp else "") or we
+        return self.probe.register_platform_wait(
+            key, await_key=await_key, sn=sn, driver=driver, note=note,
+            waiter_event=we, resolver_event=re_, stage=stage)
+
+    def probe_checkpoint(self, key: str, **kwargs) -> ProbeOutcome:
+        """**探测一次**（采集轻量事实 → 判断检查点 → 记预算 → 给下一步落点）。
+
+        ``our_need_satisfied=False`` 表示"我方已不需要这个锁" → 直接判 ``release``
+        （放锁、不再等），避免队头阻塞。
+
+        ``external_checks=<上次 checks_used>``（🔴A）：平台 `crontab` 代跑是
+        **新容器**，本地预算从 0 开始 → 必须把上一次的轮次传进来合并，
+        否则"最多 6 次"永不触发。上一次的轮次从
+        ``dispatch_probe_event(...)["budget_trail"]``（评论留痕）里取。
+        """
+        return self.probe.probe(key, **kwargs)
+
+    def dispatch_probe_event(self, event: ProbeEvent) -> Dict[str, Any]:
+        """把探测事件转成**给流水线的平台指令**（``cnb:await`` / ``cnb:apply`` /
+        ``crontab`` / 交回人工），并标明**是否允许据此唤醒下一轮**。"""
+        return self.probe.dispatch(event)
+
+    def checkpoints_overview(self) -> Dict[str, Any]:
+        """所有检查点总览（含"还剩几次探测、下一次等多久、挂在哪"）。"""
+        return self.probe.overview()
+
+    def probe_status(self) -> Dict[str, Any]:
+        """检查点探测的**生效口径快照**：次数上界、平台落点、判别式、计费口径。
+
+        含三点已确认口径：① 落点分工（`await_max_sec` 阈值 + 不可混用）；
+        ② cron **固定 `*/5` 一档扫**；③ 规则来源层级（组织级 / 仓库级，见 `chain`）。
+        """
+        rules = self.collab_rules
+        return {
+            "max_checks": self.probe.max_checks,
+            "waiting_plan": rules.waiting_plan(),
+            "probe_plan": rules.probe_plan(),
+            "drivers": list(rules.probe_drivers),
+            "checks": list(rules.probe_checks),
+            "await_max_sec": self.probe.await_max_sec,
+            "crontab_min_interval_sec": rules.crontab_min_interval_sec,
+            "crontab_interval": cron_expr_for(rules),
+            "crontab_interval_note": ("固定一档扫：不随阶梯档位放大；"
+                                      "与阶梯时间表解耦（平台多久代跑一次）"),
+            "split_note": TWO_WAY_SPLIT_NOTE,
+            "rules_scope": rules.scope,
+            "rules_chain": [dict(c) for c in rules.chain],
+            "local_cpu_cost": "0（探测点挂平台语义；本地不 sleep、不轮询）",
+            "platform_cost": rules.platform.to_dict(),
+        }
+
+    def organization_probe_rules(self) -> Dict[str, Any]:
+        """**组织级共享**的 probe 口径快照（跨仓同一份；已确认口径 #3）。"""
+        from ..collab import organization_probe_rules as _org
+        return _org(rules=self.collab_rules)
+
+    def dispatch_probe_event_shared(self, event: Any) -> Dict[str, Any]:
+        """**跨仓**落点判定：同一份组织级规则包 → 同一套动作（不依赖本地会话号）。"""
+        from ..collab import dispatch_shared
+        return dispatch_shared(event, self.collab_rules)
+
+    # ------------------------------------------------------------------
+    # 平台语义对齐（Issue #14：对齐官方 cnb:await 约束，不硬上"一定等不到"的等待）
+    # ------------------------------------------------------------------
+
+    def platform_report(self) -> Dict[str, Any]:
+        """平台语义对齐快照：await 硬约束、官方最佳实践对照、降级策略与出处。"""
+        return platform_report()
+
+    def await_plan(
+        self,
+        key: str = "",
+        waiter_event: str = "",
+        resolver_event: str = "",
+        stage: str = "stages",
+    ) -> Dict[str, Any]:
+        """**挂 await 之前先校验**：配不上对就返回降级后的真实落点。
+
+        官方约束：`cnb:await` 只能对**同一个事件**触发的 pipeline 配对，
+        且一个 key **仅能 resolve 一次**。因此：
+        - 两侧事件不同 / 不可判定 / 位置不是 `stages` → **降级 crontab**；
+        - key 按**轮次**生成（`probe:<key>:r<n>`），避免第 2 次起等不到。
+        """
+        cp = self.probe.load(key) if key else None
+        we = waiter_event or (cp.waiter_event if cp else "")
+        re_ = resolver_event or (cp.resolver_event if cp else "")
+        attempt = cp.checks_used if cp else 0
+        verdict = resolve_driver(
+            "platform_await", checkpoint_key=key, attempt=attempt,
+            waiter_event=we, resolver_event=re_, stage=stage,
+            await_max_sec=self.probe.await_max_sec,
+        )
+        out = verdict.to_dict()
+        out["waiter_event"] = we
+        out["resolver_event"] = re_
+        out["platform_sources"] = list(verdict.sources)
+        return out
+
+    def await_eligibility(
+        self,
+        waiter_event: str = "",
+        resolver_event: str = "",
+        stage: str = "stages",
+    ) -> Dict[str, Any]:
+        """只回答"能不能挂 await"（不涉及具体检查点）。"""
+        return await_eligible(waiter_event, resolver_event, stage)
+
+    def await_key_of(self, checkpoint_key: str = "", attempt: int = 0) -> str:
+        """按**轮次**生成 await 配对键（官方：一个 key 仅能 resolve 一次）。"""
+        return await_key_for(checkpoint_key, attempt)
+
+    def capability_report(self) -> Dict[str, Any]:
+        """能力与降级口径快照（增量可达性 / 降级策略 / 已知降级情形）。"""
+        return capability_report()
+
+    def impact_availability(
+        self,
+        revision: str = "",
+        base: Optional[str] = None,
+        impact: Any = "",
+        event: str = "",
+    ) -> Dict[str, Any]:
+        """能不能**可信地**算受影响面（决定增量判重是否成立）。
+
+        判不出时**保守放行**（宁可多跑，不可漏跑）——因为把"算不出变更集"
+        当成"没有变更"，会让不同变更集撞成同一个指纹而被**跳过**（危险方向）。
+        """
+        return impact_available(revision, base=base, impact=impact, event=event)
+
+    # ------------------------------------------------------------------
+    # 评审项指纹（同一问题不报第二遍）
+    # ------------------------------------------------------------------
+
+    def review_dedup(self, items: Any, round_no: int = 0) -> DedupResult:
+        """对一轮评审结果**去重**：新问题保留、老问题结转、降噪项滤掉。
+
+        `items` 支持官方评审插件风格的 dict（`category` / `line_text` / `path` /
+        `severity`），也支持已算好的指纹。**只看新问题是否需要回转**：
+        老问题重复报不产生新一轮修复（`should_rotate` 为假）。
+        """
+        return self.review_fingerprints.dedup(items, round_no=round_no)
+
+    def carry_review_items(self, keys: Any) -> int:
+        """把指定评审项标记为**已结转**（再出现只登记，不回转、不占轮次）。"""
+        if isinstance(keys, str):
+            keys = [keys]
+        return self.review_fingerprints.carry(keys or [])
+
+    def review_fingerprints_overview(self) -> Dict[str, Any]:
+        """评审项台账总览：几项、几项被重复报、几项已结转（重复报的一眼可见）。"""
+        return self.review_fingerprints.overview()
 
     # ------------------------------------------------------------------
     # 进度统计
