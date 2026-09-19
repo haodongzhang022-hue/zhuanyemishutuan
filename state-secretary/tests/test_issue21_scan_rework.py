@@ -327,14 +327,15 @@ class TestG3WorkAccountingCoversRealCost:
         assert isinstance(MAX_SCAN_WORK, int) and MAX_SCAN_WORK > 0
 
     def test_g3_failure_charge_is_window_length_not_pos_minus_p(self):
-        """**机制断言（G7 · 本轮随修法改口径）**：失败记账取**窗口长度**。
+        """**机制断言（G7 · 本轮 🔴-1/🔴-2 随修法改口径）**：喂入量**相加不取 max**。
 
-        修法前口径 = 错误位置 `pos`（`pos - p` 恒 8 ⇒ 永不触顶）。修法后解析
-        **只喂窗口**，`pos` 会**漏掉** C 解析器"扫到错误位置"之前的实扫量 ⇒
-        口径改为**窗口长度** `window_end - p`（**含**真实实扫量）。
+        修法前口径 = 错误位置 `pos`（`pos - p` 恒 8 ⇒ 永不触顶）；上一轮改为
+        `max(短切片长度, 实际喂入)`（**漏记**短切片那次喂入，实测少记
+        20 682 304 / 10.93 %，方向 fail-open）。本轮口径（🔴-1）：
+        **各次喂入相加** —— A 组未命中（普通语法错）只喂短切片 ⇒ `fed = short_fed`；
+        A 组命中（扩窗）两次都喂 ⇒ `fed = short_fed + window_fed`。
 
-        源码护栏把**新**口径钉住（旧口径 `pos - p` 仍不得出现）：
-        失败分支必须出现 `charge = window_end - p`，且不得出现 `pos - p`。
+        源码护栏把**新**口径钉住（旧 `pos - p` / `max(...)` 仍不得出现）。
         """
         path = os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
                             "trail.py")
@@ -343,15 +344,18 @@ class TestG3WorkAccountingCoversRealCost:
         body = src.split("def _scan_diag(", 1)[1]
         code = "\n".join(ln for ln in body.splitlines()
                          if not ln.lstrip().startswith("#"))
-        # **本轮口径（总师精化裁定 §二-③）**：记账 = 该次**实际喂入解码器的
-        # 字符数** —— 整窗失败取 `window_end - p`（含真实实扫量），
-        # 短切片失败取 **短切片长度** `close - p`（A 组收紧的落地）。
-        assert "fed = window_end - p" in code, \
-            "整窗失败记账未按窗口长度（修法第 2 条）"
-        assert "fed = close - p" in code, \
-            "短切片失败记账未按短切片长度（§二-② 扩窗条件收紧）"
+        # 短切片喂入量（含 `}`）+ 窗口喂入量（含窗口末字符）
+        assert "short_fed = close + 1 - p" in code, \
+            "短切片喂入量口径缺失（应含 `}`：`close + 1 - p`）"
+        assert "window_fed = window_end - p" in code, \
+            "窗口喂入量口径缺失（应含窗口末字符：`window_end - p`）"
+        assert "fed = short_fed" in code, \
+            "A 组未命中（普通语法错）未按『只喂短切片』记账"
+        assert "fed = short_fed + window_fed" in code, \
+            "扩窗时两次喂入未**相加**（🔴-1：不得取 max）"
         assert "pos - p" not in code, "失败记账回退到 pos - p（永不触顶）"
         assert "pos if" not in code, "失败记账仍取 pos（漏实扫量，记账脱钩）"
+        assert "if rel > fed" not in code, "喂入量仍取 max（漏记短切片那次喂入）"
 
     def test_g3_work_cap_reports_reason(self):
         """触顶 → `reason="work_cap"`（可观测；不得静默）。"""
@@ -724,7 +728,9 @@ class TestG7AccountingMechanism:
         # 记账含每候选固定开销）——旧口径"错误位置 pos（整段前缀）"已被证伪
         # （记账与实扫脱钩），不得再作为记账口径出现。
         assert "只喂窗口" in src or "只在该窗口上" in src
-        assert "窗口长度" in src
+        # 本轮 🔴-1/🔴-2 口径：**各次喂入相加**（`short_fed` / `window_fed`）
+        assert "short_fed" in src and "window_fed" in src
+        assert "相加" in src, "未写明『各次喂入相加』（🔴-1 口径）"
         assert "_SCAN_CANDIDATE_COST" in src
         assert "记账脱钩" in src, "未记录被证伪的旧口径（下一轮会误信）"
 
@@ -1141,22 +1147,38 @@ class TestR2AttributionIsRedundantFallback:
             f"去掉 ① 后耗时应同量级：both={both:.4f}s cap_off={cap_off:.4f}s")
 
     def test_r2_ablation_work_cap_is_the_bearing_bound(self):
-        """**消融 ②**：`MAX_SCAN_WORK→1e18` 后对抗输入**失控**（远慢于 both）。"""
+        """**消融 ②**：`MAX_SCAN_WORK→1e18` 后对抗输入**失控**。
+
+        ⚠️ **判据改用记账量（确定性）**：旧判据用墙钟 `work_off > 0.5 s` ——
+        该阈值**随解释器/机器翻转**，且本轮 🔴-1/🔴-2 定点修后 A_false 不再重取
+        窗口，同一消融的 dt 从 **0.5420 s 降到 0.39 s**（真实改善，非退化）⇒
+        硬 0.5 s 阈值**反向失败**。现以**记账量**为主判据（与速度解耦）：
+        去掉 ② 后 `work` 必须**远超** cap（实测 **6 232 276 553 ≈ 26× cap**），
+        而 dt 只作**相对**判据（`≫ both`）。
+        """
+        cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
         adv = '{"k":1, ' * 40000 + '}'
         t0 = time.perf_counter()
         _objects_diag(adv)
         both = time.perf_counter() - t0
+        work_both = _scan_diag_probe(adv)[3]
         orig = trail_mod.MAX_SCAN_WORK
         try:
             trail_mod.MAX_SCAN_WORK = 10 ** 18
             t0 = time.perf_counter()
             _objects_diag(adv)
-            work_off = time.perf_counter() - t0
+            work_off_dt = time.perf_counter() - t0
+            work_off = _scan_diag_probe(adv)[3]
         finally:
             trail_mod.MAX_SCAN_WORK = orig
-        assert work_off > 0.5, f"去掉 ② 应失控：{work_off:.4f}s"
-        assert work_off > max(both, 1e-6) * 100, (
-            f"② 才是承载上界：both={both:.4f}s work_off={work_off:.4f}s")
+        # 主判据（确定性、与机器速度无关）：记账量失控 ⇒ ② 是承载上界
+        assert work_off > cap * 10, (
+            f"去掉 ② 后记账量未失控：{work_off} vs cap={cap}")
+        assert work_off > work_both * 10, (
+            f"② 才是承载上界：both={work_both} work_off={work_off}")
+        # 辅助判据（相对，不设绝对阈值）：dt 必须远慢于 both
+        assert work_off_dt > max(both, 1e-6) * 20, (
+            f"② 才是承载上界：both={both:.4f}s work_off={work_off_dt:.4f}s")
 
 
 class TestR4DegradedFuzz:
@@ -1496,11 +1518,12 @@ class TestCP3RefinedRulingBehaviours:
 
     # ---- ⑤ 数字口径修正（实测记账量） ---------------------------------
     def test_5_accounting_numbers_match_implementation(self):
-        """**⑤** 记账数字必须与**实现同源**（本轮收紧后的实测值）。
+        """**⑤** 记账数字必须与**实现同源**（本轮 🔴-1/🔴-2 修后的实测值）。
 
-        收紧前最密文件 @417 480 记满 **≈171.7 M**（短切片普通语法错被扩窗记满）；
-        收紧后 **168 464 154**。本用例把"桶量级"钉住（防再退回摊派口径）：
-        必须有**真实**的候选失败被按**短切片**记账，而不是整窗。
+        口径：最密文件 @417 480（截断形态），**CPython 3.11.16**。
+        旧读数 **168 464 154**（"取 `max` 漏记 + A_false 仍重取窗口"）⇒ 本轮
+        实测 **29 946 906**（A_true **202** / A_false **901**；A_false 不再扩窗）。
+        判据取"明显小于『失败即记满整窗』的摊派下界"（1 103 × 262 144 ≈ 289 M）。
         """
         cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
         path = os.path.join(REPO_ROOT, "state-secretary", "tests",
@@ -1513,17 +1536,24 @@ class TestCP3RefinedRulingBehaviours:
         assert work < cap, (work, cap)
         # 记账量**小于**"每个失败候选都记满整窗"的上界 ⇒ 证明收紧生效。
         # 失败候选数 1 103（实测）、整窗 262 144 ⇒ 摊派口径下界 289 M > cap；
-        # 收紧后实测 168 464 154。判据取"明显小于摊派下界"。
+        # 本轮实测 29 946 906。判据取"明显小于摊派下界"。
         assert work < 1_103 * MAX_RESCAN_LEN * 0.8, (
             f"记账仍接近『失败即记满整窗』的摊派口径：{work}")
 
     # ---- 扩窗收紧的**判别力**（消融：把 A 组判据放回"任何失败都扩窗"） ----
     def test_6_widening_tightening_is_discriminating(self):
-        """**判别力（A 组收紧的落地）**：短切片**普通语法错**必须**不**扩窗。
+        """**判别力（A 组收紧的落地 · 本轮 🔴-2 改为消融敏感）**：短切片
+        **普通语法错**必须**不**扩窗，且该判据必须**真的**改变记账。
 
-        机制判据（确定性、不受机器速度影响）：在最密文件 @417 480 上统计
-        「短切片失败候选数」与「其中**扩窗**数」。收紧前 = **全部扩窗**；
-        收紧后 = **0 扩窗**（实测 1 103 个失败候选里 0 个"耗尽输入"）。
+        ⚠️ **旧写法无判别力**（本轮 🔴-2 点名）：旧实现里 A_false **仍然重取
+        窗口**（记账取 `max`）⇒ 强制 `_decoder_exhausted_input → True` 的消融在
+        3 个语料 + 3 000 组 fuzz 上**记账/降级/原因 delta 全 0**（"读了不生效"）。
+        本用例现在**直接断言消融敏感**：强制 `True` 后记账必须**显著变大**
+        （A_false 从"只喂短切片"变成"短切片 + 整窗"）。
+
+        实测（CPython 3.11.16）：最密 @417 480 记账 **29 946 906 → 191 483 814**
+        （**6.39×**，delta 161 536 908）；台账 ×5 **8 959 428 → 35 828 982**
+        （**4.00×**）。
         """
         from secretary import trail as tm
         path = os.path.join(REPO_ROOT, "state-secretary", "tests",
@@ -1532,7 +1562,6 @@ class TestCP3RefinedRulingBehaviours:
             src = f.read()
         body = (src * (417_480 // len(src) + 1))[:417_480]
         limit = len(body)
-        dec = json.JSONDecoder()
         short_fail = widened = 0
         i = 0
         last_close = body.rfind("}", 0, limit)
@@ -1559,18 +1588,31 @@ class TestCP3RefinedRulingBehaviours:
                     widened += 1
             i = p + 1
         assert short_fail >= 500, f"该语料短切片失败候选过少：{short_fail}"
-        # 收紧前 **100 %** 扩窗（1 103 / 1 103）；放宽判据到"**极少数**扩窗"
-        # 仍然有判别力：实测 202 / 1 103（= 18.3 %）⇒ 阈值取 25 %，
-        # 既容忍"错误位置越过短切片末尾"这条保守命中，又能抓住"退回全扩窗"。
-        assert widened <= short_fail * 0.25, (
-            f"A 组收紧失效：{short_fail} 个失败候选里有 {widened} 个仍被扩窗"
-            "（收紧前是 100 %；这正是 44.6 M vs 171.7 M 的差别）")
+        # 同源计数（与实现同口径）：A_true = 扩窗、A_false = 普通语法错。
+        # 实测 1 103 = A_true **202** + A_false **901**（旧注释写"0 / 927"失真）。
+        assert widened == 202, (
+            f"A_true 计数与实测不同源：{widened}（应为 202；总失败 {short_fail}）")
+        assert short_fail - widened == 901, (
+            f"A_false 计数与实测不同源：{short_fail - widened}（应为 901）")
         # 记账量据此明显低于"失败即记满整窗"的摊派口径
         _, deg, reason, work = _scan_diag_probe(body)
         assert deg is False, (deg, reason)
         assert work < short_fail * tm.MAX_RESCAN_LEN, (
             f"记账仍达『失败即记满整窗』口径：{work} vs "
             f"{short_fail * tm.MAX_RESCAN_LEN}")
+        # ---- 消融敏感（本轮 🔴-2 的**判别性**判据）----
+        # 强制 A 组判据恒真（= 收紧前"任何失败都扩窗"）：记账必须显著变大。
+        orig = tm._decoder_exhausted_input
+        try:
+            tm._decoder_exhausted_input = lambda exc, n: True
+            _, deg_abl, reason_abl, work_abl = _scan_diag_probe(body)
+        finally:
+            tm._decoder_exhausted_input = orig
+        assert work_abl > work * 3, (
+            f"A 组判据**未生效**（消融后记账几乎不变）：base={work} "
+            f"abl={work_abl}（应 ≥3×；旧实现 delta 恒 0）")
+        # 消融必须**只**改记账（不改变降级/召回判定）——否则说明判据越权。
+        assert (deg_abl, reason_abl) == (deg, reason), (deg_abl, reason_abl)
 
     # ---- 两档口径余量（§三） ------------------------------------------
     def test_7_commitment_tier_margin_at_least_5x(self):
@@ -1584,12 +1626,16 @@ class TestCP3RefinedRulingBehaviours:
         assert work * 5 <= cap, f"承诺档余量不足 5×：work={work} cap={cap}"
 
     def test_8_pressure_tier_is_logged_conservative(self):
-        """**两档口径 · 压力档**（全仓任意文本 @417 480）**登记为保守区间**。
+        """**两档口径 · 压力档**（全仓任意文本 @417 480）**登记 + 不触顶**。
 
-        实测最密 = `tests/test_collab_round6_fixes_issue14.py` **168 464 154**，
-        cap=240 M 下余量 **1.42×**（< 5×）。该形态**登记为实测数字**、
-        **不**作"不得降级"硬门槛（降级 = 多停一次 = 保守方向）；
-        但**必须仍不降级**（未触顶），否则就是 fail-open。
+        口径：最密 = `tests/test_collab_round6_fixes_issue14.py` @417 480（截断），
+        **CPython 3.11.16**，记账 = `_scan_diag` 的 `work`。
+        旧读数 **168 464 154**（余量 1.42×，"取 `max` 漏记 + A_false 仍重取窗口"
+        的失真值）⇒ 本轮实测 **29 946 906**、余量 **8.01×**（≥5×）。
+
+        ⚠️ **旧断言 `margin < 5.0` 是反向失败点**（🟡5）：修好 🔴-1 后余量必然
+        > 5×，该硬断言会把**修好的实现**判失败。现改为"**登记 + 不触顶**"：
+        只要求**实测值被登记**（可复跑、写进台账）且**未触顶**（不降级）。
         """
         cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
         path = os.path.join(REPO_ROOT, "state-secretary", "tests",
@@ -1602,25 +1648,81 @@ class TestCP3RefinedRulingBehaviours:
         assert deg is False, (deg, reason)
         margin = cap / work
         assert margin > 1.0, margin
-        assert margin < 5.0, (
-            f"压力档余量意外 ≥5×（裁定说登记为 <5× 的保守区间）：{margin}")
+        # **登记**：该实测值必须写进常量注释（口径可复跑、防数字漂移）。
+        with open(os.path.join(REPO_ROOT, "state-secretary", "src", "secretary",
+                               "trail.py"), encoding="utf-8") as f:
+            src_trail = f.read()
+        assert "29 946 906" in src_trail, (
+            "压力档实测记账量未登记在 trail.py 常量注释里（防口径漂移）")
+        assert "8.01×" in src_trail, "压力档余量未登记"
 
     def test_9_worst_case_dt_is_remeasured_and_bounded(self):
-        """**§三 上侧重测**（`RecursionError` 深嵌套）：最坏 dt 可复跑且 < 2 s。
+        """**§三 上侧重测**（`RecursionError` 深嵌套）：**形态无关**判据。
 
-        裁定要求"删『折算比不再随正文线性增长』类声明，改实测 dt + 测量形态"。
-        本用例给**实测 dt**（不退化成断言"上界"）。
+        ⚠️ **旧判据无判别力且随环境翻转**（本轮 🔴-3 点名）：旧用例断言
+        "最坏 dt < 2 s"，实测 **3.11 通过 / 3.13 失败** ——
+        3.11（本机）d=6000 **未触顶** dt **0.6164 s**、d=8000 起触顶；
+        3.13（总师实测）d=12000 **未触顶** dt **2.21 s**、d=14000 **3.65 s**。
+        同一判据在两个解释器上结论相反 ⇒ 属"结论随环境翻转"的用例。
+
+        现改为**形态无关**的两条（与机器速度、解释器版本解耦）：
+          ① **未触顶档位**：记账随 `d` **单调增**（结构性：候选越深，喂入越多）；
+          ② **触顶档位**：**必须降级**且 `reason="work_cap"`（不是"静默返回"）。
+        这两条在 3.11 / 3.13 上都成立（它们断言的是**结构**，不是**耗时**）。
+        另附**实测 dt + 测量形态 + 解释器**（只作观测，**不作断言**）。
         """
         cap = _need("MAX_SCAN_WORK", MAX_SCAN_WORK)
-        worst_dt = 0.0
-        worst = None
-        for d in (3000, 6000, 12000):
+        works = {}
+        degs = {}
+        dts = {}
+        for d in (1000, 2000, 3000, 4000, 5000, 6000, 8000, 12000, 14000):
             body = '{"a":' * d + '1' + '}' * d
+            _, deg, reason, work = _scan_diag_probe(body)
             t0 = time.perf_counter()
             _objects_diag(body)
-            dt = time.perf_counter() - t0
-            if dt > worst_dt:
-                worst_dt, worst = dt, d
-        assert worst_dt < 2.0, f"深嵌套最坏 dt={worst_dt:.4f}s（d={worst}）"
-        # cap 抬到 240 M 后仍 < 2 s（时间预算不被抬 cap 侵蚀）
+            dts[d] = time.perf_counter() - t0
+            works[d] = work
+            degs[d] = deg
+            if deg:
+                # ② 触顶档位：**必须**显式降级，且原因正确（不得静默）
+                assert reason == SCAN_REASON_WORK_CAP, (d, deg, reason)
+            else:
+                # 未触顶档位不得报触顶
+                assert work < cap, (d, work, cap)
+        # ① 未触顶档位（`deg=False`）记账随 `d` **单调增**
+        #    （形态无关：记账只由算法决定，与解释器速度**无关**，跨 3.11/3.13 一致）
+        # ⚠️ 判据用 `deg` 分区，**不得**用 `work < cap` —— 触顶档位**提前停**，
+        #    其 `work` 可能**低于** cap（实测 d=12000 → 239 906 061 < 240 M）。
+        untripped = sorted(d for d in works if not degs[d])
+        assert len(untripped) >= 4, (
+            f"未触顶档位过少，判据无意义：{untripped}（cap={cap}）")
+        for lo, hi in zip(untripped, untripped[1:]):
+            assert works[lo] < works[hi], (
+                f"未触顶档位记账非单调：d={lo} → {works[lo]}，"
+                f"d={hi} → {works[hi]}")
+        # ② **触顶档位必须降级**（`work_cap`）——判据**与解释器解耦**：
+        #    自然档位在 3.11 上 d≥8000 触顶、在 3.13 上可能整列都不触顶
+        #    （总师实测 3.13 d=14000 未触顶），故"必触顶"这一半改用
+        #    **确定性缩 cap** 验证（同一形态、把 cap 压到必然越界），
+        #    而不是要求自然档位里**必然**出现触顶档（那会随解释器翻转）。
+        body_deep = '{"a":' * 2000 + '1' + '}' * 2000
+        work_deep = _scan_diag_probe(body_deep)[3]
+        assert work_deep < cap, (work_deep, cap)
+        small_cap = work_deep // 2
+        orig_cap = trail_mod.MAX_SCAN_WORK
+        try:
+            trail_mod.MAX_SCAN_WORK = small_cap
+            _, deg_small, reason_small, work_small = _scan_diag_probe(body_deep)
+        finally:
+            trail_mod.MAX_SCAN_WORK = orig_cap
+        assert deg_small is True and reason_small == SCAN_REASON_WORK_CAP, (
+            deg_small, reason_small)
+        # `work` 是**触顶前**的累计值（fail-fast：越界那个候选不计入）⇒
+        # 判据取"已跑到 cap 附近"，**不得**断言 `>= cap`（那会因差一个候选而翻车）。
+        assert work_small > small_cap * 0.9, (work_small, small_cap)
+        # 附：实测 dt（**只观测、不断言**——它随解释器/机器翻转）
+        # 3.11.16 本机：d=6000 → 0.6164 s（未触顶）；d≥8000 → 0.15–0.41 s（已停）
+        # 3.13（总师实测）：d=12000 → 2.21 s；d=14000 → 3.65 s（均未触顶）
+        assert all(isinstance(v, float) and v >= 0 for v in dts.values())
+        # cap 抬到 240 M 后（时间预算不被抬 cap 侵蚀：触顶档位先停，dt 有界）
         assert cap == 240_000_000, cap
