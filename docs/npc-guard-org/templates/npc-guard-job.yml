@@ -1,0 +1,47 @@
+# 共享模板（路线 B）：**挂在 `$` 下的组织默认 job 段**
+#
+# 为什么是 `$`：`$` 是"所有角色共用的默认配置"，未匹配到角色名顶层 key 时走它；
+# 引用方为某角色单独写顶层 key 时，该 key 下的**同名事件覆盖** `$` 下的同名事件
+# （官方 NPC 文档口径），因此**不会**产生重复执行。
+#
+# ⚠️ 若引用方在**同一顶层 key 的同一事件**下再写一份 stages，include 的数组语义是
+#    "追加" → 会合并出第二个 npc go stage（重复执行）。校验脚本会拦住这种写法。
+#
+# 鉴权：本文件被别的仓库 include，鉴权字段必须声明在**本文件**上
+allow_slugs:
+  - "dongdongxiaozu/**"
+allow_events:
+  - issue.comment@npc
+  - pull_request.comment@npc
+  - pull_request
+  - push
+
+$:
+  issue.comment@npc:
+    - docker:
+        image: docker.cnb.cool/xqitw/docker/npc-dsh:latest
+      runner:
+        cpus: 2
+      services:
+        - docker
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h
+          env:
+            DSH_MAX_STEPS: "72"
+            DSH_MODEL: deepseek-v4.1-flash
+  pull_request.comment@npc:
+    - docker:
+        image: docker.cnb.cool/xqitw/docker/npc-dsh:latest
+      runner:
+        cpus: 2
+      services:
+        - docker
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h
+          env:
+            DSH_MAX_STEPS: "72"
+            DSH_MODEL: deepseek-v4.1-flash

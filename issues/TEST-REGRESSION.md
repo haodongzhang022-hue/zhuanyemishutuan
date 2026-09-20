@@ -2289,3 +2289,88 @@ G8「中等增量对照 == 2」两处硬编码期望值需同步。
 - **PR 评论 `@npc` 自触发**：建议编排层合并同 PR 同分钟 `@npc`，NPC 自身产出不触发下一棒。
 - **长尾 stall**：`cnb-teg` 跑 37 min 后 error，实为 agent 自我回滚致零产出；
   建议加"连续 N 回合无文件产出即收尾"软护栏。
+
+---
+
+## 33. 组织级成本护栏方案（PR #28）· 🔴 两轮返工
+
+> 交付物：`docs/npc-cost-guard-org-rollout.md`（**v1.2**）+ `docs/npc-guard-org/` 资产包
+> 第 1 轮触发：架构·评审 🔴 3 项（跨文件锚点 / 鉴权声明放错文件 / 校验契约字段不对齐）
+> 第 2 轮触发：复评 🔴 3 项（模板值零断言 / 通道错配不判 FAIL / 值来源不要求共享仓）
+
+### 33.1 第 1 轮必修项处置（v1.0 → v1.1）
+
+- 🔴-1 跨文件锚点平台不支持；`*anchor.stages[0]` 非法；数组追加会重复 stage。
+  处置：核心机制改为**值注入（路线 A，推荐）+ 完整 job 段模板（路线 B）**，
+  锚点仅同文件内用。证据：交付 `baseline/*.yml`（imports/optionsFrom）+
+  `templates/npc-guard-job.yml`（挂 `$` 下）；`resolve_includes` 按官方合并规则
+  模拟判定重复 stage。
+- 🔴-2 鉴权字段写在 `rules/` 上，真正被引用的模板没有；`allow_events` 漏
+  `pull_request`/`push`。处置：鉴权移到**每个被引用文件**；补齐四类事件；
+  `rules.required_allow_events` 固化为组织标准并逐文件核对。
+  证据：变异 M13–M16 各拦 1–2 条。
+- 🔴-3 `max_turns`/`DSH_MAX_STEPS`/`maxTurns` 三名混用；两路线未区分；
+  "值来源"断言在 include 后失效。处置：统一按**路线分派**——
+  镜像 = `env.DSH_MAX_STEPS`、`npc:go` = `options.maxTurns`，混用即 FAIL；
+  基线按路线分列两份。证据：变异 M7/M9 拦混用。
+
+### 33.2 第 2 轮必修项处置（v1.1 → v1.2）
+
+- 🔴-1 **路线 B 模板值零断言**：取的是顶层 `data.get(...)`，而模板值嵌在
+  `$.<event>[].stages[].env` → 全为 `None` → 静默跳过。模板内 cpus 2→8 +
+  回合 72→500 + 模型名去点**三处同改仍 rc=0**。处置：抽出
+  `assert_guard_values()`，对**每个护栏提供方文件**跑同一套值断言，取值走全树遍历
+  （兼容平铺基线与模板嵌套）。证据：**M17 触发 6 条 FAIL**（v1.1 为 0）。
+- 🔴-2 **通道错配不判 FAIL**：`shared_ref`/`opts_shared` 是死代码，判据退化成
+  "字段名出现在任意被引用文件里"；`npc:go` 用 `imports` 指 options 基线、
+  镜像用 `optionsFrom` 指 env 基线均 rc=0。处置：`collect_refs()` 给每个引用带
+  **通道**，判据为「字段 ⊆ 该通道能喂的字段集」；文件侧 + stage 侧两层拦。
+  证据：**M18/M19 各触发 3 条 FAIL**。
+- 🔴-3 **值来源不要求共享仓**：`traceable` 只看字段名，
+  `imports: [./local-baseline.yml]`（仓内自建）rc=0 → D1/D2 名存实亡。处置：
+  `make_is_shared()`——共享 = 共享仓 URL（含 `npc-guard`）**或**与 `--rules`
+  同源的资产包目录（`rules`/`baseline`/`templates`）；仓内自建判 FAIL。
+  证据：**M20 触发 2 条 FAIL**；反例样例 `samples/repo-local-baseline/` rc=1。
+
+**🟡 同批收敛**：flow-style `runner: {cpus: 2}` 计数绕过（改按解析结果 +
+对象身份去重，M21）；无关本地 include 误报（`--auth-scope`，样例
+`repo-misc-include` 现 rc=0）；内联 `- config: {...}` 误报不可读（不再当文件）；
+"最小用法"误判（所有 stage 判定改走合并后配置，新增 `samples/repo-include-min/`）；
+口径打架（统一为 v1.0 **9** → v1.1 **6** → v1.2 **2** error）；
+rebase 到 `main`（`46910b8`）后重跑全量；死代码删除（pyflakes **0 告警**）。
+
+### 33.3 自测（v1.2 复跑）
+
+- 门禁脚本 `checks/check_npc_cost_guard.py`（仅标准库 + pyyaml；缺 yaml 以 rc=2 大声失败）
+- **样例矩阵 8 个**（期望 rc 逐个核对，不符即判失败）：
+  `repo-mirror` / `repo-npcgo` / `repo-include-min` / `repo-include-override` /
+  `repo-misc-include` → **rc=0**；
+  `repo-include-dup` / `repo-local-baseline` / `repo-flow-cpus` → **rc=1**
+- **变异矩阵 23 个、漏网 0**：`python3 docs/npc-guard-org/selftest/mutation_matrix.py`
+  - M1 cpus 2→8 (3)｜M2 timeout 2h→10h (5)｜M3 基线模型名去点 (1)
+  - M4 基线去 `DSH_MAX_STEPS` (2)
+  - M5 基线去 `DSH_MODEL` (2)｜M6 本地再写一处 cpus (1)｜M7 镜像混用 `maxTurns` (1)
+  - M8 `npc:go` 基线去 `maxTurns` (2)｜M9 `npc:go` 混用 `DSH_MAX_STEPS` (1)
+  - M10 基线回合 72→200 (1)
+  - M11 基线引用指向不存在文件 (3)｜M12 与模板重复写 stages (1)｜M13 漏 `allow_events` (1)
+  - M14 漏 `allow_slugs` (1)｜M15 `allow_events` 漏 `pull_request` (1)
+  - M16 基线缺鉴权 (2)
+  - **M17 模板值三处同改坏 (6)**｜**M18 `npc:go` 走 `imports` 指 options 基线 (3)**
+  - **M19 镜像走 `optionsFrom` 指 env 基线 (3)**｜**M20 基线指向仓内自建文件 (2)**
+  - **M21 flow-style 两角色各写 cpus (1)**｜M20b/M21b 为自带红反例探针（不计入基线全绿）
+- 本仓现状 `--config .cnb/npc.yml` → **rc=0**（`cpus` 本地唯一来源）
+- 全量 pytest（rebase 到 `main` `46910b8` 后重跑）：**1256 passed / 8 failed**；
+  8 项失败在**未改动的 `main` 上同样失败**（`git worktree` 对照实跑，失败集**逐项相同**），
+  属既有基线，非本 PR 引入（本 PR 仅文档 + 新增资产，未触碰模块代码与 `.cnb/*.yml`）
+- markdownlint：新文档 **2 error**（均 MD013 行长，全仓既有口径）；对照 v1.0 **9** / v1.1 **6**
+- pyflakes：`checks/` 与 `selftest/` **0 告警**
+- 机制事实实测：跨文件锚点 → `ComposerError: undefined alias`；
+  `*anchor.stages[0]` → `ScannerError`
+- URL 形式：`/-/blob/…` 与 `/-/git/raw/…` 均可读（脚本内部归一为 raw）
+
+### 33.4 遗留
+
+- 共享仓 `npc-guard` 尚未建仓；本 PR 先交付"整目录可平移"的资产包 + 方案文档。
+- 引用方 CI 门禁样例中 `pyyaml` 需显式安装（脚本缺依赖以 rc=2 大声失败，不静默跳过）。
+- `main` 既有 8 项 pytest 失败（`test_incremental_gate_issue14` /
+  `test_issue21_scan_rework` / `test_collab_round4_fixes_issue14`）不在本 PR 范围内。
