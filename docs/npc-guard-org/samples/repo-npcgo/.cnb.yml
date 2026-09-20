@@ -1,0 +1,24 @@
+# 引用方仓库 B（npc:go 路线 · 路线 A'：optionsFrom 值注入）
+.npc-job-base: &npc-job-base
+  docker:
+    image: cnbcool/default-npc:latest
+  runner:
+    cpus: 2
+
+"专家":
+  issue.comment@npc:
+    - <<: *npc-job-base
+      stages:
+        - name: npc go
+          type: npc:go
+          timeout: 2h
+          optionsFrom:
+            - ../../baseline/npc-go-options.yml
+  pull_request.comment@npc:
+    - <<: *npc-job-base
+      stages:
+        - name: npc go
+          type: npc:go
+          timeout: 2h
+          optionsFrom:
+            - ../../baseline/npc-go-options.yml

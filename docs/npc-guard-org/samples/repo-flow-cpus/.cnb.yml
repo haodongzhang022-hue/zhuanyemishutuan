@@ -1,0 +1,21 @@
+# 反例：两个角色各写一份 runner: {cpus: 2}（flow-style，源码行首计数看不到）
+"角色A":
+  issue.comment@npc:
+    - runner: {cpus: 2}
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h
+          env:
+            DSH_MAX_STEPS: "72"
+            DSH_MODEL: deepseek-v4.1-flash
+"角色B":
+  issue.comment@npc:
+    - runner: {cpus: 2}
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h
+          env:
+            DSH_MAX_STEPS: "72"
+            DSH_MODEL: deepseek-v4.1-flash

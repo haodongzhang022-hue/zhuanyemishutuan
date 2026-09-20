@@ -1,0 +1,11 @@
+# 引用方仓库 E：与护栏**无关**的本地 include（lint 配置）+ 官方第 3 种写法（内联 config）
+# 这两类都不该被鉴权审计误报（🟡-2/🟡-3 定点：v1.1 在此 rc=1）
+include:
+  - ../../templates/npc-guard-job.yml
+  - lint-config.yml
+  - config:
+      main:
+        push:
+          - stages:
+              - name: echo
+                script: echo hi

@@ -1,0 +1,15 @@
+# 反例：imports 指向**仓内自建**基线——字段名齐全、值也在上界内，但来源不是共享仓。
+# D1「规则单一来源」要求基线只能来自共享仓：仓内自建 = 改坏无人评审（33× 事故成因）。
+.npc-job-base: &npc-job-base
+  runner:
+    cpus: 2
+
+"角色":
+  issue.comment@npc:
+    - <<: *npc-job-base
+      imports:
+        - ./local-baseline.yml
+      stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h

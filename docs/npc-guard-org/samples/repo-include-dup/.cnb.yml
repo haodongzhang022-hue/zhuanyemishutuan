@@ -1,0 +1,13 @@
+# 反例：引用方在 `$` 的同一事件下又写了一份 stages → 数组追加 → 两个 npc go stage
+include:
+  - ../../templates/npc-guard-job.yml
+
+$:
+  issue.comment@npc:
+    - stages:
+        - name: npc go
+          script: sh /app/start.sh
+          timeout: 2h
+          env:
+            DSH_MAX_STEPS: "72"
+            DSH_MODEL: deepseek-v4.1-flash

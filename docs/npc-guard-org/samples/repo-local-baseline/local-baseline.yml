@@ -1,0 +1,13 @@
+# 组织基线 · 镜像路线（引用方经 imports 引入 → 每个 key 即一个环境变量）
+# 鉴权：本文件被别的仓库 imports，声明必须在**本文件**上
+allow_slugs:
+  - "dongdongxiaozu/**"
+allow_events:
+  - issue.comment@npc
+  - pull_request.comment@npc
+  - pull_request
+  - push
+# ── 基线值（与 rules/npc-cost-guard.yml 由同一 PR 维护）────────────
+DSH_MAX_STEPS: "72"
+DSH_MODEL: deepseek-v4.1-flash
+DSH_WEB_TOOLS: "disable"

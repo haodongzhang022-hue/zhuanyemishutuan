@@ -1,0 +1,12 @@
+# 组织基线 · npc:go 路线（引用方经 optionsFrom 引入 → 每个 key 即一个 options 字段）
+# 鉴权：本文件被别的仓库 optionsFrom 引入，声明必须在**本文件**上
+allow_slugs:
+  - "dongdongxiaozu/**"
+allow_events:
+  - issue.comment@npc
+  - pull_request.comment@npc
+  - pull_request
+  - push
+# ── 基线值 ──────────────────────────────────────────────────────
+maxTurns: 72
+model: deepseek-v4.1-flash
